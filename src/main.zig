@@ -120,7 +120,7 @@ fn handleQuery(
     const proxy_id = ctx.pending_table.appendQuery(.{
         .client_id = header.id,
         .client_addr = incoming_addr,
-        .expires_at = @truncate(std.Io.Timestamp.now(io, std.Io.Clock.real).nanoseconds + 5 * std.time.ns_per_s),
+        .expires_at = @intCast(std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds + 5 * std.time.ns_per_s),
     }) catch {
         std.log.err("Failed to append query to Pending table", .{});
         return;
@@ -186,7 +186,10 @@ fn dispatcherLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
 
 fn sweeperLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
     while (true) {
-        try io.sleep(std.Io.Duration.fromSeconds(1), std.Io.Clock.real);
+        // A relative sleep on the settable wall clock would stutter or race
+        // ahead whenever NTP adjusts it; the sweep cadence should track the same
+        // monotonic clock the deadlines are measured on.
+        try io.sleep(std.Io.Duration.fromSeconds(1), std.Io.Clock.boot);
         ctx.pending_table.sweepExpiredQueries();
     }
 }
