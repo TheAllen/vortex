@@ -119,9 +119,16 @@ fn handleQuery(
         },
     }
 
+    // q_end is one past the question section, so the question occupies
+    // data[12..q_end]. parseQuestion already bounded it against data.len.
+    const question_len: u16 = @intCast(q_end - 12);
+    const question_hash = pending_table_mod.hashQuestion(ctx.question_seed, data, question_len).?;
+
     const proxy_id = ctx.pending_table.appendQuery(.{
         .client_id = header.id,
         .client_addr = incoming_addr,
+        .question_hash = question_hash,
+        .question_len = question_len,
         .expires_at = @intCast(std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds + 5 * std.time.ns_per_s),
     }) catch {
         std.log.err("Failed to append query to Pending table", .{});
@@ -153,9 +160,37 @@ fn dispatcherLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
 
         const proxy_id = std.mem.readInt(u16, reply_msg.data[0..2], .big);
 
-        // The DNS query entry with the custom proxy_id
-        const entry = ctx.pending_table.complete(proxy_id) orelse {
+        // Peek first, and only consume the entry once the reply is proven to
+        // answer it. Completing up front would mean a forged packet that merely
+        // guessed the proxy ID could delete a live query as a side effect of
+        // being rejected — the attacker fails to inject an answer but still
+        // denies service, and the sweeper is left with nothing to SERVFAIL.
+        const pending = ctx.pending_table.peek(proxy_id) orelse {
             std.log.debug("orphan response id={x}", .{proxy_id});
+            continue;
+        };
+
+        // The upstream echoes the question verbatim, so a genuine reply carries
+        // the same bytes at the same offset. On top of the random proxy ID and
+        // the source-address check, an off-path attacker now has to guess the ID
+        // *and* reproduce the exact question to land a forgery.
+        const reply_hash = pending_table_mod.hashQuestion(
+            ctx.question_seed,
+            reply_msg.data,
+            pending.question_len,
+        );
+        if (reply_hash == null or reply_hash.? != pending.question_hash) {
+            // Entry deliberately left in place: the real reply may still be in
+            // flight, and if it never comes the sweeper will SERVFAIL it.
+            std.log.warn("discarding reply id={x}: question does not match the query", .{proxy_id});
+            continue;
+        }
+
+        // Verified — now consume it. A concurrent sweep could have evicted the
+        // entry since the peek, in which case the client has already been sent
+        // a SERVFAIL and this reply is too late to matter.
+        const entry = ctx.pending_table.complete(proxy_id) orelse {
+            std.log.debug("reply id={x} arrived after its deadline", .{proxy_id});
             continue;
         };
 
@@ -186,7 +221,8 @@ fn dispatcherLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
     }
 }
 
-fn sweeperLoop(io: std.Io, gpa: std.mem.Allocator, ctx: *const Context) std.Io.Cancelable!void {
+fn sweeperLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
+    const gpa = ctx.gpa;
     // Reused across sweeps so the steady state allocates nothing: the common
     // case is an empty list once per second.
     var evicted: std.ArrayList(PendingQuery) = .empty;
@@ -216,6 +252,28 @@ fn sweeperLoop(io: std.Io, gpa: std.mem.Allocator, ctx: *const Context) std.Io.C
                 }),
             };
         }
+    }
+}
+
+/// Every background loop has this shape, which is what lets one supervisor
+/// cover all of them.
+const LoopFn = *const fn (std.Io, *const Context) std.Io.Cancelable!void;
+
+/// Runs `loop` forever, restarting it if it ever returns for any reason other
+/// than cancellation.
+///
+/// Today neither loop can return normally — every non-`Canceled` path
+/// `continue`s — so this is defence against a future edit, not a live bug. It
+/// earns its keep because the failure mode is total and silent: if
+/// `dispatcherLoop` ever stops draining the table, ingress keeps accepting and
+/// enqueuing queries that nobody will ever answer, and the only symptom is that
+/// every lookup times out.
+fn supervise(io: std.Io, ctx: *const Context, name: []const u8, loop: LoopFn) std.Io.Cancelable!void {
+    while (true) {
+        loop(io, ctx) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+        };
+        std.log.err("{s} loop returned unexpectedly; restarting", .{name});
     }
 }
 
@@ -276,12 +334,17 @@ pub fn main(init: std.process.Init) !void {
     var pending_table = PendingTable.init(gpa, io, seed);
     defer pending_table.deinit();
 
+    var question_seed: u64 = undefined;
+    io.random(std.mem.asBytes(&question_seed));
+
     const ctx = Context.init(
         &client_socket,
         &upstream_socket,
         upstream_addr,
         &pending_table,
         &policy,
+        gpa,
+        question_seed,
     );
 
     // Tasks live in the group, not in discarded futures, so completions
@@ -290,8 +353,8 @@ pub fn main(init: std.process.Init) !void {
     var group: std.Io.Group = std.Io.Group.init;
     defer group.cancel(io);
 
-    group.async(io, dispatcherLoop, .{ io, &ctx }); // Dispatcher Coroutine
-    group.async(io, sweeperLoop, .{ io, gpa, &ctx }); // Sweeper Coroutine
+    group.async(io, supervise, .{ io, &ctx, "dispatcher", dispatcherLoop });
+    group.async(io, supervise, .{ io, &ctx, "sweeper", sweeperLoop });
 
     try console.println("Vortex listening on {s}:{d}, forwarding to {s}:{d}", .{
         cfg.listen_host,

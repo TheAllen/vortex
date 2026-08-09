@@ -1,28 +1,32 @@
 # Next Steps — Road to Production-Ready
 
 Reviewed **2026-08-09** against the current source (Zig 0.16.0, `zig build test` →
-**17/17 pass, exit 0**). **No open P0s, and no open P1 bugs.** As of the second 08-08 pass,
+**30/30 pass, exit 0**, Debug and ReleaseSafe). **No open P0s, and no open P1 bugs.** As of the second 08-08 pass,
 **every P0 fix is now pinned by a regression test** — C1 (07-27), C3 (08-08 morning), and
 C2 (08-08, this pass). That closes the P0 section for good: the three bugs that shipped
 silently can no longer regress silently.
 
-The board is now entirely hardening, operability, and protocol work, and **P2.1
-configuration landed on 08-09** — Vortex is no longer configured by recompiling it. Testing
-is still the standing gap, but the count has moved three times in two days: **14 real tests,
-up from 4** on 08-08 morning. What's left untested is `parseQuestion`'s three error paths and
-all of `PendingTable` (P1.1) — the latter being where the entire P0.B series of bugs hid.
+**P2.1 configuration** landed on 08-09 (Vortex is no longer configured by recompiling it),
+and later the same day the **core query datapath was closed out**: six items, of which two
+were bugs nobody had recorded. **P1.1, P1.2, P1.3, P1.4 and P4.2 are all done**, leaving
+**P1.5 as the only open P1**.
+
+Testing has stopped being the standing gap. **27 real tests, up from 4** on 08-08 morning,
+and `PendingTable` — where the entire P0.B series hid — went from zero coverage to eight
+tests. What is still untested is `parseQuestion`'s three error paths (P2.5) and the two
+files that carry logic but no tests, `policy.zig` and `console.zig`.
 
 What exists today:
 
 - Ingress loop + per-query `handleQuery` coroutines via `std.Io.Group` ([main.zig](../src/main.zig))
 - Header validation on ingress via `Header.validateQuery`
-  ([header.zig:97–103](../src/dns/header.zig#L97)) — QR=1 datagrams are dropped
-  ([main.zig:74–80](../src/main.zig#L74)); a malformed question section is logged and
-  dropped rather than acted on ([main.zig:88–91](../src/main.zig#L88))
+  ([header.zig:115–127](../src/dns/header.zig#L115)) — QR=1 datagrams are dropped
+  ([main.zig:67–83](../src/main.zig#L67)); a malformed question section is logged and
+  dropped rather than acted on ([main.zig:91–94](../src/main.zig#L91))
 - An ingress loop that survives transient errors: `receive` failures are logged and retried,
-  and a datagram is shed when its buffer can't be allocated ([main.zig:245–271](../src/main.zig#L245))
+  and a datagram is shed when its buffer can't be allocated ([main.zig:366–411](../src/main.zig#L366))
 - Shared upstream socket with `dispatcherLoop` demuxing by proxy transaction ID, with a
-  source-address check (`upstream_addr.eql(reply.from)`) on every response ([main.zig:149](../src/main.zig#L149))
+  source-address check (`upstream_addr.eql(reply.from)`) on every response ([main.zig:159](../src/main.zig#L159))
 - Runtime configuration from defaults < `.env` < process environment
   ([settings.zig](../src/settings.zig))
 - `PendingTable` with random proxy IDs, mutex, and a sweeper coroutine ([pending_table.zig](../src/utils/pending_table.zig))
@@ -40,7 +44,81 @@ What exists today:
 
 ## ✅ Done since the last review
 
-### Landed 2026-08-09 — P2.1 configuration (mechanism)
+### Landed 2026-08-09 (second pass) — core query datapath closed out
+
+Six items, worked in dependency order. Two of them were **not previously on this board** —
+they came out of re-reading the datapath rather than from the existing list.
+
+**New findings, now fixed:**
+
+- **Oversized datagrams were silently truncated, and the dispatcher forwarded corrupt
+  replies.** `IncomingMessage.flags.trunc` — "the trailing portion of a datagram was
+  discarded because it was larger than the buffer supplied" — was never checked on either
+  socket. The dispatcher case was a genuine correctness bug: we forward the client's OPT
+  verbatim, so a client advertising an EDNS0 buffer above 4096 lets upstream legitimately
+  reply with more than `msg_buf` holds. We truncated it, rewrote the ID, and forwarded a
+  **malformed message with TC unset** — the client had no way to know. Now
+  `Header.markTruncated` ([header.zig:136](../src/dns/header.zig#L136)) sets TC=1 before
+  relaying ([main.zig:206](../src/main.zig#L206)); the client retries over TCP, which fails
+  honestly until **P3.6** rather than corrupting silently. On ingress
+  ([main.zig:383](../src/main.zig#L383)) an oversized query gets FORMERR and is dropped
+  **before** the dupe and coroutine spawn, so a flood costs one 12-byte reply each. FORMERR
+  is safe to send there precisely because the reply is far smaller than the query.
+  *Verified with a fake upstream returning 5000 bytes (flags word `0x8380` on the wire) and a
+  5000-byte query (12-byte FORMERR back).*
+- **Timeouts ran on the settable wall clock.** `expires_at` and the sweeper both used
+  `Clock.real`, which std documents as "affected by discontinuous jumps... and by frequency
+  adjustments performed by NTP": a step backwards let entries outlive their deadline, a step
+  forwards evicted every in-flight query at once. Both now use **`Clock.boot`** — monotonic,
+  and unlike `.awake` it counts time the machine spends suspended, so a query outstanding
+  across a laptop sleep is correctly treated as long dead. The sweep cadence
+  ([main.zig:224](../src/main.zig#L224)) moved too: a relative sleep on a settable clock
+  stutters whenever NTP adjusts. All three sites also went `@truncate` → `@intCast`, which
+  closes the half of [memory-review.md](memory-review.md) #4 that was never adopted.
+
+**Board items, now done:**
+
+- **P4.2 — QDCOUNT/opcode validation.** `Rejection` gained `bad_opcode` and `bad_qdcount`
+  plus an `rcode()` method that puts drop-vs-reply in one place instead of at the call site.
+  New `Header.headerOnlyReply` ([header.zig:178](../src/dns/header.zig#L178)) zeroes **all
+  four** counts including QDCOUNT — for `bad_qdcount` the existence of a parseable question
+  is exactly what is in doubt. *Ordering is load-bearing:* QR is checked first, because a
+  spoofed response with a bogus QDCOUNT must stay silent or we FORMERR a forged address and
+  reopen the C3 reflector. Mutation-verified.
+- **P1.1 — `PendingTable` unit tests.** Eight tests: round trip, idempotent complete, the
+  **B1 expiry regression**, sweep-is-a-no-op, 4096 distinct proxy IDs, ID-space exhaustion
+  (fills all 65,536), `peek` non-consumption, and `hashQuestion`. The trick that made them
+  cheap is that none control time — a helper builds deadlines off the same clock the sweeper
+  reads, so "already expired" is a negative offset. Mutation-verified five ways, including
+  reintroducing B1 verbatim.
+- **P1.2 — supervisor (the coroutine half).** One `supervise(io, ctx, name, loop)`
+  ([main.zig:271](../src/main.zig#L271)) covers both loops, which now share a
+  `fn (Io, *const Context)` shape (`sweeperLoop` takes its allocator from `Context`). Neither
+  loop can currently return, so this guards a future edit — it earns its place because the
+  failure is total and silent.
+- **P1.3 — question verification (the second half).** `PendingQuery` carries a seeded
+  `question_hash` plus `question_len`. Storing the length means the reply path **never
+  re-parses**: it slices a known range and hashes it, so a hostile question in a forged reply
+  gets no parser to attack. The seed is per-process from `io.random`, so a colliding question
+  cannot be precomputed offline.
+- **P1.4 — SERVFAIL on sweep.** `sweepExpiredQueries` now *reports* what it evicted into a
+  caller-owned list and `sweeperLoop` does the sending, so the table still holds no socket —
+  which is what keeps its suite runnable without one. Reused across sweeps, so the steady
+  state (an empty sweep per second) allocates nothing. A failed report still evicts: holding
+  a slot open because we could not allocate a *notification* would turn transient OOM into a
+  permanently leaked proxy ID.
+
+**One design bug found by testing, worth recording.** The first cut of P1.3 called
+`complete()` (which removes) *before* the hash check. A forged packet that merely guessed the
+proxy ID would therefore **delete the legitimate pending query as a side effect of being
+rejected** — no injected answer, but a successful denial of service, and nothing left for the
+sweeper to SERVFAIL. A live test against an upstream that echoed the right ID with the wrong
+question produced silence instead of SERVFAIL, which is how it surfaced. Fixed by adding
+`PendingTable.peek` ([pending_table.zig:109](../src/utils/pending_table.zig#L109)) and
+ordering it **peek → verify → complete**. P1.3 and P1.4 each looked correct alone; the defect
+was in their interaction.
+
+### Landed 2026-08-09 (first pass) — P2.1 configuration (mechanism)
 
 `settings.zig` went from a block of `pub const` compile-time constants to a runtime
 `Settings` struct resolved once at startup. **Precedence: defaults < `.env` file < process
@@ -90,7 +168,7 @@ the file without editing it.
   ([blocked_response.zig](../src/dns/blocked_response.zig)). `build(gpa, query,
   question_end, rcode)` takes bytes and returns a fresh owned buffer of exactly
   `question_end + Authority.WIRE_LEN`. `handleQuery`'s blocked branch went from ~18 lines of
-  inline buffer juggling to three ([main.zig:99–111](../src/main.zig#L99)).
+  inline buffer juggling to three ([main.zig:102–115](../src/main.zig#L102)).
 
   This was the precondition for testing C2 at all. A golden-bytes test on
   `write_authority_section` alone would have missed the part that was actually bug-prone:
@@ -99,7 +177,7 @@ the file without editing it.
   the `validateQuery` extraction, same payoff.
 
 - **`craftBlockedResponse` → `Header.writeResponseFlags(msg, rcode)`**
-  ([header.zig:133–152](../src/dns/header.zig#L133)). Three changes: the RCODE is a
+  ([header.zig:218–239](../src/dns/header.zig#L218)). Three changes: the RCODE is a
   parameter instead of a hard-coded `3`, the RR-count zeroing moved out to the caller, and
   the vestigial `_: *Header` receiver is gone. Splitting flags from counts is what lets
   **P4.2** reuse it — a FORMERR for a bad QDCOUNT can't echo a question section, so it needs
@@ -130,7 +208,7 @@ the file without editing it.
   corrupting a neighbouring allocation.
 
 - **Stale `expires_at` comment corrected**
-  ([pending_table.zig:6](../src/utils/pending_table.zig#L6)) — it claimed "ns since boot,
+  ([pending_table.zig:21](../src/utils/pending_table.zig#L21)) — it claimed "ns since boot,
   `std.time.nanoTimestamp()`"; both writer and sweeper use ns-since-epoch from
   `std.Io.Timestamp.now(io, .real)`. No behavior change; this was the comment that invited
   reintroducing **B1**.
@@ -142,21 +220,21 @@ the file without editing it.
 
 ### Landed 2026-08-08 (first pass) — C3 gets a test, P1.2 closed
 - **P1.2 fixed** — the ingress loop no longer propagates out of `main`
-  ([main.zig:245–271](../src/main.zig#L245)). `receive` now mirrors `dispatcherLoop`'s
+  ([main.zig:366–411](../src/main.zig#L366)). `receive` now mirrors `dispatcherLoop`'s
   shape (`error.Canceled => return` for clean shutdown, log + `continue` otherwise), and a
   failed `gpa.dupe` sheds the datagram instead of terminating the server. A transient
   receive error or one failed allocation is no longer fatal. The `dupe` site is the
   natural hook for the **P1.5** concurrency cap when that lands.
-- **`Header.validateQuery` extracted** ([header.zig:97–103](../src/dns/header.zig#L97)) —
+- **`Header.validateQuery` extracted** ([header.zig:115–127](../src/dns/header.zig#L115)) —
   the QR check moved out of `handleQuery` into a pure method returning a
   `Header.Rejection` (`none` / `is_response`). `handleQuery` switches on it
-  ([main.zig:74–80](../src/main.zig#L74)); behavior is unchanged. Two reasons:
+  ([main.zig:67–83](../src/main.zig#L67)); behavior is unchanged. Two reasons:
   - **It made the C3 fix testable.** `handleQuery` needs an `Io` and a `Context` holding
     two live sockets, so "assert nothing is forwarded" was an integration test. The
     extracted method is bytes-in/enum-out.
   - **It gives P4.2 a home.** `Rejection` is where `bad_qdcount` and `bad_opcode` go, so
     the header-validation family stays in one guard instead of scattering `if`s.
-- **Three tests added** ([header.zig:167+](../src/dns/header.zig#L167)) — QR=1 rejected,
+- **Three tests added** ([header.zig:252+](../src/dns/header.zig#L252)) — QR=1 rejected,
   ordinary query accepted, and QR-in-isolation (QR=1 with all other flags clear is still
   refused; a query with odd AA/TC/RCODE bits is still accepted, since that's P4.2's
   business, not this guard's). **`zig build test` → 10/10, and the real count moved 4 → 7.**
@@ -194,7 +272,7 @@ they landed" isn't recoverable, only that they were true then:
 
 - **Malformed questions drop instead of propagating** — `parseQuestion`'s error union
   (`TruncatedQuestion` / `UnsupportedLabel` / `NameTooLong`) is caught in `handleQuery` and
-  turned into a debug log + drop ([main.zig:88–91](../src/main.zig#L88)), so a truncated or
+  turned into a debug log + drop ([main.zig:91–94](../src/main.zig#L91)), so a truncated or
   compression-pointer question can't take a query path down. All three error paths are
   still untested (P2.5).
 - **The test aggregator covers every module** — the `test { _ = @import(…) }` block pulls in
@@ -217,7 +295,7 @@ P1.2), and a corrected P2.5 coverage count (`7/7` passing is **4** real tests, n
 Everything the 2026-07-30 entry below claims as landed was verified still present and
 correct in the source — including the 34-byte SOA math in
 [authority.zig](../src/dns/authority.zig) and the fresh-buffer blocked path in
-[main.zig:99–111](../src/main.zig#L99).
+[main.zig:102–115](../src/main.zig#L102).
 
 ### Landed 2026-07-30 (previous session)
 
@@ -230,7 +308,7 @@ correct in the source — including the 34-byte SOA math in
     `std.mem.writeInt` (no `@bitCast`, so the endianness footgun is avoided). `WIRE_LEN = 34`
     is a named constant with the "only fixed because of the pointer + root-label choices"
     caveat documented at its definition.
-  - The blocked branch in `handleQuery` ([main.zig:99–111](../src/main.zig#L99)) takes the
+  - The blocked branch in `handleQuery` ([main.zig:102–115](../src/main.zig#L102)) takes the
     "fresh buffer" path: `craftBlockedResponse` truncates + flips flags on the exact-sized
     dupe, the caller sets **NSCOUNT=1**, then copies `data[0..question_len]` into a
     `question_len + WIRE_LEN` buffer and appends the SOA there — so the exact-length query
@@ -246,12 +324,12 @@ correct in the source — including the 34-byte SOA math in
 
 
 - **P0.B1–B6** — all six pending-table bugs fixed: sweeper now compares ns to ns
-  ([pending_table.zig:86](../src/utils/pending_table.zig#L86)); `dead_queries` is
+  ([pending_table.zig:153](../src/utils/pending_table.zig#L153)); `dead_queries` is
   `defer`-freed ([:91](../src/utils/pending_table.zig#L91)); the proxy ID is reclaimed on
-  upstream send failure ([main.zig:138](../src/main.zig#L138)); the bogus `main.zig` import
+  upstream send failure ([main.zig:143](../src/main.zig#L143)); the bogus `main.zig` import
   is gone; the capacity guard is `> maxInt(u16)`
   ([:37](../src/utils/pending_table.zig#L37)); `pending_table.deinit()` is deferred
-  ([main.zig:230](../src/main.zig#L230)).
+  ([main.zig:347](../src/main.zig#L347)).
 - **P1.3 (partial)** — dispatcher now drops responses whose source address isn't the
   upstream. The optional question-hash verification is still open (see P1 below).
 - **P3.4** — suffix/wildcard blocking implemented, plus a curated allowlist that
@@ -285,7 +363,7 @@ under mutation:
 |-----|-------|-----------|
 | C1 — QName never lowercased | 2026-07-27 | [question.zig:72](../src/dns/question.zig#L72), plus the verbatim-question assertion in the C2 golden test (the wire-case half) |
 | C2 — blocked NXDOMAIN carries no SOA | 2026-07-30 | [blocked_response.zig](../src/dns/blocked_response.zig) — three golden-bytes tests, 2026-08-08 |
-| C3 — QR bit never checked on ingress | 2026-08-07 | [header.zig:167+](../src/dns/header.zig#L167) — three `validateQuery` tests, 2026-08-08 |
+| C3 — QR bit never checked on ingress | 2026-08-07 | [header.zig:252+](../src/dns/header.zig#L252) — three `validateQuery` tests, 2026-08-08 |
 
 The subsections below are retained as **reference for the behavior now shipped**, not as
 to-dos; each records why the fix is shaped the way it is and what now keeps it that way.
@@ -318,11 +396,11 @@ Localhost-only binding was the *only* thing containing this, which meant it woul
 live the moment P2.6 binds anything else — same trigger as P1.5.
 
 **How it was fixed:** `Header.validateQuery` returns `.is_response` for QR=1
-([header.zig:97–103](../src/dns/header.zig#L97)), and `handleQuery` switches on it between
-`parseHeader` and `Policy.decide` ([main.zig:74–80](../src/main.zig#L74)) — before the
+([header.zig:115–127](../src/dns/header.zig#L115)), and `handleQuery` switches on it between
+`parseHeader` and `Policy.decide` ([main.zig:67–83](../src/main.zig#L67)) — before the
 `PendingTable` allocation, and silent, since a server must not answer a response.
 
-**Pinned by three tests** ([header.zig:167+](../src/dns/header.zig#L167)): QR=1 rejected,
+**Pinned by three tests** ([header.zig:252+](../src/dns/header.zig#L252)): QR=1 rejected,
 ordinary query accepted, and QR-in-isolation. All three fail if the guard is inverted
 (verified by mutation), so this fix can't silently regress the way it silently arrived.
 
@@ -388,7 +466,7 @@ constant records the caveat so nobody later swaps in a real MNAME and overruns t
   literal bytes. Two `assert`s (added 08-08) check the caller left room for all 34 bytes and
   that the QNAME really is at offset 12, since `0xC00C` is meaningless otherwise.
 - **The buffer gotcha** — the handler buffer is `gpa.dupe(u8, incoming.data)`
-  ([main.zig:259](../src/main.zig#L259)), sized to the *exact* query length, so the blocked
+  ([main.zig:401](../src/main.zig#L401)), sized to the *exact* query length, so the blocked
   branch can't extend it in place. `blocked_response.build` allocates a fresh
   `question_end + WIRE_LEN` buffer, copies the question in (the copy length is what
   truncates the message), flips the flags and counts *in the output*, and appends the SOA
@@ -418,15 +496,23 @@ constant records the caveat so nobody later swaps in a real MNAME and overruns t
 
 ## P1 — Hardening the dispatcher path
 
-1. **Unit tests for `PendingTable`.** Still *zero* tests, and this is exactly where the
+**Only P1.5 remains open.** P1.1–P1.4 all landed 2026-08-09; entries kept below as a record
+of what each was and how it was resolved.
+
+1. ~~**Unit tests for `PendingTable`.**~~ ✅ **Done 2026-08-09** — eight tests, mutation-verified,
+   including the B1 expiry regression. Original note follows.
+   **Was:** Still *zero* tests, and this is exactly where the
    P0.B-series bugs hid. The list stands: allocate/complete round trip, expiry,
    sweep-only-expired, collision retry, ID-space exhaustion, idempotent complete. B1
    would have been caught by the first expiry test.
-2. **Supervisor for dispatcher/sweeper death.** ~~Ingress-loop error recovery~~ — ✅ **fixed
+2. ~~**Supervisor for dispatcher/sweeper death.**~~ ✅ **Done 2026-08-09** — `supervise`
+   ([main.zig:271](../src/main.zig#L271)) wraps both loops and restarts on any non-`Canceled`
+   return. Original note follows.
+   **Was:** ~~Ingress-loop error recovery~~ — ✅ **fixed
    2026-08-08**: `receive` now propagates only `error.Canceled` (clean shutdown) and logs +
    `continue`s otherwise, and a failed `gpa.dupe` sheds the datagram
-   ([main.zig:245–271](../src/main.zig#L245)), matching the shape `dispatcherLoop` uses
-   ([main.zig:141–147](../src/main.zig#L141)). What remains is the *coroutine* half: if
+   ([main.zig:366–411](../src/main.zig#L366)), matching the shape `dispatcherLoop` uses
+   ([main.zig:150–157](../src/main.zig#L150)). What remains is the *coroutine* half: if
    `dispatcherLoop` ever returns, every future forwarded query hangs silently — the ingress
    loop keeps enqueuing to a table nobody drains. Have `main` watch the group (or wrap each
    loop body in a catch-all + respawn) instead of fire-and-forget `group.async`. Note that
@@ -438,16 +524,23 @@ constant records the caveat so nobody later swaps in a real MNAME and overruns t
      free) and do not free at the call site after `group.async` (use-after-free). The
      08-08 pass briefly had a second `gpa.dupe` at the call site, which leaked one copy per
      query and left the fatal `try` in place — worth not reintroducing.
-3. **Question-hash verification (finish P1.3).** The source-address check is in; on top
-   of the random proxy ID, store a hash of the question section in `PendingQuery` and
-   verify the response's question matches before forwarding to the client.
-4. **SERVFAIL on sweep.** When the sweeper evicts an entry, the client gets nothing and
-   waits out its own timeout. Sending SERVFAIL (RCODE=2) to `entry.client_addr` fails
-   fast. (The sweeper currently only holds `client_id`/`client_addr`/`expires_at`, which
-   is enough to craft the reply.)
+3. ~~**Question-hash verification.**~~ ✅ **Done 2026-08-09** — seeded `question_hash` +
+   `question_len` in `PendingQuery`, checked by the dispatcher **before** the entry is
+   consumed (`peek` → verify → `complete`; see the landed entry for why that ordering is
+   load-bearing). The reply path never re-parses.
+4. ~~**SERVFAIL on sweep.**~~ ✅ **Done 2026-08-09** — `sweepExpiredQueries` reports evicted
+   entries to the caller; `sweeperLoop` sends `Header.synthesizedReply(id, .server_failure)`.
+   Measured latency is ~5.4 s (the 5 s deadline plus up to 1 s of sweep granularity).
+   **Two follow-ups:** the reply carries QDCOUNT=0 because the sweeper has no question bytes
+   — `dig` accepts it, matching on ID, but a stricter stub resolver may ignore it and fall
+   back to its own timeout (never worse than the old silence). Echoing the question would
+   mean storing the bytes rather than the hash, which is a real memory trade, not a free
+   upgrade. And the 5 s deadline plus 1 s cadence are still hard-coded — newly unblocked for
+   **P2.1** now that their consumer takes runtime values, and arguably too long for a
+   forwarder (2–3 s is typical).
 5. **Bounded in-flight concurrency / backpressure.** The ingress loop does an unbounded
    `group.async(handleQuery, …)` plus a `gpa.dupe` **per received datagram**
-   ([main.zig:245–271](../src/main.zig#L245)). The P1.2 fix put a `catch` on that `dupe`, so
+   ([main.zig:366–411](../src/main.zig#L366)). The P1.2 fix put a `catch` on that `dupe`, so
    an allocation failure now sheds one datagram instead of killing the server — but that is
    a backstop, not a bound: nothing caps how many handlers are in flight before the
    allocator starts failing. A UDP flood still spawns unbounded coroutines and
@@ -498,52 +591,46 @@ constant records the caveat so nobody later swaps in a real MNAME and overruns t
 4. **Graceful shutdown.** No signal handling; the only exit is a crash or Ctrl-C
    mid-write. Catch SIGINT/SIGTERM, `group.cancel`, flush the console, run the deferred
    deinits.
-5. **Test coverage + CI. — still the top of the board.** The harness bug is fixed —
-   `zig build test` aggregates every module (see "Landed 2026-07-27"). **`17/17`, of which
-   14 are real** — the count moved three times over 08-08/08-09, after stalling since
-   2026-07-27. The seventeen are:
-   - **14 real behavior tests** — `DomainName` append
-     ([domain_name.zig](../src/dns/domain_name.zig)), allowlist hit/miss
-     ([allowlist.zig](../src/blocklist/allowlist.zig)), `parseQuestion` case normalization
-     ([question.zig](../src/dns/question.zig)), `SuffixBlockList.decide` parent-walk
-     ([suffix_blocklist.zig](../src/blocklist/suffix_blocklist.zig)), the three
-     `validateQuery` tests covering **P0.C3** ([header.zig:167+](../src/dns/header.zig#L167)),
-     the three `blocked_response.build` golden-bytes tests covering **P0.C2**
-     ([blocked_response.zig](../src/dns/blocked_response.zig)), and the four env-file /
-     precedence / port-validation tests covering **P2.1**
-     ([settings.zig](../src/settings.zig)).
-   - **3 that assert nothing about Vortex** — `root.zig`'s `add(3, 7) == 10` template stub;
-     `main.zig`'s "initialize sockets", which only checks
-     `IpAddress.parse("0.0.0.0", 5454).getPort() == 5454` (a std-library assertion); and the
-     anonymous `test { _ = @import(…) }` aggregator block in [main.zig](../src/main.zig),
-     which the runner counts as a passing test even though its whole job is to pull in the
-     other files. Four of the files it imports (`policy.zig`, `pending_table.zig`,
-     `utility.zig`, `console.zig`) still contain **no `test` blocks at all**.
+5. **Test coverage + CI.** The harness bug is fixed and **CI exists** (`.github/workflows/ci.yml`
+   — `zig fmt --check`, build, test, plus a ReleaseSafe job). **`30/30`, of which 27 are real**;
+   the count has moved four times over 08-08/08-09 after stalling since 2026-07-27.
+   - **27 real behavior tests** — `DomainName` append, allowlist hit/miss, `parseQuestion`
+     case normalization, `SuffixBlockList.decide` parent-walk, **nine** `Header` tests
+     (P0.C3 QR validation, P4.2 opcode/QDCOUNT, `headerOnlyReply`, `markTruncated`,
+     `synthesizedReply`), **three** `blocked_response.build` golden-bytes tests (P0.C2),
+     **four** `settings` env-file/precedence tests (P2.1), and **eight** `PendingTable`
+     tests (P1.1) covering round trip, idempotent complete, the B1 expiry regression,
+     no-op sweep, distinct proxy IDs, ID-space exhaustion, `peek` non-consumption, and
+     `hashQuestion`.
+   - **3 that assert nothing about Vortex** — `root.zig`'s `add(3, 7) == 10` stub;
+     `main.zig`'s "initialize sockets", which only checks a std-library assertion; and the
+     `test { _ = @import(…) }` aggregator, which the runner counts as a passing test.
 
-   **Lesson worth keeping — now confirmed twice.** The C3 test only became cheap once the
-   check moved out of `handleQuery` into the pure `Header.validateQuery`; the C2 test only
-   became *possible* once the blocked-response assembly moved into the pure
-   `blocked_response.build`. Anything reachable only through `handleQuery` needs an `Io` and
-   two live sockets to test; **pull the logic into a pure function and the test is a byte
-   array.** Both P0 test gaps closed the same way. Apply the move again for `PendingTable`
-   where you can — though its `Io` dependency is structural, not incidental, so expect that
-   one to cost more.
+   **The lesson, now confirmed four times.** C3 became testable when the check moved into
+   pure `Header.validateQuery`; C2 when assembly moved into pure `blocked_response.build`;
+   P2.1 when the dotenv parser split from the file read; P1.1 when
+   `sweepExpiredQueries` was changed to *report* evictions instead of sending them.
+   Every one of those is the same move: **separate deciding from doing, and the test needs
+   no `Io`.**
 
-   **Second lesson, from the C2 test:** assert against a *literal* byte array, not against
-   values recomputed from the same constants the code uses. The endianness bug this guards
-   is invisible to a test that reads `Authority.SERIAL` back.
+   Two more worth keeping:
+   - **Assert against literal bytes**, not values recomputed from the same constants the
+     code uses — that is what catches a byte-reversed SERIAL/TTL/MINIMUM.
+   - **Test the interaction, not just the units.** P1.3 and P1.4 were each correct in
+     isolation; the defect was that verifying a reply consumed the entry, so a rejected
+     forgery killed the real query. Only an end-to-end run against a hostile upstream
+     showed it.
 
    Still missing:
    - **`Question.parseQuestion` malformed-input tests** — the error paths
-     (`TruncatedQuestion`, `UnsupportedLabel` for a `>63` length byte / compression pointer,
-     `NameTooLong`) all exist in [question.zig](../src/dns/question.zig) and are all
-     unexercised; plus QDCOUNT≠1 once **P4.2** lands.
-   - The `PendingTable` suite from **P1.1**, `parseDomain`/`parseSuffixDomain` parsing
-     tests, and a **CI workflow** running `zig build test` — `.github/` does not exist yet,
-     so that last one is entirely untouched.
-   Housekeeping: `root.zig` is still the template stub (`add(3,7)` / `printAnotherMessage`)
-   and is the module root of the second (now near-empty) test artifact — fold it into the
-   aggregator or delete it. Deleting it also stops it inflating the pass count.
+     (`TruncatedQuestion`, `UnsupportedLabel`, `NameTooLong`) all exist in
+     [question.zig](../src/dns/question.zig) and are all unexercised.
+   - `parseDomain`/`parseSuffixDomain` parsing tests. `policy.zig` and `console.zig` are now
+     the only files carrying logic with **no `test` blocks at all**.
+   - **CI has never actually run.** Every step passes locally, but the workflow, the
+     `mlugg/setup-zig` action and the Ubuntu runner are unexercised until the first push.
+   Housekeeping: `root.zig` is still the template stub and the module root of the second
+   test artifact — fold it into the aggregator or delete it.
 6. **Deployment surface.** `127.0.0.1:5354` is dev-only. Real use means `0.0.0.0:53`
    (privileged port → capability / launchd / systemd unit), an IPv6 listener, and a
    service definition. Pick the target platform and add the unit files.
@@ -586,6 +673,11 @@ the previous. (P3.4 wildcard blocking is now **done** — see the top of this do
    arithmetic `WIRE_LEN` currently makes trivial.
 6. **TCP fallback.** On TC=1 from upstream, retry over TCP with 2-byte length framing
    (RFC 1035 §4.2.2). The dispatcher detects TC=1 and hands off to a TCP path.
+   **Newly concrete as of 08-09:** we now *set* TC=1 ourselves when an upstream reply
+   overflows the 4096-byte buffer, so a conforming client will retry over TCP and find
+   nothing listening. That is a deliberate, honest failure rather than the silent corruption
+   it replaced — but it means this item now has a reachable trigger, not just a theoretical
+   one. A TCP listener would also remove the ingress-side FORMERR for oversized queries.
 7. **Multiple upstreams / DoT / DoH.** Future arcs the dispatcher architecture was chosen
    to accommodate (a connection pool replaces `upstream_socket`, same `PendingTable`
    pattern). See the evolution table in [upstream-design.md](upstream-design.md).
@@ -610,7 +702,8 @@ real sinkhole (the Pi-hole / AdGuard Home / Unbound-`local-zone` feature class):
      not just flipped header flags.
    Decide a default, make it configurable, and branch on `qtype` (A vs AAAA vs everything
    else). This subsumes C2 (the SOA is required for the NODATA/NXDOMAIN caching paths).
-2. **QDCOUNT / opcode validation.** `parseQuestion` always reads exactly one question at
+2. ~~**QDCOUNT / opcode validation.**~~ ✅ **Done 2026-08-09** — see the landed entry above. Original spec follows.
+   **Was:** `parseQuestion` always reads exactly one question at
    offset 12 regardless of QDCOUNT, and opcode is parsed but unused. Reject QDCOUNT≠1 and
    non-standard opcodes with FORMERR/NOTIMP instead of parsing whatever is at offset 12.
    Same root cause as **P0.C3**, which is now fixed — so both prerequisites already exist
@@ -629,7 +722,7 @@ real sinkhole (the Pi-hole / AdGuard Home / Unbound-`local-zone` feature class):
 
    Order matters — QR is checked first because it is the only one that must *not* generate
    a reply. Then handle the two new variants in `handleQuery`'s switch
-   ([main.zig:74–80](../src/main.zig#L74)); the compiler will point at it for you. A
+   ([main.zig:67–83](../src/main.zig#L67)); the compiler will point at it for you. A
    placeholder comment marks the spot in `Rejection`. Flag-flipping is already
    rcode-parameterized: `Header.writeResponseFlags(msg, .format_error)`.
 
@@ -686,8 +779,8 @@ real sinkhole (the Pi-hole / AdGuard Home / Unbound-`local-zone` feature class):
   an SOA", which C2 made false back on 07-30.
 - ~~**Stale comment on `PendingQuery.expires_at`**~~ — ✅ **fixed 2026-08-08.** It claimed
   "ns since boot, `std.time.nanoTimestamp()`"; both the writer
-  ([main.zig:122](../src/main.zig#L122)) and the sweeper
-  ([pending_table.zig:89](../src/utils/pending_table.zig#L89)) use ns-since-epoch from
+  ([main.zig:132](../src/main.zig#L132)) and the sweeper
+  ([pending_table.zig:153](../src/utils/pending_table.zig#L153)) use ns-since-epoch from
   `std.Io.Timestamp.now(io, .real)`. There was never a bug, but this was the comment that
   invited reintroducing **B1** (the fixed ns/ms mismatch); it now names the clock and says
   why the unit matters.

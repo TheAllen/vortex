@@ -111,25 +111,30 @@ mutating under live readers.
 
 ## Where it actually stands
 
-Roughly **one third** of the way to "production-ready home sinkhole," with the
-caveat that the expensive-to-reverse architectural decisions are the ones already
-made. [`docs/progress.md`](docs/progress.md) has the weighted breakdown and what
-would actually move it.
+Roughly **40%** of the way to "production-ready home sinkhole," with the caveat
+that the expensive-to-reverse architectural decisions are the ones already made.
+[`docs/progress.md`](docs/progress.md) has the weighted breakdown and what would
+actually move it.
 
-Done and pinned by regression tests: QName case normalization, cacheable SOA on
-blocked answers, and QR-bit validation on ingress. `zig build test` runs 17 tests,
-14 of which assert real behavior.
+**The query datapath is complete and tested.** Header validation (QR, opcode,
+QDCOUNT), QName case normalization, cacheable SOA on blocked answers, replies
+verified against the question that provoked them, SERVFAIL on upstream timeout,
+and TC=1 rather than silent corruption when a reply overflows the receive buffer.
+`zig build test` runs 30 tests, 27 asserting real behavior, under both Debug and
+ReleaseSafe.
 
 > [!WARNING]
-> **Do not bind this off localhost yet.** There is no cap on in-flight handlers
-> (a UDP flood spawns unbounded coroutines and heap) and no per-client rate
-> limiting. Until those land, the localhost default is load-bearing as a security
-> control, not just a dev convenience.
+> **Do not bind this off localhost yet.** There is no cap on in-flight handlers —
+> a UDP flood spawns unbounded coroutines and heap — and no per-client rate
+> limiting. The localhost default is load-bearing as a security control, not a dev
+> convenience. Since configuration became runtime, removing that guard rail is a
+> one-line edit rather than a recompile, so this matters more than it used to.
 
-Also missing: response caching, DNS message compression, EDNS0, TCP fallback,
-graceful shutdown, structured logging and metrics, and blocklist refresh with an
-on-disk cache — today a failed fetch at startup is fatal.
-[`docs/next_steps.md`](docs/next_steps.md) is the full prioritized board.
+The gap is everything around the datapath: response caching, DNS message
+compression, EDNS0, TCP fallback, graceful shutdown, structured logging and
+metrics, and blocklist refresh with an on-disk cache — today a failed fetch at
+startup is fatal. [`docs/next_steps.md`](docs/next_steps.md) is the full
+prioritized board.
 
 ## Documentation
 

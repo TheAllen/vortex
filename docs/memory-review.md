@@ -8,9 +8,9 @@ Findings from a one-off review of `src/` for memory bugs, ordered by severity.
 > lifetime) is **P4.5**, and **#6** (unbounded in-flight handlers) is **P1.5**,
 > one of the two gates on binding off localhost.
 >
-> **One partial:** #4's primary bug (the units mismatch) is fixed, but its
-> secondary recommendation — `@intCast` instead of `@truncate` when narrowing the
-> timestamp — was not adopted. See the note under that finding.
+> **#4 is now fully resolved** (2026-08-09). Its secondary recommendation —
+> `@intCast` instead of `@truncate` when narrowing the timestamp — was adopted
+> along with a move off the settable wall clock. See the note under that finding.
 >
 > **On line numbers:** the `Where:` lines record where things were on 2026-07-12
 > and have since drifted. Resolution notes and the *Verified sound* section cite
@@ -48,9 +48,10 @@ Findings from a one-off review of `src/` for memory bugs, ordered by severity.
 ### 2. [x] Discarded `io.async` futures — dangling result storage
 
 > **Fixed.** Tasks live in a long-lived `std.Io.Group` in `main`
-> (`main.zig:236-240`), so every completion has live result storage. The two
-> startup blocklist fetches keep their futures and `await` both before
-> propagating either error (`main.zig:199-218`).
+> (`main.zig:353-357`), so every completion has live result storage. Both loops
+> now go through a supervisor that restarts them (P1.2, 08-09). The two startup
+> blocklist fetches keep their futures and `await` both before propagating
+> either error (`main.zig:311-330`).
 
 - **Where:** `src/main.zig:188`, `src/main.zig:189`, `src/main.zig:198`
 - **What:** `_ = io.async(...)` discards the returned `Future`. In the 0.16
@@ -67,7 +68,7 @@ Findings from a one-off review of `src/` for memory bugs, ordered by severity.
 
 ### 3. [x] Memory leak in the sweeper — every second
 
-> **Fixed.** `defer dead_queries.deinit(self.gpa)` (`pending_table.zig:94`). Was P0.B2.
+> **Fixed.** `defer dead_queries.deinit(self.gpa)` (`pending_table.zig:158`). Was P0.B2.
 
 - **Where:** `src/utils/pending_table.zig:86`
 - **What:** `sweepExpiredQueries` allocates `dead_queries` with
@@ -77,20 +78,27 @@ Findings from a one-off review of `src/` for memory bugs, ordered by severity.
 
 ### 4. [x] Expiry units mismatch — entries never expire
 
-> **Fixed — the units half.** Writer and sweeper both use nanoseconds from
-> `std.Io.Timestamp.now(io, .real)` (`main.zig:113`, `pending_table.zig:89`), and
-> the comment on `PendingQuery.expires_at` now names the clock and unit so the
-> mismatch is harder to reintroduce. Was P0.B1.
+> **Fixed — the units half.** Writer and sweeper both use nanoseconds from the
+> same clock (`main.zig:132`, `pending_table.zig:153`), and the comment on
+> `PendingQuery.expires_at` now names the clock and unit so the mismatch is
+> harder to reintroduce. Was P0.B1.
 >
-> **Not adopted — the `@intCast` half.** Both sites still `@truncate`. That
-> narrows an **i96** (`Io.Timestamp.nanoseconds`) to `i64`, so an out-of-range
-> value would wrap silently instead of trapping. Benign in practice: nanoseconds
-> since the epoch is ~1.8 × 10¹⁸ against an i64 ceiling of ~9.2 × 10¹⁸, so it
-> holds until the year 2262. Switching both to `@intCast` costs nothing and
-> turns a silent wrap into a panic — worth doing, just not done.
+> **Also fixed (2026-08-09) — the `@intCast` half.** Both sites now `@intCast`,
+> so narrowing `Io.Timestamp.nanoseconds` (an **i96**) to `i64` traps instead of
+> silently wrapping.
 >
-> Neither half is pinned by a test: `PendingTable` still has zero coverage, which
-> is **P1.1** and the single largest test gap in the project.
+> **And a third problem this finding did not spot.** Both sides were reading
+> `Clock.real`, the *settable* wall clock — std documents it as subject to NTP
+> steps and manual adjustment. A step backwards would let entries outlive their
+> deadline; a step forwards would evict every in-flight query at once. Both now
+> use `Clock.boot`: monotonic, and unlike `.awake` it counts time the machine
+> spends suspended, so a query outstanding across a laptop sleep is correctly
+> treated as long dead. The sweep cadence moved to the same clock.
+>
+> **Now pinned by tests.** `PendingTable` went from zero coverage to eight tests
+> (P1.1, done 2026-08-09). The expiry test reintroduces B1 exactly under mutation
+> and fails — and because its helper reads the same clock the sweeper does, it
+> also catches a *clock* mismatch between the two sides, not just a unit one.
 
 - **Where:** `src/main.zig:92` (stores **nanoseconds**) vs.
   `src/utils/pending_table.zig:85` (compares **milliseconds**)
@@ -140,8 +148,8 @@ Findings from a one-off review of `src/` for memory bugs, ordered by severity.
 > a compile-time constant, so reaching this bug required a recompile; now
 > `VORTEX_LISTEN_HOST=0.0.0.0` is one line in a config file.
 
-- **Where:** `src/main.zig:203` *(2026-07-12)* — now `src/main.zig:268`, the
-  `group.async(io, handleQuery, ...)` spawn; the `gpa.dupe` at `:263` is the
+- **Where:** `src/main.zig:203` *(2026-07-12)* — now `src/main.zig:406`, the
+  `group.async(io, handleQuery, ...)` spawn; the `gpa.dupe` at `:401` is the
   natural place to acquire a semaphore.
 - **What:** Split out from finding #2. The `std.Io.Group` fix gives every
   task's completion live result storage, but the main loop still spawns one
@@ -193,17 +201,18 @@ Checked and found no issues. **Re-verified 2026-08-09** against a `main.zig` tha
 has changed substantially since — all four still hold, at these locations:
 
 - `handleQuery`'s `defer gpa.free(data)` covers all exit paths
-  (`src/main.zig:57`). It now covers three *more* early returns than it did in
-  July — the QR-bit drop, the malformed-question drop, and the blocked-response
-  path — which is why `main.zig` carries an ownership note at the call site
-  (`:259-262`): do not free in those branches, and do not free after
-  `group.async`.
+  (`src/main.zig:59`). It now covers several *more* early returns than it did in
+  July — the QR-bit drop, the P4.2 opcode/QDCOUNT rejections, the
+  malformed-question drop, and the blocked-response path — which is why
+  `main.zig` carries an ownership note at the call site (`:397-400`): do not free
+  in those branches, and do not free after `group.async`.
 - `parseQuestion`'s bounds checks are correct (`src/dns/question.zig`). Still
   correct, still **untested** — all three error paths are unexercised (P2.5).
 - The dispatcher sends synchronously from `msg_buf` before the next receive, so
-  there is no buffer-reuse race (`src/main.zig:129-159`).
+  there is no buffer-reuse race (`src/main.zig:148-222`).
 - The main loop's `gpa.dupe` happens before the receive buffer is reused
-  (`src/main.zig:263`).
+  (`src/main.zig:401`). An oversized datagram is now refused *before* this point,
+  so a truncated query never reaches a handler at all (08-09).
 
 Two further properties established after this review, both memory-relevant and
 worth recording here so they are not re-litigated:

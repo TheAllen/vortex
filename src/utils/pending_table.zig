@@ -3,6 +3,21 @@ const std = @import("std");
 pub const PendingQuery = struct {
     client_id: u16,
     client_addr: std.Io.net.IpAddress,
+
+    /// Seeded hash of the query's question section, and its length on the wire.
+    ///
+    /// Together these let the dispatcher confirm a reply answers *this* query
+    /// before it is forwarded: the upstream echoes the question verbatim, so the
+    /// bytes at the same offset in the reply must hash identically. Storing the
+    /// length as well means the reply path never re-parses — it slices a known
+    /// range and hashes it, so a malformed or hostile question in a forged reply
+    /// gets no parser to attack.
+    ///
+    /// A hash rather than the bytes: 10 bytes per in-flight query instead of up
+    /// to 259, and matching is all we need. See `hashQuestion` for why the seed
+    /// is per-process.
+    question_hash: u64,
+    question_len: u16,
     /// Nanoseconds on the **`.boot` clock** (`std.Io.Timestamp.now(io, .boot)`),
     /// the same clock and unit `sweepExpiredQueries` compares against.
     ///
@@ -15,6 +30,19 @@ pub const PendingQuery = struct {
     /// correctly treated as long dead.
     expires_at: i64,
 };
+
+/// Hashes a DNS message's question section — the `question_len` bytes starting
+/// at offset 12 — returning null if the message is too short to hold them.
+///
+/// `seed` is drawn once per process rather than fixed at zero. An off-path
+/// attacker forging a reply must already guess the 16-bit proxy ID and spoof the
+/// upstream's source address; a fixed seed would additionally let them
+/// precompute a colliding question offline, and a random one costs nothing.
+pub fn hashQuestion(seed: u64, msg: []const u8, question_len: u16) ?u64 {
+    const end = 12 + @as(usize, question_len);
+    if (msg.len < end) return null;
+    return std.hash.Wyhash.hash(seed, msg[12..end]);
+}
 
 /// PendingTable is responsible for holding DNS queries that have been sent to upstream resolver.
 /// It serves as a source of truth for DNS queries inflight.
@@ -69,6 +97,23 @@ pub const PendingTable = struct {
         }
 
         return error.IdSpaceExhausted;
+    }
+
+    /// Looks up an entry **without** removing it.
+    ///
+    /// The dispatcher needs this to validate a reply before consuming the entry.
+    /// If it used `complete` first, a forged packet that guessed the proxy ID
+    /// would delete the pending query as a side effect of being rejected —
+    /// denying service to the real reply that arrives moments later, and leaving
+    /// nothing for the sweeper to SERVFAIL. Peek, verify, then complete.
+    pub fn peek(self: *PendingTable, proxy_id: u16) ?PendingQuery {
+        self.mutex.lock(self.io) catch {
+            std.log.err("Failed to acquire lock while peeking pending query...", .{});
+            return null;
+        };
+        defer self.mutex.unlock(self.io);
+
+        return self.map.get(proxy_id);
     }
 
     /// Attempts to acquire a mutex then fetchRemove a entry by proxy_id
@@ -139,8 +184,48 @@ fn queryExpiringIn(io: std.Io, client_id: u16, offset_ns: i64) PendingQuery {
     return .{
         .client_id = client_id,
         .client_addr = std.Io.net.IpAddress.parse("127.0.0.1", 5354) catch unreachable,
+        .question_hash = 0,
+        .question_len = 0,
         .expires_at = now + offset_ns,
     };
+}
+
+/// A 12-byte header followed by `question` — the shape `hashQuestion` slices.
+fn msgWithQuestion(comptime question: []const u8) [12 + question.len]u8 {
+    var msg: [12 + question.len]u8 = @splat(0);
+    @memcpy(msg[12..], question);
+    return msg;
+}
+
+test "hashQuestion matches only on identical question bytes" {
+    const a = msgWithQuestion("\x03ads\x07example\x03com\x00\x00\x01\x00\x01");
+    const qlen: u16 = a.len - 12;
+
+    // Same bytes, same seed -> same hash. This is the whole mechanism: the
+    // upstream echoes our question, so a genuine reply hashes identically.
+    try testing.expectEqual(
+        hashQuestion(99, &a, qlen).?,
+        hashQuestion(99, &a, qlen).?,
+    );
+
+    // A different question must not match — this is the forged-reply case.
+    const b = msgWithQuestion("\x03ads\x07example\x03net\x00\x00\x01\x00\x01");
+    try testing.expect(hashQuestion(99, &a, qlen).? != hashQuestion(99, &b, qlen).?);
+
+    // Trailing answer records must not disturb the hash: only the question
+    // range is covered, so a real reply (question + answers) still matches.
+    var with_answers: [a.len + 32]u8 = @splat(0xAB);
+    @memcpy(with_answers[0..a.len], &a);
+    try testing.expectEqual(hashQuestion(99, &a, qlen).?, hashQuestion(99, &with_answers, qlen).?);
+
+    // Per-process seed: the same question under a different seed differs, so a
+    // collision cannot be precomputed offline.
+    try testing.expect(hashQuestion(1, &a, qlen).? != hashQuestion(2, &a, qlen).?);
+
+    // Too short to hold the claimed question -> null, never a bogus match. A
+    // forged reply truncated mid-question hits this.
+    try testing.expect(hashQuestion(99, &a, qlen + 1) == null);
+    try testing.expect(hashQuestion(99, a[0..12], qlen) == null);
 }
 
 test "appendQuery then complete round trips, and complete is idempotent" {
@@ -252,4 +337,22 @@ test "appendQuery fails cleanly once the 16-bit ID space is full" {
     const freed = table.complete(0x1234);
     try testing.expect(freed != null);
     _ = try table.appendQuery(queryExpiringIn(testing.io, 0, 3600 * std.time.ns_per_s));
+}
+
+test "peek does not consume the entry" {
+    var table = PendingTable.init(testing.allocator, testing.io, 3);
+    defer table.deinit();
+
+    const id = try table.appendQuery(queryExpiringIn(testing.io, 0x4242, std.time.ns_per_s));
+
+    // Repeated peeks must all succeed. The dispatcher rejects a forged reply by
+    // peeking and walking away; if that removed the entry, one guessed proxy ID
+    // would be enough to kill a legitimate in-flight query.
+    try testing.expectEqual(@as(u16, 0x4242), table.peek(id).?.client_id);
+    try testing.expectEqual(@as(u16, 0x4242), table.peek(id).?.client_id);
+    try testing.expectEqual(@as(u32, 1), table.map.count());
+
+    // And the real reply can still complete it afterwards.
+    try testing.expectEqual(@as(u16, 0x4242), table.complete(id).?.client_id);
+    try testing.expect(table.peek(id) == null);
 }
