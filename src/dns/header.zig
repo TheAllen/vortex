@@ -88,18 +88,81 @@ pub const Header = packed struct(u96) {
         /// us a reflector and burn a PendingTable slot per injected packet.
         is_response,
 
-        // P4.2 extends this: `bad_qdcount` (QDCOUNT != 1) and `bad_opcode`
-        // (non-standard OPCODE). Unlike `is_response` those are real queries
-        // from a real client, so they warrant a FORMERR/NOTIMP reply rather
-        // than a silent drop — see next_steps.md P4.2.
+        /// OPCODE is something other than a standard query (IQUERY, STATUS,
+        /// or reserved). Answer NOTIMP — this is a real client asking for
+        /// something we don't do, not an attack.
+        bad_opcode,
+
+        /// QDCOUNT != 1. `parseQuestion` always reads one question at offset
+        /// 12, so anything else means we'd be parsing bytes that aren't a
+        /// question. Answer FORMERR.
+        bad_qdcount,
+
+        /// Whether this rejection should produce a reply, and with what RCODE.
+        /// `null` means drop silently.
+        pub fn rcode(self: Rejection) ?RCode {
+            return switch (self) {
+                .none => null,
+                // A server must never answer a response — replying would make
+                // us usable as a reflector amplifier.
+                .is_response => null,
+                .bad_opcode => .not_implemented,
+                .bad_qdcount => .format_error,
+            };
+        }
     };
 
     /// Header-level validation, run before the question is parsed or any policy
     /// is applied. Pure: inspects the parsed header only, so it is unit-testable
     /// without an `Io` or a socket.
+    ///
+    /// Order matters. QR is checked first because it is the only rejection that
+    /// must **not** generate a reply: a spoofed response with a bogus QDCOUNT
+    /// has to stay silent, or we hand an attacker a reflector.
     pub fn validateQuery(self: *const Header) Rejection {
         if (self.qr == 1) return .is_response;
+        if (self.opcode != .standard_query) return .bad_opcode;
+        if (self.question_count != 1) return .bad_qdcount;
         return .none;
+    }
+
+    /// Sets TC=1 on an existing message in place, leaving every other bit alone.
+    ///
+    /// Separate from `writeResponseFlags` (which clears TC) because this is used
+    /// on a message we are *relaying*, not synthesizing: a reply from upstream
+    /// that overflowed our receive buffer. TC=1 is the only way to tell the
+    /// client "what you're holding is incomplete, ask again over TCP" — without
+    /// it they parse a silently corrupt message.
+    pub fn markTruncated(msg: []u8) void {
+        std.debug.assert(msg.len >= 12);
+
+        var flags = std.mem.readInt(u16, msg[2..4], .big);
+        flags |= 1 << 9; // TC=1
+        std.mem.writeInt(u16, msg[2..4], flags, .big);
+    }
+
+    /// A 12-byte reply carrying nothing but the header: the query's ID, response
+    /// flags with `rcode`, and **all four section counts zeroed**.
+    ///
+    /// Used where the question section cannot be echoed. RFC 1035 §4.1.2 says a
+    /// reply should repeat the question, but for `bad_qdcount` whether a
+    /// parseable question exists at all is precisely what is in doubt, and for
+    /// `bad_opcode` (IQUERY, STATUS) there may be no question section at
+    /// all. Zeroing QDCOUNT and sending only the header is what BIND does in the
+    /// same spot, and it is the only self-consistent message we can produce.
+    ///
+    /// Contrast `blocked_response.build`, which *does* echo the question — there
+    /// the question is known good, because we parsed it to make the decision.
+    pub fn headerOnlyReply(query: []const u8, rcode: RCode) [12]u8 {
+        std.debug.assert(query.len >= 12);
+
+        var out: [12]u8 = undefined;
+        @memcpy(&out, query[0..12]);
+        writeResponseFlags(&out, rcode);
+
+        // QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT — no sections follow.
+        @memset(out[4..12], 0);
+        return out;
     }
 
     /// Deserialize Header section to little-endian format
@@ -204,4 +267,87 @@ test "validateQuery keys on QR alone, not the other flags" {
     var odd_query = wireHeader(0, 0x0603, 1); // AA=1, TC=1, RCODE=3, QR=0
     header.parseHeader(&odd_query);
     try testing.expectEqual(Header.Rejection.none, header.validateQuery());
+}
+
+test "validateQuery rejects non-standard opcodes (P4.2)" {
+    var header = Header{};
+
+    // OPCODE occupies bits 11-14. IQUERY (1) and STATUS (2) are real opcodes we
+    // don't implement; 15 is reserved. All three earn NOTIMP rather than being
+    // parsed as if they carried a standard question.
+    for ([_]u16{ 1, 2, 15 }) |opcode| {
+        var wire = wireHeader(0, opcode << 11, 1);
+        header.parseHeader(&wire);
+        try testing.expectEqual(Header.Rejection.bad_opcode, header.validateQuery());
+        try testing.expectEqual(Header.RCode.not_implemented, header.validateQuery().rcode().?);
+    }
+
+    // Opcode 0 with an otherwise identical header is still fine.
+    var standard = wireHeader(0, 0, 1);
+    header.parseHeader(&standard);
+    try testing.expectEqual(Header.Rejection.none, header.validateQuery());
+}
+
+test "validateQuery rejects QDCOUNT != 1 (P4.2)" {
+    var header = Header{};
+
+    // parseQuestion unconditionally reads one question at offset 12. QDCOUNT=0
+    // means there is nothing there; QDCOUNT>1 means we would silently ignore
+    // the rest. Either way we would be acting on bytes we did not validate.
+    for ([_]u16{ 0, 2, 65535 }) |qdcount| {
+        var wire = wireHeader(0, 0x0100, qdcount);
+        header.parseHeader(&wire);
+        try testing.expectEqual(Header.Rejection.bad_qdcount, header.validateQuery());
+        try testing.expectEqual(Header.RCode.format_error, header.validateQuery().rcode().?);
+    }
+}
+
+test "validateQuery checks QR before anything that would generate a reply" {
+    // The ordering is load-bearing, not incidental. A spoofed *response* that
+    // also has a bogus QDCOUNT must be dropped silently — if it came back as
+    // `bad_qdcount` we would send a FORMERR to whatever address the attacker
+    // forged, which is exactly the reflector P0.C3 closed.
+    var wire = wireHeader(0, 0x8000 | (2 << 11), 7); // QR=1, opcode=2, QDCOUNT=7
+    var header = Header{};
+    header.parseHeader(&wire);
+
+    try testing.expectEqual(Header.Rejection.is_response, header.validateQuery());
+    try testing.expect(header.validateQuery().rcode() == null);
+}
+
+test "headerOnlyReply echoes the ID and zeroes every section count" {
+    // A FORMERR for a query claiming QDCOUNT=3, with a question section that we
+    // must not echo because we never validated it.
+    var wire = wireHeader(0xBEEF, 0x0100, 3); // RD=1
+    const reply = Header.headerOnlyReply(&wire, .format_error);
+
+    try testing.expectEqual(@as(usize, 12), reply.len);
+    try testing.expectEqual(@as(u16, 0xBEEF), std.mem.readInt(u16, reply[0..2], .big));
+
+    // QR=1, opcode=0 preserved, AA=0, TC=0, RD=1 preserved, RA=1, Z=0, RCODE=1.
+    try testing.expectEqual(@as(u16, 0x8181), std.mem.readInt(u16, reply[2..4], .big));
+
+    // Every count zero — including QDCOUNT, since no question follows.
+    try testing.expectEqualSlices(u8, &[_]u8{0} ** 8, reply[4..12]);
+}
+
+test "markTruncated sets TC and touches nothing else" {
+    // A relayed upstream reply: QR=1, RD=1, RA=1, RCODE=0 — plus real section
+    // counts, which must survive since the client needs them to parse what did
+    // arrive.
+    var wire = wireHeader(0x0A0B, 0x8180, 1);
+    std.mem.writeInt(u16, wire[6..8], 9, .big); // ANCOUNT = 9
+
+    Header.markTruncated(&wire);
+
+    // 0x8180 | TC(bit 9) == 0x8380. Asserting the whole word catches a flag
+    // clobbered on the way through.
+    try testing.expectEqual(@as(u16, 0x8380), std.mem.readInt(u16, wire[2..4], .big));
+    try testing.expectEqual(@as(u16, 0x0A0B), std.mem.readInt(u16, wire[0..2], .big));
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, wire[4..6], .big));
+    try testing.expectEqual(@as(u16, 9), std.mem.readInt(u16, wire[6..8], .big));
+
+    // Idempotent — a reply that already had TC set stays valid.
+    Header.markTruncated(&wire);
+    try testing.expectEqual(@as(u16, 0x8380), std.mem.readInt(u16, wire[2..4], .big));
 }

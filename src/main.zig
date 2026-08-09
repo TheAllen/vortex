@@ -62,12 +62,22 @@ fn handleQuery(
     var header = Header{};
     header.parseHeader(data[0..12]);
 
-    switch (header.validateQuery()) {
-        .none => {},
-        .is_response => {
-            std.log.debug("dropping response-as-query from {f}", .{incoming_addr});
-            return;
-        },
+    const rejection = header.validateQuery();
+    if (rejection != .none) {
+        // `rcode()` decides drop-vs-reply. QR=1 is the silent case: answering a
+        // response would make us a reflector. The others are real clients
+        // asking for something malformed or unimplemented, so they get an
+        // answer — header-only, since their question section is exactly what we
+        // could not trust.
+        if (rejection.rcode()) |rcode| {
+            const reply = Header.headerOnlyReply(data, rcode);
+            ctx.client_socket.send(io, &incoming_addr, &reply) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => {},
+            };
+        }
+        std.log.debug("rejecting query from {f}: {s}", .{ incoming_addr, @tagName(rejection) });
+        return;
     }
 
     var question = Question{};
@@ -148,6 +158,22 @@ fn dispatcherLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
         };
 
         std.mem.writeInt(u16, reply_msg.data[0..2], entry.client_id, .big);
+
+        // The datagram was larger than `msg_buf` and the tail was discarded. We
+        // forward the client's OPT verbatim, so a client advertising an EDNS0
+        // buffer above 4096 can legitimately provoke this. Relaying the prefix
+        // as-is hands the client a silently corrupt message; TC=1 tells them it
+        // is incomplete and to retry over TCP. (That retry has nowhere to land
+        // until P3.6 adds a TCP listener — an honest failure rather than
+        // silent corruption.)
+        if (reply_msg.flags.trunc) {
+            std.log.warn("upstream reply for id={x} exceeded {d}-byte buffer; setting TC", .{
+                proxy_id,
+                msg_buf.len,
+            });
+            Header.markTruncated(reply_msg.data);
+        }
+
         ctx.client_socket.send(io, &entry.client_addr, reply_msg.data) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             else => {
@@ -256,6 +282,27 @@ pub fn main(init: std.process.Init) !void {
         };
 
         const incoming_addr: std.Io.net.IpAddress = incoming.from;
+
+        // The query was larger than `buffer` and its tail is gone. Parsing the
+        // prefix would mean acting on a question we only half received, so this
+        // is refused before the dupe and the coroutine spawn — a flood of
+        // oversized datagrams costs one 12-byte reply each and nothing more.
+        // FORMERR is safe to send here: the reply is far smaller than the
+        // query, so it carries no amplification value.
+        if (incoming.flags.trunc) {
+            std.log.warn("oversized query from {f} exceeded {d}-byte buffer", .{
+                incoming_addr,
+                buffer.len,
+            });
+            if (incoming.data.len >= 12) {
+                const reply = Header.headerOnlyReply(incoming.data, .format_error);
+                client_socket.send(io, &incoming_addr, &reply) catch |err| switch (err) {
+                    error.Canceled => return,
+                    else => {},
+                };
+            }
+            continue;
+        }
 
         // `buffer` is reused by the next receive, so the handler needs its own copy.
         // Ownership transfers to `handleQuery`, whose `defer gpa.free(data)` releases
