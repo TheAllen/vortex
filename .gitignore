@@ -1,0 +1,16 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Local configuration. `.env.example` is the committed reference; copy it to
+# `.env` and edit. Vortex runs fine with no `.env` at all — it falls back to
+# built-in defaults — so nothing here is required to build or run.
+.env
+
+# Editor / tooling local state
+.claude/settings.local.json
+.vscode/
+.idea/
+
+# macOS
+.DS_Store

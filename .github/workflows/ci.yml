@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets you re-run the suite by hand from the Actions tab without a push.
+  workflow_dispatch:
+
+# A new push to the same branch cancels the previous run rather than queueing
+# behind it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          # Pinned to match `minimum_zig_version` in build.zig.zon. Zig is
+          # pre-1.0 and std changes shape between releases (this project already
+          # tracks the 0.16 `std.Io` rewrite), so an unpinned toolchain would
+          # break the build on an unrelated day.
+          version: 0.16.0
+
+      - name: Check formatting
+        run: zig fmt --check .
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test --summary all
+
+  # Fails the build if `zig build` emits anything under ReleaseSafe that Debug
+  # let through — a cheap guard on a codebase that leans on `std.debug.assert`
+  # for wire-format bounds (see src/dns/authority.zig).
+  release-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig build -Doptimize=ReleaseSafe
+      - run: zig build test -Doptimize=ReleaseSafe --summary all
