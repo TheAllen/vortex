@@ -92,10 +92,28 @@ they came out of re-reading the datapath rather than from the existing list.
   reads, so "already expired" is a negative offset. Mutation-verified five ways, including
   reintroducing B1 verbatim.
 - **P1.2 — supervisor (the coroutine half).** One `supervise(io, ctx, name, loop)`
-  ([main.zig:271](../src/main.zig#L271)) covers both loops, which now share a
+  ([main.zig:313](../src/main.zig#L313)) covers both loops, which now share a
   `fn (Io, *const Context)` shape (`sweeperLoop` takes its allocator from `Context`). Neither
   loop can currently return, so this guards a future edit — it earns its place because the
   failure is total and silent.
+
+  **With exponential backoff** ([main.zig:288](../src/main.zig#L288)). The supervisor is a
+  `while` wrapping a loop that itself blocks forever, so in the healthy case its body never
+  completes an iteration and costs nothing but a stack frame. The hazard is the opposite
+  case: a `loop` that returns *immediately* would be restarted as fast as the CPU allows,
+  pinning a core and writing error logs in a tight spin — the classic supervisor crash loop.
+  The schedule is `0s → 1s → 2s → 4s → 8s → 16s → 30s` (capped), with two deliberate
+  properties:
+  - **The first restart is immediate**, so a single spurious return recovers with no added
+    latency. Only repeated failures back off.
+  - **A clean run of 60s resets the schedule**, so a process up for a month does not inherit
+    a 30s penalty from an unrelated hiccup at startup.
+
+  `io.sleep` propagates `error.Canceled`, so shutdown never waits out a 30s delay.
+  `backoffSeconds` is pure and separately tested — including saturation, because an
+  unbounded shift would overflow the `u6` and panic, turning a recoverable crash loop into a
+  hard crash. *Verified live by temporarily making `sweeperLoop` return immediately: 8
+  restarts in 75 seconds, against millions without the backoff.*
 - **P1.3 — question verification (the second half).** `PendingQuery` carries a seeded
   `question_hash` plus `question_len`. Storing the length means the reply path **never
   re-parses**: it slices a known range and hashes it, so a hostile question in a forged reply
@@ -329,7 +347,7 @@ correct in the source — including the 34-byte SOA math in
   upstream send failure ([main.zig:143](../src/main.zig#L143)); the bogus `main.zig` import
   is gone; the capacity guard is `> maxInt(u16)`
   ([:37](../src/utils/pending_table.zig#L37)); `pending_table.deinit()` is deferred
-  ([main.zig:347](../src/main.zig#L347)).
+  ([main.zig:396](../src/main.zig#L396)).
 - **P1.3 (partial)** — dispatcher now drops responses whose source address isn't the
   upstream. The optional question-hash verification is still open (see P1 below).
 - **P3.4** — suffix/wildcard blocking implemented, plus a curated allowlist that
@@ -506,8 +524,9 @@ of what each was and how it was resolved.
    sweep-only-expired, collision retry, ID-space exhaustion, idempotent complete. B1
    would have been caught by the first expiry test.
 2. ~~**Supervisor for dispatcher/sweeper death.**~~ ✅ **Done 2026-08-09** — `supervise`
-   ([main.zig:271](../src/main.zig#L271)) wraps both loops and restarts on any non-`Canceled`
-   return. Original note follows.
+   ([main.zig:313](../src/main.zig#L313)) wraps both loops and restarts on any non-`Canceled`
+   return, with exponential backoff (`0s → 1s → … → 30s`, reset after a 60s clean run) so a
+   fast-returning loop cannot become a spin. Original note follows.
    **Was:** ~~Ingress-loop error recovery~~ — ✅ **fixed
    2026-08-08**: `receive` now propagates only `error.Canceled` (clean shutdown) and logs +
    `continue`s otherwise, and a failed `gpa.dupe` sheds the datagram
@@ -613,13 +632,29 @@ of what each was and how it was resolved.
    Every one of those is the same move: **separate deciding from doing, and the test needs
    no `Io`.**
 
-   Two more worth keeping:
+   Three more worth keeping:
    - **Assert against literal bytes**, not values recomputed from the same constants the
      code uses — that is what catches a byte-reversed SERIAL/TTL/MINIMUM.
    - **Test the interaction, not just the units.** P1.3 and P1.4 were each correct in
      isolation; the defect was that verifying a reply consumed the entry, so a rejected
      forgery killed the real query. Only an end-to-end run against a hostile upstream
      showed it.
+   - **`zig build test` does not type-check `main`.** Discovered 2026-08-09 while adding the
+     supervisor backoff: `backoffSeconds` returned `u64` where `Io.Duration.fromSeconds`
+     takes `i64`, and for several minutes **`zig build test` reported 0 errors while
+     `zig build` failed to produce a binary at all.**
+
+     The cause is Zig's lazy analysis. In a test build the root is `main.zig`, but the test
+     runner supplies its own entry point, so `pub fn main` is never referenced and never
+     analysed — and neither is anything reachable only from it. That covers a lot of this
+     project: the ingress loop, `supervise`, and all the wiring in `main` sit outside any
+     `test` block.
+
+     **Consequence: a green test suite is not evidence that Vortex compiles.** Always run
+     `zig build` too. CI already does — `zig build` and `zig build test` are separate steps,
+     plus a ReleaseSafe pair — which was belt-and-braces when it was written and now has a
+     concrete justification. Anything you want the compiler to check must be reachable from
+     a `test`, or you must build the exe.
 
    Still missing:
    - **`Question.parseQuestion` malformed-input tests** — the error paths
@@ -629,6 +664,7 @@ of what each was and how it was resolved.
      the only files carrying logic with **no `test` blocks at all**.
    - **CI has never actually run.** Every step passes locally, but the workflow, the
      `mlugg/setup-zig` action and the Ubuntu runner are unexercised until the first push.
+     Note its `zig build` step is load-bearing, not decorative — see the third lesson above.
    Housekeeping: `root.zig` is still the template stub and the module root of the second
    test artifact — fold it into the aggregator or delete it.
 6. **Deployment surface.** `127.0.0.1:5354` is dev-only. Real use means `0.0.0.0:53`

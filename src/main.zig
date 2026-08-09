@@ -268,12 +268,73 @@ const LoopFn = *const fn (std.Io, *const Context) std.Io.Cancelable!void;
 /// `dispatcherLoop` ever stops draining the table, ingress keeps accepting and
 /// enqueuing queries that nobody will ever answer, and the only symptom is that
 /// every lookup times out.
+/// Longest a restart is ever delayed. Past this the loop is clearly broken and
+/// retrying faster only burns CPU, but we keep retrying: an upstream socket that
+/// is unusable now may be usable in a minute.
+const restart_backoff_cap_s = 30;
+
+/// A loop that stayed up this long was doing its job, so its next failure is
+/// treated as a fresh incident rather than a continuation of a crash loop.
+const healthy_run_ns = 60 * std.time.ns_per_s;
+
+/// Delay before the *next* restart, given how many restarts have already
+/// happened back to back. Doubles from 1s and saturates at
+/// `restart_backoff_cap_s`; the very first restart is immediate, so a one-off
+/// blip recovers with no added latency.
+///
+/// Pure, so the schedule is testable without spawning anything.
+/// Returns `i64` because that is what `std.Io.Duration.fromSeconds` takes;
+/// keeping the type match here avoids a cast at the call site.
+fn backoffSeconds(consecutive_restarts: u32) i64 {
+    if (consecutive_restarts == 0) return 0;
+    const shift: u6 = @intCast(@min(consecutive_restarts - 1, 5));
+    return @min(@as(i64, 1) << shift, restart_backoff_cap_s);
+}
+
+/// Runs `loop` forever, restarting it if it ever returns for any reason other
+/// than cancellation.
+///
+/// Today neither loop can return normally — every non-`Canceled` path
+/// `continue`s — so this is defence against a future edit, not a live bug. It
+/// earns its keep because the failure mode is total and silent: if
+/// `dispatcherLoop` ever stops draining the table, ingress keeps accepting and
+/// enqueuing queries that nobody will ever answer, and the only symptom is that
+/// every lookup times out.
+///
+/// **Why the backoff.** The `while` here wraps a loop that itself blocks
+/// forever, so in the healthy case this body never completes a single iteration
+/// and costs nothing but a stack frame. The danger is the opposite case: a
+/// `loop` that returns *immediately* would be restarted as fast as the CPU
+/// allows, pinning a core and writing error logs in a tight spin. That is the
+/// classic supervisor crash-loop, and the backoff is what bounds it.
+///
+/// Cancellation is honoured while backing off — `io.sleep` propagates
+/// `error.Canceled` — so shutdown never waits out a 30-second delay.
 fn supervise(io: std.Io, ctx: *const Context, name: []const u8, loop: LoopFn) std.Io.Cancelable!void {
+    var consecutive_restarts: u32 = 0;
+
     while (true) {
+        const started = std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds;
+
         loop(io, ctx) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
         };
-        std.log.err("{s} loop returned unexpectedly; restarting", .{name});
+
+        // A long clean run means this is a new failure, not a tight crash loop,
+        // so the schedule starts over rather than inheriting an old delay.
+        const ran_ns = std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds - started;
+        if (ran_ns >= healthy_run_ns) consecutive_restarts = 0;
+
+        const delay_s = backoffSeconds(consecutive_restarts);
+        std.log.err("{s} loop returned unexpectedly after {d}ms; restart #{d} in {d}s", .{
+            name,
+            @divTrunc(ran_ns, std.time.ns_per_ms),
+            consecutive_restarts + 1,
+            delay_s,
+        });
+
+        if (delay_s > 0) try io.sleep(std.Io.Duration.fromSeconds(delay_s), std.Io.Clock.boot);
+        consecutive_restarts +|= 1;
     }
 }
 
@@ -437,4 +498,38 @@ test "initialize sockets" {
     const test_socket = try initIpAddress("0.0.0.0", 5454);
 
     std.debug.assert(test_socket.getPort() == 5454);
+}
+
+test "backoffSeconds doubles, caps, and lets the first restart be immediate" {
+    const testing = std.testing;
+
+    // First restart is free: a single spurious return should recover with no
+    // added latency, since one blip is not a crash loop.
+    try testing.expectEqual(@as(i64, 0), backoffSeconds(0));
+
+    // Then double from one second.
+    try testing.expectEqual(@as(i64, 1), backoffSeconds(1));
+    try testing.expectEqual(@as(i64, 2), backoffSeconds(2));
+    try testing.expectEqual(@as(i64, 4), backoffSeconds(3));
+    try testing.expectEqual(@as(i64, 8), backoffSeconds(4));
+    try testing.expectEqual(@as(i64, 16), backoffSeconds(5));
+
+    // 1<<5 is 32, which the cap clamps to 30 — the doubling must not overshoot
+    // the documented ceiling on its way there.
+    try testing.expectEqual(@as(i64, restart_backoff_cap_s), backoffSeconds(6));
+
+    // And it stays clamped no matter how long the crash loop runs. This is the
+    // property that matters: an unbounded shift would overflow the u6 and panic,
+    // turning a recoverable crash loop into a hard crash.
+    try testing.expectEqual(@as(i64, restart_backoff_cap_s), backoffSeconds(7));
+    try testing.expectEqual(@as(i64, restart_backoff_cap_s), backoffSeconds(1000));
+    try testing.expectEqual(@as(i64, restart_backoff_cap_s), backoffSeconds(std.math.maxInt(u32)));
+
+    // Never decreases, so a longer crash loop is never retried more eagerly.
+    var prev: i64 = 0;
+    for (0..64) |i| {
+        const cur = backoffSeconds(@intCast(i));
+        try testing.expect(cur >= prev);
+        prev = cur;
+    }
 }
