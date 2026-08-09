@@ -141,6 +141,28 @@ pub const Header = packed struct(u96) {
         std.mem.writeInt(u16, msg[2..4], flags, .big);
     }
 
+    /// A 12-byte reply built from an ID alone, for when the query bytes are
+    /// gone: the sweeper timing out an entry that retains only `client_id` and
+    /// `client_addr`.
+    ///
+    /// Sets QR=1, RD=1, RA=1, the given RCODE, and zero counts. RD is *assumed*
+    /// rather than echoed — anything that reached the pending table is a query
+    /// we forwarded upstream, which only happens for recursive queries.
+    ///
+    /// Caveat worth knowing: with QDCOUNT=0 there is no question to match
+    /// against, and a strict stub resolver may ignore the reply and fall back to
+    /// its own timeout. That is exactly today's behaviour, so this is never
+    /// worse — but it can be made strictly correct by storing the question in
+    /// `PendingQuery` and echoing it, which is what P1.3's question
+    /// verification will put there anyway.
+    pub fn synthesizedReply(id: u16, rcode: RCode) [12]u8 {
+        var out: [12]u8 = @splat(0);
+        std.mem.writeInt(u16, out[0..2], id, .big);
+        // QR=1, RD=1, RA=1 (0x8180) plus the RCODE in the low nibble.
+        std.mem.writeInt(u16, out[2..4], 0x8180 | @as(u16, @intFromEnum(rcode)), .big);
+        return out;
+    }
+
     /// A 12-byte reply carrying nothing but the header: the query's ID, response
     /// flags with `rcode`, and **all four section counts zeroed**.
     ///
@@ -350,4 +372,25 @@ test "markTruncated sets TC and touches nothing else" {
     // Idempotent — a reply that already had TC set stays valid.
     Header.markTruncated(&wire);
     try testing.expectEqual(@as(u16, 0x8380), std.mem.readInt(u16, wire[2..4], .big));
+}
+
+test "synthesizedReply builds a reply from an ID alone" {
+    // What the sweeper sends when a query times out: it kept the client's ID
+    // and address, but the query bytes were freed when handleQuery returned.
+    const reply = Header.synthesizedReply(0x1357, .server_failure);
+
+    try testing.expectEqual(@as(usize, 12), reply.len);
+    try testing.expectEqual(@as(u16, 0x1357), std.mem.readInt(u16, reply[0..2], .big));
+
+    // QR=1, opcode=0, AA=0, TC=0, RD=1 (assumed), RA=1, Z=0, RCODE=2.
+    try testing.expectEqual(@as(u16, 0x8182), std.mem.readInt(u16, reply[2..4], .big));
+
+    // No sections at all — there is no question to echo.
+    try testing.expectEqualSlices(u8, &[_]u8{0} ** 8, reply[4..12]);
+
+    // The RCODE is the only thing that varies.
+    try testing.expectEqual(
+        @as(u16, 0x8180),
+        std.mem.readInt(u16, Header.synthesizedReply(0, .no_error)[2..4], .big),
+    );
 }

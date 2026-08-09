@@ -86,7 +86,19 @@ pub const PendingTable = struct {
         return null;
     }
 
-    pub fn sweepExpiredQueries(self: *PendingTable) void {
+    /// Removes every entry past its deadline, appending each evicted
+    /// `PendingQuery` to `evicted` so the caller can answer the clients whose
+    /// queries were abandoned.
+    ///
+    /// The table deliberately does **not** send anything itself. It holds no
+    /// socket, and keeping it that way is what lets the whole suite below run
+    /// without a live one — the reporting/sending split is the same shape as
+    /// pulling logic out of `handleQuery` to make it testable.
+    ///
+    /// `evicted` must use the same allocator the table was built with. It is
+    /// appended to, never cleared, so the caller controls reuse:
+    /// `clearRetainingCapacity` between sweeps avoids reallocating every second.
+    pub fn sweepExpiredQueries(self: *PendingTable, evicted: *std.ArrayList(PendingQuery)) void {
         self.mutex.lock(self.io) catch {
             std.log.err("Failed to acquire lock on sweeper loop...", .{});
             return;
@@ -107,7 +119,11 @@ pub const PendingTable = struct {
             }
         }
         for (dead_queries.items) |id| {
-            _ = self.map.remove(id);
+            const kv = self.map.fetchRemove(id) orelse continue;
+            // If the report can't be recorded the entry is still evicted.
+            // Holding a slot open because we failed to allocate a notification
+            // would turn a transient OOM into a permanently leaked proxy ID.
+            evicted.append(self.gpa, kv.value) catch {};
         }
     }
 };
@@ -155,7 +171,14 @@ test "sweep removes expired entries and leaves live ones (B1 regression)" {
     const live = try table.appendQuery(queryExpiringIn(testing.io, 2, 3600 * std.time.ns_per_s));
     try testing.expectEqual(@as(u32, 2), table.map.count());
 
-    table.sweepExpiredQueries();
+    var evicted: std.ArrayList(PendingQuery) = .empty;
+    defer evicted.deinit(testing.allocator);
+    table.sweepExpiredQueries(&evicted);
+
+    // The sweeper must hand back what it evicted, or the caller cannot SERVFAIL
+    // the abandoned client — the entry would vanish as silently as before.
+    try testing.expectEqual(@as(usize, 1), evicted.items.len);
+    try testing.expectEqual(@as(u16, 1), evicted.items[0].client_id);
 
     // This is the assertion B1 failed. The writer stored nanoseconds and the
     // sweeper compared milliseconds, so `expires_at <= now` was never true and
@@ -174,8 +197,14 @@ test "sweep is a no-op when nothing has expired" {
     for (0..8) |i| {
         _ = try table.appendQuery(queryExpiringIn(testing.io, @intCast(i), 3600 * std.time.ns_per_s));
     }
-    table.sweepExpiredQueries();
+    var evicted: std.ArrayList(PendingQuery) = .empty;
+    defer evicted.deinit(testing.allocator);
+    table.sweepExpiredQueries(&evicted);
+
     try testing.expectEqual(@as(u32, 8), table.map.count());
+    // Nothing expired, so nothing to notify: a spurious SERVFAIL to a client
+    // whose query is still in flight would be worse than staying quiet.
+    try testing.expectEqual(@as(usize, 0), evicted.items.len);
 }
 
 test "appendQuery hands out distinct proxy IDs" {

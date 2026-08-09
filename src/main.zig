@@ -6,7 +6,9 @@ const Console = @import("console.zig").Console;
 const Context = @import("utility.zig").Context;
 const DomainBlockList = @import("blocklist/domain_blocklist.zig").DomainBlockList;
 const Header = @import("dns/header.zig").Header;
-const PendingTable = @import("utils/pending_table.zig").PendingTable;
+const pending_table_mod = @import("utils/pending_table.zig");
+const PendingTable = pending_table_mod.PendingTable;
+const PendingQuery = pending_table_mod.PendingQuery;
 const Policy = @import("blocklist/policy.zig").Policy;
 const Settings = @import("settings.zig").Settings;
 const SuffixBlockList = @import("blocklist/suffix_blocklist.zig").SuffixBlockList;
@@ -184,13 +186,36 @@ fn dispatcherLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
     }
 }
 
-fn sweeperLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
+fn sweeperLoop(io: std.Io, gpa: std.mem.Allocator, ctx: *const Context) std.Io.Cancelable!void {
+    // Reused across sweeps so the steady state allocates nothing: the common
+    // case is an empty list once per second.
+    var evicted: std.ArrayList(PendingQuery) = .empty;
+    defer evicted.deinit(gpa);
+
     while (true) {
         // A relative sleep on the settable wall clock would stutter or race
         // ahead whenever NTP adjusts it; the sweep cadence should track the same
         // monotonic clock the deadlines are measured on.
         try io.sleep(std.Io.Duration.fromSeconds(1), std.Io.Clock.boot);
-        ctx.pending_table.sweepExpiredQueries();
+
+        evicted.clearRetainingCapacity();
+        ctx.pending_table.sweepExpiredQueries(&evicted);
+        if (evicted.items.len == 0) continue;
+
+        // The upstream never answered inside the deadline. Until now the client
+        // got nothing at all and had to wait out its own timeout; SERVFAIL lets
+        // it fail fast and move to its next configured resolver.
+        std.log.debug("sweeping {d} timed-out queries", .{evicted.items.len});
+        for (evicted.items) |entry| {
+            const reply = Header.synthesizedReply(entry.client_id, .server_failure);
+            ctx.client_socket.send(io, &entry.client_addr, &reply) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => std.log.warn("SERVFAIL send to {f} failed: {s}", .{
+                    entry.client_addr,
+                    @errorName(err),
+                }),
+            };
+        }
     }
 }
 
@@ -266,7 +291,7 @@ pub fn main(init: std.process.Init) !void {
     defer group.cancel(io);
 
     group.async(io, dispatcherLoop, .{ io, &ctx }); // Dispatcher Coroutine
-    group.async(io, sweeperLoop, .{ io, &ctx }); // Sweeper Coroutine
+    group.async(io, sweeperLoop, .{ io, gpa, &ctx }); // Sweeper Coroutine
 
     try console.println("Vortex listening on {s}:{d}, forwarding to {s}:{d}", .{
         cfg.listen_host,
