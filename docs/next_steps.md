@@ -1,7 +1,7 @@
 # Next Steps — Road to Production-Ready
 
 Reviewed **2026-08-09** against the current source (Zig 0.16.0, `zig build test` →
-**30/30 pass, exit 0**, Debug and ReleaseSafe). **No open P0s, and no open P1 bugs.** As of the second 08-08 pass,
+**31/31 pass, exit 0**, Debug and ReleaseSafe). **No open P0s, and no open P1 bugs.** As of the second 08-08 pass,
 **every P0 fix is now pinned by a regression test** — C1 (07-27), C3 (08-08 morning), and
 C2 (08-08, this pass). That closes the P0 section for good: the three bugs that shipped
 silently can no longer regress silently.
@@ -11,10 +11,13 @@ and later the same day the **core query datapath was closed out**: six items, of
 were bugs nobody had recorded. **P1.1, P1.2, P1.3, P1.4 and P4.2 are all done**, leaving
 **P1.5 as the only open P1**.
 
-Testing has stopped being the standing gap. **27 real tests, up from 4** on 08-08 morning,
-and `PendingTable` — where the entire P0.B series hid — went from zero coverage to eight
-tests. What is still untested is `parseQuestion`'s three error paths (P2.5) and the two
-files that carry logic but no tests, `policy.zig` and `console.zig`.
+Testing has changed shape rather than gone away. **28 real tests, up from 4** on 08-08
+morning, and `PendingTable` — where the entire P0.B series hid — went from zero coverage to
+eight tests. The remaining gap is no longer "write more unit tests": it is that
+`handleQuery`, `dispatcherLoop` and the ingress loop have **no automated coverage at all**,
+and cannot get any by extracting another pure function, because what is untested is the
+socket plumbing itself. That needs an integration harness (**P2.5**), which in turn needs a
+local-file blocklist source (**P2.1**) so startup does not cost 25 seconds per case.
 
 What exists today:
 
@@ -583,7 +586,9 @@ of what each was and how it was resolved.
      fatal, as is a malformed port — silently listening on 5354 because someone typed
      `535e` is the config bug that costs an hour.
    - **Still to do:** `std.process.args` for CLI flags (highest precedence, above process
-     env), multiple upstreams (P4.3), local file paths as a blocklist source alongside URLs,
+     env), multiple upstreams (P4.3), **local file paths as a blocklist source alongside
+     URLs — now a blocker for the P2.5 integration harness, since a 25s HTTP fetch at
+     startup makes per-case integration tests unusable**,
      and the four knobs whose *consumers* can't take a runtime value yet — **timeouts**,
      **log level** (needs P2.3), **negative-cache TTL** (needs `Authority`'s comptime fields
      un-`comptime`d, see Housekeeping), and **fail-open vs fail-closed** (needs P2.2). Each
@@ -611,16 +616,16 @@ of what each was and how it was resolved.
    mid-write. Catch SIGINT/SIGTERM, `group.cancel`, flush the console, run the deferred
    deinits.
 5. **Test coverage + CI.** The harness bug is fixed and **CI exists** (`.github/workflows/ci.yml`
-   — `zig fmt --check`, build, test, plus a ReleaseSafe job). **`30/30`, of which 27 are real**;
+   — `zig fmt --check`, build, test, plus a ReleaseSafe job). **`31/31`, of which 28 are real**;
    the count has moved four times over 08-08/08-09 after stalling since 2026-07-27.
-   - **27 real behavior tests** — `DomainName` append, allowlist hit/miss, `parseQuestion`
+   - **28 real behavior tests** — `DomainName` append, allowlist hit/miss, `parseQuestion`
      case normalization, `SuffixBlockList.decide` parent-walk, **nine** `Header` tests
      (P0.C3 QR validation, P4.2 opcode/QDCOUNT, `headerOnlyReply`, `markTruncated`,
      `synthesizedReply`), **three** `blocked_response.build` golden-bytes tests (P0.C2),
-     **four** `settings` env-file/precedence tests (P2.1), and **eight** `PendingTable`
+     **four** `settings` env-file/precedence tests (P2.1), **eight** `PendingTable`
      tests (P1.1) covering round trip, idempotent complete, the B1 expiry regression,
-     no-op sweep, distinct proxy IDs, ID-space exhaustion, `peek` non-consumption, and
-     `hashQuestion`.
+     no-op sweep, distinct proxy IDs, ID-space exhaustion, `peek` non-consumption and
+     `hashQuestion`, and the `backoffSeconds` schedule test (P1.2).
    - **3 that assert nothing about Vortex** — `root.zig`'s `add(3, 7) == 10` stub;
      `main.zig`'s "initialize sockets", which only checks a std-library assertion; and the
      `test { _ = @import(…) }` aggregator, which the runner counts as a passing test.
@@ -657,6 +662,41 @@ of what each was and how it was resolved.
      a `test`, or you must build the exe.
 
    Still missing:
+   - **An integration harness for the coroutine-bound code — now the largest gap.**
+     The 31 tests are almost entirely over pure functions. `handleQuery`, `dispatcherLoop`
+     and the ingress loop have **no automated coverage of any kind** — not runtime, and (per
+     the third lesson above) not even compile-time from `zig build test`. Everything proven
+     about them on 2026-08-09 was proven by hand with `dig` and throwaway Python.
+
+     That is a different shape of gap from the rest of this list: it cannot be closed by
+     extracting another pure function, because what is untested *is* the socket plumbing.
+     It needs a harness that spawns the binary against a scratch config, drives it with
+     crafted UDP, and asserts on the replies.
+
+     The manual runs that would become its first cases, and what each one caught:
+
+     | Scenario | Asserts | Caught |
+     |---|---|---|
+     | Normal forward | reply relayed, ID restored | — |
+     | Blocked name | NXDOMAIN + 34-byte SOA, `0xC00C` resolves | — |
+     | `+opcode=IQUERY` | NOTIMP, `QUERY: 0` | — |
+     | 5000-byte query | 12-byte FORMERR, no coroutine spawned | — |
+     | Upstream returns 5000 bytes | TC=1 set on the relayed prefix | the silent-corruption bug |
+     | Upstream never answers | SERVFAIL at ~5.4s, not silence | — |
+     | Upstream echoes right ID, wrong question | reply dropped **and** client still gets SERVFAIL | the peek-vs-complete DoS |
+     | Supervised loop returns immediately | backoff `0→1→2→4→8→16→30`, not a spin | — |
+
+     Two of those found real bugs that every unit test passed straight through, which is the
+     argument for building it.
+
+     **P2.1 is what makes this feasible** — pointing the binary at a fake upstream on a
+     scratch port is now a config file, not a recompile.
+
+     **But there is a hard prerequisite:** startup blocks on fetching two blocklists over
+     HTTP, which took ~25s in every manual run. At 25s per case this is unusable in CI. The
+     harness needs the **local-file blocklist source** already listed under P2.1's "still to
+     do" — or an injection seam for the lists. Do that first; the harness is cheap
+     afterwards and near-impossible before.
    - **`Question.parseQuestion` malformed-input tests** — the error paths
      (`TruncatedQuestion`, `UnsupportedLabel`, `NameTooLong`) all exist in
      [question.zig](../src/dns/question.zig) and are all unexercised.

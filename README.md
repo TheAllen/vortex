@@ -120,7 +120,7 @@ actually move it.
 QDCOUNT), QName case normalization, cacheable SOA on blocked answers, replies
 verified against the question that provoked them, SERVFAIL on upstream timeout,
 and TC=1 rather than silent corruption when a reply overflows the receive buffer.
-`zig build test` runs 30 tests, 27 asserting real behavior, under both Debug and
+`zig build test` runs 31 tests, 28 asserting real behavior, under both Debug and
 ReleaseSafe.
 
 > [!WARNING]

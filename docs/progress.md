@@ -16,8 +16,8 @@ are stated explicitly below so the number can be argued with rather than just qu
 > **≈ 42% complete** against the yardstick in
 > [next_steps.md](next_steps.md): *"production-ready DNS sinkhole for a home network."*
 >
-> Source: 2,290 lines of Zig across 15 files. `zig build test` → 30/30 pass under both
-> Debug and ReleaseSafe, of which **27 are real behavior tests**.
+> Source: 2,290 lines of Zig across 15 files. `zig build test` → 31/31 pass under both
+> Debug and ReleaseSafe, of which **28 are real behavior tests**.
 
 ### Breakdown
 
@@ -27,7 +27,7 @@ are stated explicitly below so the number can be argued with rather than just qu
 | Operability | 25% | ~20% | 5.0 | P2.1 config done. Structured logging, metrics, graceful shutdown, deployment, blocklist refresh still unbuilt |
 | Protocol completeness | 20% | ~10% | 2.0 | Wildcard blocking done; compression, response parsing, caching, EDNS0, TCP fallback all open |
 | Sinkhole feature set | 15% | ~5% | 0.8 | Per-qtype strategy, local records, dashboards, DNSSEC posture — all open |
-| Tests + CI | 10% | ~48% | 4.8 | 27 real tests; CI exists but has never run; `PendingTable` went 0 → 8 tests |
+| Tests + CI | 10% | ~48% | 4.8 | 28 real tests; CI exists but has never run; `PendingTable` went 0 → 8 tests |
 | **Total** | **100%** | | **≈ 42** | |
 
 *What "98%" on the datapath means:* the remaining 2% is the hard-coded 5 s deadline and 1 s
@@ -162,7 +162,7 @@ coincidence — see the lesson in [next_steps.md](next_steps.md) P2.5.
 |---|---:|---|
 | 2026-08-08 | ~33% | First assessment. Same-day: P1.2 closed, C3 pinned, C2 pinned + extracted to a pure function; tests 7/7 (4 real) → 13/13 (10 real) |
 | 2026-08-09 | ~37% | P2.1 configuration mechanism: runtime `Settings` from defaults < `.env` < process env; tests → 17/17 (14 real). Also raised the priority of P1.5/P2.7 — see the localhost cliff |
-| 2026-08-09 (pm) | ~42% | Core datapath closed out: P1.1–P1.4 + P4.2, plus two unrecorded bugs (silent datagram truncation, wall-clock timeouts). Tests → 30/30 (27 real); `PendingTable` 0 → 8. Repo prepped for GitHub with CI |
+| 2026-08-09 (pm) | ~42% | Core datapath closed out: P1.1–P1.4 + P4.2, plus two unrecorded bugs (silent datagram truncation, wall-clock timeouts). Tests → 31/31 (28 real); `PendingTable` 0 → 8. Supervisor backoff. Repo prepped for GitHub with CI |
 
 *Add a row per review pass. If the number doesn't move, that is itself the finding — the
 coverage count sat still from 2026-07-27 to 2026-08-08 and nobody noticed until it was
