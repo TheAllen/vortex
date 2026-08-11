@@ -20,9 +20,12 @@
 //! one place every record must pass through, rather than being a rule call
 //! sites are trusted to remember.
 //!
-//! Not yet here (see next_steps.md P2.3): a runtime `VORTEX_LOG_LEVEL` — level
-//! filtering is still `std.log`'s comptime default — a `text`-vs-`logfmt`
-//! choice, and the per-query event log.
+//! Level and output format are both runtime settings — `VORTEX_LOG_LEVEL` and
+//! `VORTEX_LOG_FORMAT` — resolved by [settings.zig](../settings.zig) and applied
+//! through `configure`.
+//!
+//! Not yet here (see next_steps.md P2.3): the per-query event log carrying
+//! client, qtype and latency as real fields, and counters.
 
 const std = @import("std");
 
@@ -46,18 +49,117 @@ const std = @import("std");
 /// still reaches stderr.
 var app_io: ?std.Io = null;
 
+/// How much to log. Ordered loosest-last, so `@intFromEnum` *is* the threshold.
+///
+/// Distinct from `std.log.Level` because it has an `off`, which that enum
+/// cannot express — and "log nothing" is a real thing to ask a resolver for,
+/// given the per-query records are personally identifying.
+pub const Level = enum(u8) {
+    off,
+    err,
+    warn,
+    info,
+    debug,
+
+    /// Case-insensitive, and accepts both the short and long spelling of the
+    /// two levels people disagree about. `VORTEX_LOG_LEVEL=WARNING` doing
+    /// nothing would be a maddening ten minutes.
+    pub fn parse(text: []const u8) ?Level {
+        const eq = std.ascii.eqlIgnoreCase;
+        if (eq(text, "off") or eq(text, "none")) return .off;
+        if (eq(text, "err") or eq(text, "error")) return .err;
+        if (eq(text, "warn") or eq(text, "warning")) return .warn;
+        if (eq(text, "info")) return .info;
+        if (eq(text, "debug")) return .debug;
+        return null;
+    }
+
+    /// Bootstrap default, used for anything logged before `configure` runs —
+    /// which includes every diagnostic `Settings.load` itself emits. Follows
+    /// `std.log`'s build-mode default so this changes nothing until an operator
+    /// asks it to.
+    pub fn fromStd(message_level: std.log.Level) Level {
+        return switch (message_level) {
+            .err => .err,
+            .warn => .warn,
+            .info => .info,
+            .debug => .debug,
+        };
+    }
+
+    fn enables(self: Level, message_level: std.log.Level) bool {
+        return @intFromEnum(self) >= @intFromEnum(fromStd(message_level));
+    }
+};
+
+/// Wire format for records.
+///
+/// `auto` is a configuration value only: `configure` resolves it against stderr
+/// and the atomic below never holds it.
+pub const Format = enum(u8) {
+    /// `text` when stderr is a terminal, `logfmt` when it is a pipe or a file.
+    /// Someone watching the server run wants to read it; something collecting
+    /// its output wants to parse it.
+    auto,
+    /// One `key=value` record per line. See the module doc comment.
+    logfmt,
+    /// `std.log`'s own colored `level(scope): message`. No timestamp — the
+    /// terminal in front of you supplies the context that field carries.
+    text,
+
+    /// Case-insensitive, to match `Level.parse`. Two config variables that
+    /// disagree about whether `TEXT` counts would be its own small betrayal.
+    pub fn parse(text: []const u8) ?Format {
+        const eq = std.ascii.eqlIgnoreCase;
+        if (eq(text, "auto")) return .auto;
+        if (eq(text, "logfmt")) return .logfmt;
+        if (eq(text, "text")) return .text;
+        return null;
+    }
+
+    fn resolve(self: Format, io: std.Io) Format {
+        if (self != .auto) return self;
+        const tty = std.Io.File.stderr().isTty(io) catch false;
+        return if (tty) .text else .logfmt;
+    }
+};
+
+/// Read on every log call from any thread, written twice during startup.
+/// Relaxed ordering throughout: these guard a diagnostic, not a data
+/// dependency, and a record either side of a level change is equally correct.
+var current_level: std.atomic.Value(Level) = .init(Level.fromStd(std.log.default_level));
+var current_format: std.atomic.Value(Format) = .init(.logfmt);
+
 /// Points logging at the application's `Io`. Call once, early in `main`, before
 /// anything that can log.
 pub fn init(io: std.Io) void {
     app_io = io;
 }
 
+/// Applies the operator's `VORTEX_LOG_LEVEL` and `VORTEX_LOG_FORMAT`.
+///
+/// Separate from `init` because configuration cannot be read without logging:
+/// `Settings.load` reports its own parse failures, so logging has to work
+/// before the settings that govern it exist. Records emitted in that window use
+/// the bootstrap defaults.
+pub fn configure(io: std.Io, log_level: Level, log_format: Format) void {
+    current_level.store(log_level, .monotonic);
+    current_format.store(log_format.resolve(io), .monotonic);
+}
+
 pub fn logFn(
     comptime message_level: std.log.Level,
     comptime scope: @EnumLiteral(),
-    comptime format: []const u8,
+    // `fmt`, not `format`, so it does not shadow the module-level format state.
+    comptime fmt: []const u8,
     args: anytype,
 ) void {
+    // Before the clock, the lock, and any formatting: on a filtered-out record
+    // this load and compare is the entire cost. `std.options.log_level` is
+    // `.debug` so that the comptime gate in `std.log` passes everything through
+    // to here — which is the only place a *runtime* level can be applied.
+    if (!current_level.load(.monotonic).enables(message_level)) return;
+
     const io = app_io orelse std.Options.debug_io;
 
     // Logging is not a cancelation point. A coroutine being torn down still
@@ -78,14 +180,24 @@ pub fn logFn(
 
     // A record we cannot write is a record we cannot report, so there is
     // nothing to do with the error but drop it.
-    writeRecord(
-        &locked.file_writer.interface,
-        now.nanoseconds,
-        message_level,
-        scope,
-        format,
-        args,
-    ) catch {};
+    switch (current_format.load(.monotonic)) {
+        .logfmt => writeRecord(
+            &locked.file_writer.interface,
+            now.nanoseconds,
+            message_level,
+            scope,
+            fmt,
+            args,
+        ) catch {},
+        .text => std.log.defaultLogFileTerminal(
+            message_level,
+            scope,
+            fmt,
+            args,
+            locked.terminal(),
+        ) catch {},
+        .auto => unreachable, // `configure` resolves it; the atomic never holds it.
+    }
 }
 
 /// Renders one complete record, newline included.
@@ -212,6 +324,57 @@ const EscapingWriter = struct {
 };
 
 const testing = std.testing;
+
+test "Level.parse takes both spellings, any case, and rejects the rest" {
+    try testing.expectEqual(Level.off, Level.parse("off").?);
+    try testing.expectEqual(Level.off, Level.parse("none").?);
+    try testing.expectEqual(Level.err, Level.parse("err").?);
+    try testing.expectEqual(Level.err, Level.parse("error").?);
+    try testing.expectEqual(Level.warn, Level.parse("warn").?);
+    try testing.expectEqual(Level.warn, Level.parse("warning").?);
+    try testing.expectEqual(Level.info, Level.parse("info").?);
+    try testing.expectEqual(Level.debug, Level.parse("debug").?);
+
+    try testing.expectEqual(Level.warn, Level.parse("WARNING").?);
+    try testing.expectEqual(Level.debug, Level.parse("Debug").?);
+
+    // Near misses are rejected rather than coerced. Guessing that `verbose`
+    // means `debug` is how you end up logging every query on a box you thought
+    // was quiet.
+    try testing.expect(Level.parse("verbose") == null);
+    try testing.expect(Level.parse("warnings") == null);
+    try testing.expect(Level.parse("") == null);
+    try testing.expect(Level.parse("1") == null);
+}
+
+test "Level.enables is a threshold, and off silences everything" {
+    // Each level admits itself and everything more severe, nothing less.
+    try testing.expect(Level.warn.enables(.err));
+    try testing.expect(Level.warn.enables(.warn));
+    try testing.expect(!Level.warn.enables(.info));
+    try testing.expect(!Level.warn.enables(.debug));
+
+    try testing.expect(Level.debug.enables(.debug));
+    try testing.expect(Level.err.enables(.err));
+    try testing.expect(!Level.err.enables(.warn));
+
+    // `off` is the point of having our own enum rather than `std.log.Level`:
+    // a resolver's per-query records are PII, so "log nothing" has to be
+    // expressible.
+    inline for (.{ .err, .warn, .info, .debug }) |message_level| {
+        try testing.expect(!Level.off.enables(message_level));
+    }
+}
+
+test "Format.parse matches Level.parse's case-insensitivity" {
+    try testing.expectEqual(Format.auto, Format.parse("auto").?);
+    try testing.expectEqual(Format.logfmt, Format.parse("logfmt").?);
+    try testing.expectEqual(Format.text, Format.parse("text").?);
+    try testing.expectEqual(Format.text, Format.parse("TEXT").?);
+
+    try testing.expect(Format.parse("json") == null);
+    try testing.expect(Format.parse("") == null);
+}
 
 /// Renders one record into an owned buffer. Callers free the result.
 fn renderForTest(

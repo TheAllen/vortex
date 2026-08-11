@@ -15,8 +15,14 @@ const SuffixBlockList = @import("blocklist/suffix_blocklist.zig").SuffixBlockLis
 const Question = @import("dns/question.zig").Question;
 
 /// Every `std.log.*` call in the process — ours and the standard library's —
-/// renders through [obs/log.zig](obs/log.zig) as one logfmt record.
+/// renders through [obs/log.zig](obs/log.zig).
+///
+/// `log_level` is deliberately wide open. `std.log.logEnabled` filters at
+/// comptime, which cannot see a value that arrives from the environment at
+/// startup, so the comptime gate has to pass everything through and `logFn`
+/// applies the operator's real level at runtime.
 pub const std_options: std.Options = .{
+    .log_level = .debug,
     .logFn = obs_log.logFn,
 };
 
@@ -364,6 +370,10 @@ pub fn main(init: std.process.Init) !void {
     // here keeps every write to it on this thread, before any coroutine runs.
     // Borrowed strings live as long as the map, i.e. the process.
     const cfg = try Settings.load(io, gpa, init.environ_map);
+
+    // Only now can logging honour the operator: everything above this line —
+    // including `Settings.load`'s own diagnostics — used the bootstrap defaults.
+    obs_log.configure(io, cfg.log_level, cfg.log_format);
 
     const client_socket, const upstream_socket = try initSockets(io, cfg);
     defer client_socket.close(io);

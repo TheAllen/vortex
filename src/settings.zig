@@ -19,20 +19,28 @@
 //! lives for the whole process. `Settings` therefore owns nothing and has no
 //! `deinit` — but it must not outlive the map it was loaded from.
 //!
-//! Not yet covered here (see next_steps.md P2.1): timeouts, log level,
-//! negative-cache TTL, and fail-open-vs-closed. Each is one field plus one line
-//! in `fromEnviron` once the code it configures can accept a runtime value.
+//! Not yet covered here (see next_steps.md P2.1): timeouts, negative-cache TTL,
+//! and fail-open-vs-closed. Each is one field plus one line in `fromEnviron`
+//! once the code it configures can accept a runtime value.
 
 const builtin = @import("builtin");
 const std = @import("std");
 
+const obs_log = @import("obs/log.zig");
+
 const Environ = std.process.Environ;
 
-/// Config diagnostics, scoped so they can be filtered once P2.3 lands a real
-/// log level — and silenced under `zig build test`, because the validation
-/// tests deliberately feed in bad values and Zig's test runner fails any test
-/// that logs at `.err`. Only the logging is suppressed: the returned errors are
+/// Config diagnostics, scoped so an operator can filter them apart from the
+/// datapath — and silenced under `zig build test`, because the validation tests
+/// deliberately feed in bad values and Zig's test runner fails any test that
+/// logs at `.err`. Only the logging is suppressed: the returned errors are
 /// identical either way, and those are what the tests actually assert on.
+///
+/// P2.3 landed a runtime level, so `VORTEX_LOG_LEVEL=off` could in principle do
+/// this job instead. It deliberately does not: that is one process-wide global,
+/// and a test that set it would silence every *other* test running after it in
+/// the same binary. A comptime swap of this one namespace is scoped to the file
+/// that needs it and cannot leak.
 const log = if (builtin.is_test) struct {
     fn err(comptime _: []const u8, _: anytype) void {}
     fn warn(comptime _: []const u8, _: anytype) void {}
@@ -55,8 +63,19 @@ pub const Settings = struct {
     upstream_bind_port: u16,
 
     /// Exact-match blocklist (hosts format) and suffix/wildcard blocklist.
+    ///
+    /// The suffix list must be **bare domains, one per line** — the format
+    /// `SuffixBlockList.parseSuffixDomain` reads and `decide`'s parent-label
+    /// walk matches against. A list whose entries carry a `*.` prefix parses
+    /// without complaint and then matches nothing at all, which is the worst
+    /// possible failure: a blocklist that loads clean and blocks zero domains.
     blocklist_url: []const u8,
     suffix_blocklist_url: []const u8,
+
+    /// Diagnostic verbosity, and whether records render for a human or a
+    /// parser. Applied by `obs_log.configure`; see [obs/log.zig](obs/log.zig).
+    log_level: obs_log.Level,
+    log_format: obs_log.Format,
 
     pub const defaults: Settings = .{
         .listen_host = "127.0.0.1",
@@ -69,7 +88,17 @@ pub const Settings = struct {
         .upstream_bind_port = 0,
 
         .blocklist_url = "https://raw.githubusercontent.com/StevenBlack/hosts/refs/heads/master/hosts",
-        .suffix_blocklist_url = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/light-onlydomains.txt",
+        // `domainswild2`, not `domainswild`: the `2` variant omits the `*.`
+        // prefix, which is the only form this codebase can match. Replaced the
+        // hagezi light list on 2026-08-10 after that entire GitHub *account*
+        // disappeared — not just the file — leaving no successor to point at.
+        .suffix_blocklist_url = "https://small.oisd.nl/domainswild2",
+
+        // Tracks `std.log`'s build-mode default — debug under `Debug`, info
+        // under the release modes — so adding this knob changes nothing for
+        // anyone who does not set it.
+        .log_level = obs_log.Level.fromStd(std.log.default_level),
+        .log_format = .auto,
     };
 
     /// Environment file consulted when `VORTEX_ENV_FILE` is unset. Missing is
@@ -82,6 +111,10 @@ pub const Settings = struct {
     pub const ParseError = error{
         /// A port variable was set to something that isn't a u16.
         InvalidPort,
+        /// `VORTEX_LOG_LEVEL` was set to something that isn't a level.
+        InvalidLogLevel,
+        /// `VORTEX_LOG_FORMAT` was set to something that isn't a format.
+        InvalidLogFormat,
     };
 
     /// Reads the environment file into `environ`, then resolves every field.
@@ -109,6 +142,23 @@ pub const Settings = struct {
 
             .blocklist_url = envStr(environ, "VORTEX_BLOCKLIST_URL", defaults.blocklist_url),
             .suffix_blocklist_url = envStr(environ, "VORTEX_SUFFIX_BLOCKLIST_URL", defaults.suffix_blocklist_url),
+
+            .log_level = try envEnum(
+                obs_log.Level,
+                environ,
+                "VORTEX_LOG_LEVEL",
+                defaults.log_level,
+                error.InvalidLogLevel,
+                "off, error, warn, info, or debug",
+            ),
+            .log_format = try envEnum(
+                obs_log.Format,
+                environ,
+                "VORTEX_LOG_FORMAT",
+                defaults.log_format,
+                error.InvalidLogFormat,
+                "auto, logfmt, or text",
+            ),
         };
     }
 
@@ -130,6 +180,27 @@ pub const Settings = struct {
         return std.fmt.parseInt(u16, raw, 10) catch {
             log.err("{s}: '{s}' is not a port number (expected 0-65535)", .{ key, raw });
             return error.InvalidPort;
+        };
+    }
+
+    /// Same fail-loud contract as `envPort`, for the enum-valued variables.
+    ///
+    /// `T` supplies its own `parse` rather than getting `std.meta.stringToEnum`
+    /// applied here, so a type can accept aliases its tag names do not cover —
+    /// `Level` takes both `warn` and `warning`.
+    fn envEnum(
+        comptime T: type,
+        environ: *const Environ.Map,
+        key: []const u8,
+        fallback: T,
+        comptime invalid: ParseError,
+        comptime expected: []const u8,
+    ) ParseError!T {
+        const raw = environ.get(key) orelse return fallback;
+        if (raw.len == 0) return fallback;
+        return T.parse(raw) orelse {
+            log.err("{s}: '{s}' is not valid (expected {s})", .{ key, raw, expected });
+            return invalid;
         };
     }
 };
@@ -356,4 +427,39 @@ test "fromEnviron falls back to defaults and rejects a bad port" {
 
     try map.put("VORTEX_LISTEN_PORT", "70000"); // > maxInt(u16)
     try testing.expectError(error.InvalidPort, Settings.fromEnviron(&map));
+}
+
+test "fromEnviron resolves the logging knobs and rejects bad values" {
+    var map = Environ.Map.init(testing.allocator);
+    defer map.deinit();
+
+    // Unset means the bootstrap default, which tracks the build mode — so
+    // adding these variables changed nothing for anyone who ignores them.
+    const unset = try Settings.fromEnviron(&map);
+    try testing.expectEqual(obs_log.Level.fromStd(std.log.default_level), unset.log_level);
+    try testing.expectEqual(obs_log.Format.auto, unset.log_format);
+
+    try map.put("VORTEX_LOG_LEVEL", "warning");
+    try map.put("VORTEX_LOG_FORMAT", "logfmt");
+    const cfg = try Settings.fromEnviron(&map);
+    try testing.expectEqual(obs_log.Level.warn, cfg.log_level);
+    try testing.expectEqual(obs_log.Format.logfmt, cfg.log_format);
+
+    // Empty is "unset", consistent with every other variable here.
+    try map.put("VORTEX_LOG_LEVEL", "");
+    try testing.expectEqual(
+        obs_log.Level.fromStd(std.log.default_level),
+        (try Settings.fromEnviron(&map)).log_level,
+    );
+
+    // Same fail-loud contract as a typo'd port: starting up at a level nobody
+    // asked for is exactly as silent a failure as listening on the wrong port,
+    // and here it could mean an operator believes they disabled query logging
+    // when they did not.
+    try map.put("VORTEX_LOG_LEVEL", "verbose");
+    try testing.expectError(error.InvalidLogLevel, Settings.fromEnviron(&map));
+
+    try map.put("VORTEX_LOG_LEVEL", "info");
+    try map.put("VORTEX_LOG_FORMAT", "json");
+    try testing.expectError(error.InvalidLogFormat, Settings.fromEnviron(&map));
 }
