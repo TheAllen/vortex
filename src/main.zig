@@ -2,7 +2,6 @@
 const std = @import("std");
 
 const blocked_response = @import("dns/blocked_response.zig");
-const Console = @import("console.zig").Console;
 const Context = @import("utility.zig").Context;
 const DomainBlockList = @import("blocklist/domain_blocklist.zig").DomainBlockList;
 const Header = @import("dns/header.zig").Header;
@@ -10,9 +9,22 @@ const pending_table_mod = @import("utils/pending_table.zig");
 const PendingTable = pending_table_mod.PendingTable;
 const PendingQuery = pending_table_mod.PendingQuery;
 const Policy = @import("blocklist/policy.zig").Policy;
+const obs_log = @import("obs/log.zig");
 const Settings = @import("settings.zig").Settings;
 const SuffixBlockList = @import("blocklist/suffix_blocklist.zig").SuffixBlockList;
 const Question = @import("dns/question.zig").Question;
+
+/// Every `std.log.*` call in the process — ours and the standard library's —
+/// renders through [obs/log.zig](obs/log.zig) as one logfmt record.
+pub const std_options: std.Options = .{
+    .logFn = obs_log.logFn,
+};
+
+/// Per-query verdicts, scoped so they can be filtered apart from operational
+/// diagnostics. `debug` because this is one record per DNS query on the
+/// network; P2.3's query log is what will carry these as real fields
+/// (client, qtype, latency) on a level an operator can leave on.
+const query_log = std.log.scoped(.query);
 
 fn addrBind(io: std.Io, addr: *const std.Io.net.IpAddress) !std.Io.net.Socket {
     return addr.bind(io, .{ .mode = .dgram, .protocol = .udp }) catch |err| {
@@ -97,10 +109,10 @@ fn handleQuery(
 
     switch (ctx.policy.decide(domain)) {
         .allow => {
-            console.println("Allow", .{}) catch {};
+            query_log.debug("verdict=allow qname={s}", .{domain});
         },
         .block => {
-            console.println("{s} -> BLOCKED", .{domain}) catch {};
+            query_log.debug("verdict=block qname={s}", .{domain});
 
             // NXDOMAIN + a synthetic SOA so the client can negatively cache the
             // block. Built into a fresh buffer because `data` is a dupe sized to
@@ -115,7 +127,7 @@ fn handleQuery(
             return;
         },
         .pass => {
-            console.println("PASS", .{}) catch {};
+            query_log.debug("verdict=pass qname={s}", .{domain});
         },
     }
 
@@ -338,15 +350,14 @@ fn supervise(io: std.Io, ctx: *const Context, name: []const u8, loop: LoopFn) st
     }
 }
 
-var console = Console{};
-
 pub fn main(init: std.process.Init) !void {
     // A standard set of pre-initialized useful APIs
     const io = init.io;
     const gpa = init.gpa;
 
-    // Console is a thread safe writer
-    console.init(io);
+    // Before anything that can log, so diagnostics share one stderr lock with
+    // the rest of the process rather than interleaving with it.
+    obs_log.init(io);
 
     // Resolve configuration before anything else, so a bad env file fails
     // before we have opened a socket. `environ_map` is not threadsafe; loading
@@ -417,7 +428,7 @@ pub fn main(init: std.process.Init) !void {
     group.async(io, supervise, .{ io, &ctx, "dispatcher", dispatcherLoop });
     group.async(io, supervise, .{ io, &ctx, "sweeper", sweeperLoop });
 
-    try console.println("Vortex listening on {s}:{d}, forwarding to {s}:{d}", .{
+    std.log.info("listening={s}:{d} upstream={s}:{d}", .{
         cfg.listen_host,
         cfg.listen_port,
         cfg.upstream_host,
@@ -490,7 +501,7 @@ test {
     _ = @import("blocklist/policy.zig");
     _ = @import("utils/pending_table.zig");
     _ = @import("utility.zig");
-    _ = @import("console.zig");
+    _ = @import("obs/log.zig");
     _ = @import("settings.zig");
 }
 
