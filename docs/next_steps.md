@@ -723,11 +723,13 @@ Priority order unchanged: **compression → response parsing → caching**, each
 the previous. (P3.4 wildcard blocking is now **done** — see the top of this doc.)
 
 1. **DNS message compression (pointer following).** Prerequisite for parsing any answer
-   section. `0xC0`-prefixed length byte = pointer; follow with a depth/visited-offset
-   limit against malicious loops. (`resource_record.zig`/`resource_data.zig` do not exist
-   yet — create them fresh.)
+   section. `0xC0`-prefixed length byte = pointer; follow it, with a loop bound that holds
+   against hostile input. **Planned in full in [P3.1 in detail](#p31-in-detail--compression-pointer-following)
+   below** (2026-08-11).
 2. **Parse upstream response records.** Decode Answer/Authority/Additional RRs to log
    resolved IPs/CNAMEs and extract TTLs — prerequisite for caching.
+   (`resource_record.zig`/`resource_data.zig` do not exist yet — create them fresh, on top
+   of the name reader from P3.1.)
 3. **TTL-aware response caching.** Keyed on `(qname, qtype, qclass)`; store response
    bytes + expiry; on hit rewrite txid and reply without touching upstream. Plugs in
    cleanly: check in `handleQuery` before `appendQuery`, populate in `dispatcherLoop`
@@ -757,6 +759,146 @@ the previous. (P3.4 wildcard blocking is now **done** — see the top of this do
 7. **Multiple upstreams / DoT / DoH.** Future arcs the dispatcher architecture was chosen
    to accommodate (a connection pool replaces `upstream_socket`, same `PendingTable`
    pattern). See the evolution table in [upstream-design.md](upstream-design.md).
+
+### P3.1 in detail — compression pointer following
+
+Planned 2026-08-11. Nothing below is built yet.
+
+Today Vortex only ever *writes* a pointer — `Authority.NAME = 0xC00C`
+([authority.zig:5](../src/dns/authority.zig#L5)) — and *rejects* them on read, since
+`parseQuestion`'s `label_len > 63` check ([question.zig:27](../src/dns/question.zig#L27))
+catches `0xC0` on the way past. Nothing in the process can follow one, which is why the
+answer section is still opaque bytes we relay without reading.
+
+**New file: `src/dns/name_reader.zig`.** Not `domain_name.zig` — that is a growable byte
+buffer, a different job — and not `resource_record.zig`, which does not exist and is P3.2's
+file. Reading a name out of a message is its own concern, and it is the piece both P3.2 and
+P3.3 sit on.
+
+#### API
+
+```zig
+pub const Name = struct {
+    buf: [255]u8 = undefined,
+    len: u8 = 0,
+    pub fn slice(self: *const Name) []const u8;
+};
+
+pub const Read = struct { name: Name, next_offset: usize };
+
+/// Reads a name at `offset`, following compression pointers.
+pub fn readName(msg: []const u8, offset: usize) NameError!Read;
+
+/// Query-path variant: a pointer is a protocol violation, not a hop.
+pub fn readNameNoPointers(msg: []const u8, offset: usize) NameError!Read;
+```
+
+Two decisions worth pinning here, because they are the expensive-to-reverse ones:
+
+**No allocator.** A name is at most 255 octets (RFC 1035 §2.3.4), so a fixed inline buffer
+is exactly sized, cannot leak, and keeps the allocator off the response path — which starts
+to matter at P3.2 (once per RR) and P3.3 (once per cache lookup). `Question` currently owns
+an `ArrayList` through `DomainName`; the refactor below drops it.
+
+**`next_offset` is not "where the name ended."** This is the whole subtlety of the format:
+when a pointer is followed, parsing resumes **2 bytes past the pointer**, not past the
+target name. Returning both in one struct is what makes it impossible for a caller to get
+that wrong — the reason the signature is not just `[]const u8`.
+
+#### Loop protection: strictly-backwards, not a depth counter
+
+Every pointer must target an offset **strictly less than the offset of the pointer itself**.
+That one invariant makes termination provable with O(1) state — no visited set to allocate,
+no arbitrary depth constant to justify — and costs nothing in compatibility, because RFC
+1035 compression *is* a backreference to a name already emitted. It kills self-reference
+(`0xC00C` sitting at offset 12), forward pointers, and A→B→A ping-pong under a single rule.
+
+On top of it, `max_jumps = 64`. A pointer-to-pointer chain emits no bytes, so it is not
+bounded by the 255-octet cap the way a chain of partial names is; the ordering rule alone
+bounds it only by message length. Unreachable in any real message — it exists so the loop
+bound does not rest solely on the ordering argument.
+
+#### Validation, in reading order
+
+| Condition | Error |
+|---|---|
+| `offset >= msg.len` at any step | `Truncated` |
+| Length byte `& 0xC0` is `0x40` or `0x80` | `ReservedLabelType` |
+| Label body runs past `msg.len` | `Truncated` |
+| Pointer's second byte missing | `Truncated` |
+| Pointer target `>=` the pointer's own offset | `BadPointer` (covers self, forward, cycle) |
+| Jumps exceed 64 | `BadPointer` |
+| Decoded wire length exceeds 255 | `NameTooLong` |
+| Any pointer at all, in the no-pointer variant | `UnexpectedCompressionInQuery` |
+
+Lowercase while decoding, for the reason already given at
+[question.zig:36](../src/dns/question.zig#L36) — filter lookups and the future cache key
+both want the canonical form.
+
+#### Refactor `question.zig` onto it
+
+`parseQuestion` becomes `readNameNoPointers(msg, 12)` followed by QTYPE/QCLASS at
+`next_offset`, deleting the hand-rolled label loop and the `DomainName` field. Two things
+fall out of that: the hard-coded start offset of 12 becomes a parameter (P3.2 needs to parse
+questions inside *responses*), and the `idx - 12 > 255` length check moves inside the reader,
+where it is measured against the right origin rather than against a constant that happens to
+be the header size.
+
+The existing case-normalization test ([question.zig:72](../src/dns/question.zig#L72)) should
+pass **unchanged** — that is the signal the refactor preserved behavior. `error.UnsupportedLabel`
+and `error.TruncatedQuestion` are named in `main.zig`'s drop path, so either keep the names or
+update both sites in the same commit.
+
+#### Tests
+
+The format is bytes, so these are golden byte vectors. Not one table-driven test — each of
+these fails differently, and the point is to know which one broke:
+
+- Uncompressed name → text plus `next_offset` past the root byte
+- Pure pointer (`0xC00C` as the whole name) → the target's name, `next_offset` = pointer + 2
+- **Partial compression** — `3 'w' 'w' 'w' 0xC0 0x0C` → `www.example.com`. The case that
+  actually shows up in real upstream replies
+- Two-hop chain → resolves
+- Self-pointer at its own offset → `BadPointer`
+- Forward pointer → `BadPointer`
+- A→B, B→A → `BadPointer`
+- Target past `msg.len` → `BadPointer`
+- Bare `0xC0` as the final byte → `Truncated`
+- `0x40` / `0x80` length byte → `ReservedLabelType`
+- Root-only name (`0x00`) → empty, `next_offset` = offset + 1
+- Chained partial compression expanding past 255 → `NameTooLong`
+- **Round trip against our own writer** — run `readName` over a message built by
+  `blocked_response.build` and assert the SOA's owner name comes back as the qname. Checks
+  the reader against the one pointer Vortex already emits
+
+Then a fuzz target (`std.testing.fuzz`) over arbitrary bytes, asserting only that it
+terminates and returns. That is the highest-value test in the list: the entire threat model
+of this function is hostile input, and under ReleaseSafe any out-of-bounds read becomes a
+clean crash the fuzzer catches. It also lands in the one place this project's testing lesson
+applies cleanly — a pure function over a byte slice, no `Io` anywhere near it.
+
+#### Explicitly out of scope
+
+- **Writing** compression. We synthesize exactly one pointer, by hand, and it is correct. A
+  general compressor only earns its keep if local records (P4.1) start emitting multi-RR
+  answers.
+- **Wiring into `dispatcherLoop`.** P3.1 ships as a tested pure module with no caller. The
+  datapath change belongs to P3.2, and mixing the two makes both harder to review.
+
+#### Sequencing
+
+1. `name_reader.zig` plus tests and the fuzz target — self-contained, no callers, reviewable
+   on its own
+2. `question.zig` refactored onto it; the existing test must pass untouched
+3. Delete `DomainName` if nothing else uses it (nothing does, outside its own test)
+4. Docs: a pointer-following section in [dns-message-format.md](dns-message-format.md),
+   which currently forward-references this as "item #2"; mark P3.1 done here; move the
+   protocol band in [progress.md](progress.md) off ~10%
+
+No `build.zig` change is needed — tests are discovered through `main.zig`'s import graph, so
+the new file only needs to be reachable from a `test`, which step 2 provides. Per the
+lesson recorded under P2.5, run `zig build` as well as `zig build test`: a green suite is not
+evidence that the exe still compiles.
 
 ---
 
