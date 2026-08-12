@@ -722,9 +722,9 @@ of what each was and how it was resolved.
 Priority order unchanged: **compression → response parsing → caching**, each depending on
 the previous. (P3.4 wildcard blocking is now **done** — see the top of this doc.)
 
-1. **DNS message compression (pointer following).** Prerequisite for parsing any answer
-   section. `0xC0`-prefixed length byte = pointer; follow it, with a loop bound that holds
-   against hostile input. **Planned in full in [P3.1 in detail](#p31-in-detail--compression-pointer-following)
+1. **DNS message compression (pointer following).** Prerequisite for reading anything out of
+   an upstream reply — TTLs, CNAME targets, resolved IPs. `0xC0`-prefixed length byte =
+   pointer; follow it, with a loop bound that holds against hostile input. **Planned in full in [P3.1 in detail](#p31-in-detail--compression-pointer-following)
    below** (2026-08-11).
 2. **Parse upstream response records.** Decode Answer/Authority/Additional RRs to log
    resolved IPs/CNAMEs and extract TTLs — prerequisite for caching.
@@ -764,11 +764,45 @@ the previous. (P3.4 wildcard blocking is now **done** — see the top of this do
 
 Planned 2026-08-11. Nothing below is built yet.
 
+#### Why this matters
+
 Today Vortex only ever *writes* a pointer — `Authority.NAME = 0xC00C`
 ([authority.zig:5](../src/dns/authority.zig#L5)) — and *rejects* them on read, since
 `parseQuestion`'s `label_len > 63` check ([question.zig:27](../src/dns/question.zig#L27))
-catches `0xC0` on the way past. Nothing in the process can follow one, which is why the
-answer section is still opaque bytes we relay without reading.
+catches `0xC0` on the way past. Nothing in the process can follow one.
+
+**This is a reading capability, not a writing one, and it pays for nothing we do today.**
+Blocked responses carry no answer section at all — that is the point of NXDOMAIN over a
+`0.0.0.0` sinkhole — and on the forward path `dispatcherLoop` relays upstream's bytes
+verbatim, rewriting only the transaction ID ([main.zig:215](../src/main.zig#L215)) and TC on
+overflow. Upstream already did the compressing. Land P3.1 on its own and **every existing
+behavior is byte-for-byte identical**; the value is entirely in what it unblocks:
+
+- **Caching (P3.3), the real prize.** Correct caching needs the TTL, and the TTL lives
+  inside each RR behind a name: `NAME (variable) │ TYPE 2 │ CLASS 2 │ TTL 4 │ RDLENGTH 2 │
+  RDATA`. The name is both the *first* field and the *variable-length* one, so every read of
+  a TTL — and every step to the next record — begins by getting past a name. The dodge is
+  caching the whole datagram under a fixed TTL, which breaks DNS-based failover and
+  round-robin load balancing in ways that are miserable to diagnose from the client side.
+- **CNAME cloaking — a real blocking gap, not just plumbing.** Trackers defeat QNAME-only
+  blocklists by pointing `metrics.example.com` at `tracker.adnetwork.net` via CNAME.
+  `Policy` decides on the question name alone, so Vortex forwards the query and hands the
+  client the tracker's address. Closing that means reading the CNAME target out of the
+  answer's RDATA, and that target is itself a name — usually a compressed one.
+- **Per-query logs that name the answer.** Resolved IPs and the CNAME chain are the half of
+  P2.3 that makes the query log usable for debugging rather than just for auditing.
+- **Not poisoning our own cache.** The moment responses are cached, answer RRs have to be
+  checked as in-bailiwick instead of stored because upstream volunteered them. That check
+  compares names, which means resolving them.
+
+**One distinction the rest of this section leans on.** *Recognizing* a pointer is enough to
+**skip** a name — see `0xC0`, add 2, move on — and that alone walks the record stream to
+TYPE/TTL/RDLENGTH. *Following* one is what yields the name's **value**, needed for CNAME
+targets, bailiwick checks, and logging. So P3.2 could technically reach TTLs on recognition
+alone; following is what makes the records mean anything. Both are the same sixty lines of
+reader, so splitting them would be false economy — but "prerequisite for parsing the answer
+section" is a slight overstatement of the dependency, and worth knowing which half you are
+relying on when P3.2 gets written.
 
 **New file: `src/dns/name_reader.zig`.** Not `domain_name.zig` — that is a growable byte
 buffer, a different job — and not `resource_record.zig`, which does not exist and is P3.2's
