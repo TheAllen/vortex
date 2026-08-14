@@ -11,13 +11,17 @@ are stated explicitly below so the number can be argued with rather than just qu
 
 ---
 
-## Snapshot — 2026-08-10 (end of day)
+## Snapshot — 2026-08-13
 
-> **≈ 44.5% complete** against the yardstick in
+> **≈ 47.1% complete** against the yardstick in
 > [next_steps.md](next_steps.md): *"production-ready DNS sinkhole for a home network."*
 >
-> Source: 2,951 lines of Zig across 15 files. `zig build test` → 40/40 pass under both
-> Debug and ReleaseSafe, of which **37 are real behavior tests**.
+> Source: 3,294 lines of Zig across 15 files. `zig build test` → 59/59 pass under both
+> Debug and ReleaseSafe, of which **58 are real behavior tests**.
+>
+> Moved by P3.1 (compression pointer following): the protocol band from ~10% to ~20%, and
+> tests from 37 to 58. The datapath is byte-for-byte unchanged — P3.1 buys no behavior, only
+> the capability P3.2 and P3.3 are built on. `DomainName` and its allocator left with it.
 
 ### Breakdown
 
@@ -25,10 +29,10 @@ are stated explicitly below so the number can be argued with rather than just qu
 |---|---:|---:|---:|---|
 | Core query datapath | 30% | ~98% | 29.4 | **Closed out 08-09.** Header validation complete, no silent-failure modes left, replies verified against their query, every query lifecycle has a defined answer including timeout |
 | Operability | 25% | ~27% | 6.75 | P2.1 config done; P2.3 structured logging **phases 1 and 2 of 3** done — records are structured, level and format are runtime. The per-query event log, metrics, graceful shutdown, deployment, blocklist refresh still unbuilt |
-| Protocol completeness | 20% | ~10% | 2.0 | Wildcard blocking done; compression, response parsing, caching, EDNS0, TCP fallback all open |
+| Protocol completeness | 20% | ~20% | 4.0 | Wildcard blocking done; **P3.1 compression pointer following done 08-13**; response parsing, caching, EDNS0, TCP fallback open |
 | Sinkhole feature set | 15% | ~5% | 0.8 | Per-qtype strategy, local records, dashboards, DNSSEC posture — all open |
-| Tests + CI | 10% | ~56% | 5.6 | 37 real tests; CI exists but **has still never run**; `obs/log.zig` shipped with 8 tests including an adversarial one |
-| **Total** | **100%** | | **≈ 44.5** | |
+| Tests + CI | 10% | ~62% | 6.2 | 58 real tests; CI exists but **has still never run**; `name_reader.zig` shipped with 17 tests including the project's first fuzz target |
+| **Total** | **100%** | | **≈ 47.1** | |
 
 *What "98%" on the datapath means:* the remaining 2% is the hard-coded 5 s deadline and 1 s
 sweep cadence (newly unblocked for P2.1) and the QDCOUNT=0 SERVFAIL. Both are known, both are

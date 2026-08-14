@@ -45,56 +45,91 @@ www.example.com  encodes as:
 
 Rules:
 - Each label length is 1–63 bytes (`0x01`–`0x3F`).
-- The top two bits `11` (`0xC0`–`0xFF`) mean **this is a compression pointer**, not a label length — see [next_steps.md item #2](next_steps.md). Queries from clients almost never use compression in QNAME, but responses from upstream do, so the parser must reject pointers in queries and follow them in responses.
+- The top two bits `11` (`0xC0`–`0xFF`) mean **this is a compression pointer**, not a label length — see [Compression pointers](#compression-pointers-rfc-1035-414) below. Queries from clients almost never use compression in QNAME, but responses from upstream do, so the parser rejects pointers in queries and follows them in responses.
 - Max total wire length 255 bytes (RFC 1035 §2.3.4).
 - Case-insensitive per RFC 1035 §2.3.3 — lowercase before comparing against the blocklist (the StevenBlack hosts list is all lowercase).
 
-### Implementation sketch
+## Compression pointers (RFC 1035 §4.1.4)
 
-The skeleton in [src/dns/question.zig](../src/dns/question.zig) is a stub. The parsing loop already drafted in [next_steps.md item #1](next_steps.md) is the right shape, expanded with bounds checks and the QTYPE / QCLASS tail:
+Implemented in [src/dns/name_reader.zig](../src/dns/name_reader.zig) (P3.1, landed
+2026-08-13). Reading a name is its own concern, shared by the question parser and — from
+P3.2 onwards — the resource-record walk, so it lives in one module rather than inside
+either caller.
 
-```zig
-pub const Question = struct {
-    qname: std.ArrayListUnmanaged(u8) = .empty,
-    qtype: QType = undefined,
-    qclass: QClass = undefined,
+A pointer is two bytes: `11` in the top two bits, then a 14-bit offset from the **start of
+the message**. It means "the rest of this name is the name at that offset."
 
-    /// Returns the byte offset *after* the question section so the caller can
-    /// continue parsing answer / authority / additional sections.
-    pub fn parse(
-        self: *Question,
-        gpa: std.mem.Allocator,
-        data: []const u8,
-        start: usize,
-    ) !usize {
-        var idx: usize = start;
-
-        // QNAME — read labels until 0x00 root terminator.
-        while (true) {
-            if (idx >= data.len) return error.MalformedPacket;
-            const len_byte = data[idx];
-
-            if (len_byte == 0) { idx += 1; break; }
-            if (len_byte & 0xC0 != 0) return error.UnexpectedCompressionInQuery;
-            if (len_byte > 63)        return error.LabelTooLong;
-            if (idx + 1 + len_byte > data.len) return error.MalformedPacket;
-
-            if (self.qname.items.len > 0)
-                try self.qname.append(gpa, '.');
-            for (0..len_byte) |i|
-                try self.qname.append(gpa, std.ascii.toLower(data[idx + 1 + i]));
-            idx += 1 + len_byte;
-
-            if (self.qname.items.len > 255) return error.QnameTooLong;
-        }
-
-        if (idx + 4 > data.len) return error.MalformedPacket;
-        self.qtype  = @enumFromInt(std.mem.readInt(u16, data[idx..][0..2], .big));
-        self.qclass = @enumFromInt(std.mem.readInt(u16, data[idx + 2..][0..2], .big));
-        return idx + 4;
-    }
-};
 ```
+0xC0 0x0C  →  11 000000 00001100  →  offset 12
+   ↑              ↑        ↑
+   type bits      high 6   low 8
+```
+
+So every length byte is one of three things, decided by its top two bits:
+
+| Top 2 bits | Meaning | Action |
+|---|---|---|
+| `00` | label, length 0–63 (`0` = root) | copy the bytes; `0` ends the name |
+| `11` | compression pointer | jump to the target offset |
+| `01` / `10` | reserved, never assigned | `error.ReservedLabelType` |
+
+### `next_offset` is not where the name ended
+
+This is the whole subtlety of the format. When a pointer is followed, the *name* continues
+at the target, but the *message* continues **2 bytes past the pointer**. `readName` returns
+both in one struct so a caller cannot conflate them.
+
+Take a message whose question name `example.com` sits at offset 12, with a later record
+naming `www.example.com` via partial compression:
+
+```
+12: 07 'e''x''a''m''p''l''e'   20: 03 'c''o''m'   24: 00   25: qtype   27: qclass
+31: 03 'w''w''w'               35: C0 0C          37: <the next field starts here>
+```
+
+`readName(msg, 31)`:
+
+| pos | byte | what happens | name so far |
+|---|---|---|---|
+| 31 | `03` | label `www` | `www` |
+| 35 | `C0 0C` | target 12 < 35 ✓ → **`next_offset = 37`**, jump | `www` |
+| 12 | `07` | label `example` | `www.example` |
+| 20 | `03` | label `com` | `www.example.com` |
+| 24 | `00` | root; name ends | `www.example.com` |
+
+The name's bytes ended at 25 — inside the question section, which is *not* where the record
+stream resumes. A walk that resumed there would desynchronize silently.
+
+### Termination: strictly backwards, plus a jump cap
+
+Every pointer must target an offset **strictly less than the pointer's own offset**. RFC
+1035 compression *is* a backreference to a name already emitted, so this costs nothing in
+compatibility, and it kills self-reference (`0xC00C` at offset 12), forward pointers,
+A→B→A ping-pong, and out-of-range targets under a single O(1) rule — no visited set to
+allocate, no arbitrary depth constant to justify.
+
+That rule alone does **not** bound the loop, which is worth stating because it is easy to
+assume otherwise: `63 'a'… 0xC0 0x00` read from the pointer goes strictly backwards on
+every hop and still cycles forever. Chains that emit bytes are stopped by the 255-octet
+length cap; chains that emit none — pointer straight to pointer — are stopped by
+`max_jumps = 64`. Both bounds are load-bearing.
+
+### Two entry points
+
+Whether a pointer is legal is a property of *where in the protocol you are*, not of the
+parser:
+
+| Function | Used by | On a pointer |
+|---|---|---|
+| `readNameNoPointers` | `Question.parseQuestion` — the client's query | `error.UnexpectedCompressionInQuery` |
+| `readName` | P3.2's record walk — upstream's reply | follow it |
+
+### Storage
+
+`Name` is a fixed 253-byte inline buffer, no allocator. 255 octets is the wire cap; text
+form spends each label's length byte on a `.` separator instead — except the last — and
+drops the root byte, so a W-octet wire name is exactly W−2 characters of text. 253 is the
+wire cap restated, not a second limit.
 
 ### Fields we care about
 
@@ -246,25 +281,33 @@ if (ctx.blocklist.contains(question.qname.items)) {
 
 ## Error handling
 
-Every read past `data.len` is `error.MalformedPacket`. The handler logs and drops — never panic, never echo back a half-built reply. This is the contract roadmap [item #8](next_steps.md) asks for.
+Every malformed name is an error value. The handler logs and drops — never panic, never echo
+back a half-built reply. This is the contract roadmap [item #8](next_steps.md) asks for.
+
+Name errors are `name_reader.NameError`, raised identically on both paths; the rest are the
+question parser's own.
 
 | Condition | Outcome |
 |---|---|
 | Header < 12 bytes | Drop silently — there's no valid ID to respond against. |
-| QNAME length byte points past `data.len` | `error.MalformedPacket`, drop. |
+| QNAME length byte or label body runs past `data.len` | `error.Truncated`, drop. |
 | Compression pointer in a query QNAME | `error.UnexpectedCompressionInQuery`, drop. |
-| Label length > 63 | `error.LabelTooLong`, drop. |
-| QNAME total length > 255 | `error.QnameTooLong`, drop. |
+| Length byte with a `01`/`10` prefix | `error.ReservedLabelType`, drop. |
+| Pointer that is not strictly backwards, or a chain over 64 hops | `error.BadPointer`, drop. |
+| QNAME total wire length > 255 | `error.NameTooLong`, drop. |
+| QTYPE/QCLASS not fully present after the name | `error.Truncated`, drop. |
 | `QDCOUNT != 1` | Respond with `RCODE=1` (Format Error), same flag-flip pattern as the NXDOMAIN path. |
 | Trailing bytes after the question section | Allowed — leave them alone on forward, truncate them on synthesized response. |
+
+A label length above 63 is not a separate error: the top two bits make it either a pointer
+or a reserved type, so it is already covered by the two rows above.
 
 ## Cross-references
 
 - [src/dns/header.zig](../src/dns/header.zig) — header parser (done)
-- [src/dns/question.zig](../src/dns/question.zig) — question parser (stub; this doc specifies it)
-- [next_steps.md item #1](next_steps.md) — multi-label QNAME parsing
-- [next_steps.md item #2](next_steps.md) — compression pointer handling (responses only)
-- [next_steps.md item #3](next_steps.md) — answer-section parser (needed for caching, not blocking)
+- [src/dns/question.zig](../src/dns/question.zig) — question parser (done)
+- [src/dns/name_reader.zig](../src/dns/name_reader.zig) — name reader with compression pointer following (done, P3.1)
+- [next_steps.md P3.2](next_steps.md) — answer-section parser (needed for caching, not blocking)
 - [next_steps.md item #8](next_steps.md) — defensive bounds-checking on parsing
 - [async-migration.md](async-migration.md) — where `craftBlockedResponse` slots into the blocked path (Pattern 2)
 - [upstream-design.md](upstream-design.md) — what happens to non-blocked queries
