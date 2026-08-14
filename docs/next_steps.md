@@ -33,7 +33,9 @@ What exists today:
 - Runtime configuration from defaults < `.env` < process environment
   ([settings.zig](../src/settings.zig))
 - `PendingTable` with random proxy IDs, mutex, and a sweeper coroutine ([pending_table.zig](../src/utils/pending_table.zig))
-- Multi-label QName parsing with bounds checks, lowercased in place ([question.zig](../src/dns/question.zig))
+- Multi-label QName parsing with bounds checks, lowercased in place ([question.zig](../src/dns/question.zig)),
+  on top of an allocator-free name reader that follows compression pointers on the response
+  path and refuses them on the query path ([name_reader.zig](../src/dns/name_reader.zig))
 - A `Policy` filter chain — allowlist → exact blocklist → suffix blocklist — with a
   three-valued `Verdict` (`allow`/`block`/`pass`) ([policy.zig](../src/blocklist/policy.zig))
   - Exact-match blocklist fetched over HTTP ([domain_blocklist.zig](../src/blocklist/domain_blocklist.zig))
@@ -722,14 +724,18 @@ of what each was and how it was resolved.
 Priority order unchanged: **compression → response parsing → caching**, each depending on
 the previous. (P3.4 wildcard blocking is now **done** — see the top of this doc.)
 
-1. **DNS message compression (pointer following).** Prerequisite for reading anything out of
-   an upstream reply — TTLs, CNAME targets, resolved IPs. `0xC0`-prefixed length byte =
-   pointer; follow it, with a loop bound that holds against hostile input. **Planned in full in [P3.1 in detail](#p31-in-detail--compression-pointer-following)
-   below** (2026-08-11).
+1. ~~**DNS message compression (pointer following).**~~ **Done 2026-08-13** —
+   [name_reader.zig](../src/dns/name_reader.zig) reads names with pointer following, bounded
+   by a strictly-backwards rule plus a 64-jump cap; `question.zig` is refactored onto its
+   no-pointer variant and `DomainName` is deleted. Ships with no datapath caller by design —
+   see [P3.1 in detail](#p31-in-detail--compression-pointer-following) below for the full
+   rationale, which is retained because P3.2 and P3.3 both build directly on its decisions.
 2. **Parse upstream response records.** Decode Answer/Authority/Additional RRs to log
    resolved IPs/CNAMEs and extract TTLs — prerequisite for caching.
    (`resource_record.zig`/`resource_data.zig` do not exist yet — create them fresh, on top
-   of the name reader from P3.1.)
+   of the name reader from P3.1.) **This is where the reader gets its first datapath
+   caller**: `dispatcherLoop` after `upstream_socket.receive`, walking the record stream from
+   `q_end` with `readName`'s `next_offset`.
 3. **TTL-aware response caching.** Keyed on `(qname, qtype, qclass)`; store response
    bytes + expiry; on hit rewrite txid and reply without touching upstream. Plugs in
    cleanly: check in `handleQuery` before `appendQuery`, populate in `dispatcherLoop`
@@ -762,14 +768,16 @@ the previous. (P3.4 wildcard blocking is now **done** — see the top of this do
 
 ### P3.1 in detail — compression pointer following
 
-Planned 2026-08-11. Nothing below is built yet.
+Planned 2026-08-11. **Built 2026-08-13** — the plan is kept below as written, with a
+[what actually shipped](#what-actually-shipped) note at the end recording the three places
+reality diverged from it. Everything else landed as specified.
 
 #### Why this matters
 
-Today Vortex only ever *writes* a pointer — `Authority.NAME = 0xC00C`
-([authority.zig:5](../src/dns/authority.zig#L5)) — and *rejects* them on read, since
-`parseQuestion`'s `label_len > 63` check ([question.zig:27](../src/dns/question.zig#L27))
-catches `0xC0` on the way past. Nothing in the process can follow one.
+*(Written before the build.)* Today Vortex only ever *writes* a pointer —
+`Authority.NAME = 0xC00C` ([authority.zig:5](../src/dns/authority.zig#L5)) — and *rejects*
+them on read, since `parseQuestion`'s `label_len > 63` check catches `0xC0` on the way past.
+Nothing in the process can follow one.
 
 **This is a reading capability, not a writing one, and it pays for nothing we do today.**
 Blocked responses carry no answer section at all — that is the point of NXDOMAIN over a
@@ -933,6 +941,41 @@ No `build.zig` change is needed — tests are discovered through `main.zig`'s im
 the new file only needs to be reachable from a `test`, which step 2 provides. Per the
 lesson recorded under P2.5, run `zig build` as well as `zig build test`: a green suite is not
 evidence that the exe still compiles.
+
+#### What actually shipped
+
+Landed 2026-08-13. `zig build test` → **59/59 pass**, `zig build` green. Three divergences
+from the plan above, each because building it made something visible that planning it did
+not:
+
+1. **The strictly-backwards rule does not bound the loop on its own.** The plan claimed it
+   "makes termination provable with O(1) state" and cast `max_jumps = 64` as belt-and-braces
+   for pointer-to-pointer chains. It is not: `63 'a'… 0xC0 0x00`, read starting at the
+   pointer, goes strictly backwards on every hop and cycles forever, emitting a label each
+   time. Termination rests on **two** bounds — the length cap stops chains that emit bytes,
+   `max_jumps` stops chains that do not — and `max_jumps` is load-bearing, not decorative.
+   Recorded in a comment at its definition so the next reader does not re-derive it.
+2. **The buffer is 253 bytes, not 255.** The 255-octet cap is a *wire* length; text form
+   spends each label's length byte on a `.` except the last, and drops the root byte, so a
+   W-octet wire name is exactly W−2 characters. 253 is that cap restated in the module's own
+   units, which makes the bound checkable against the buffer directly instead of maintaining
+   a second wire-length counter alongside it.
+3. **No error-name coordination was needed.** The plan warned that `error.UnsupportedLabel`
+   and `error.TruncatedQuestion` were "named in `main.zig`'s drop path". They were not —
+   [main.zig:105](../src/main.zig#L105) only formats `@errorName(err)`, so no site outside
+   `question.zig` referenced either. The whole error set is now `NameError`, and the drop log
+   gained more precise names for free (`ReservedLabelType`, `BadPointer`) rather than the
+   catch-all `UnsupportedLabel`.
+
+Also worth recording: the "target past `msg.len`" row in the validation table is
+**unreachable as its own case**. A target beyond the message is necessarily ahead of the
+pointer, so the ordering rule catches it first. The test for it is kept, because what it
+pins is that the ordering rule subsumes the bounds check — not that a separate check exists.
+
+The plan's own test list was followed as written and all of it earned its keep; the
+`next_offset` assertion in the pure-pointer test was verified to discriminate (mutating it
+to the target's end offset fails the suite), which is the one assertion in the file that
+could have been vacuous.
 
 ---
 

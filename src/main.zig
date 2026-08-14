@@ -101,17 +101,14 @@ fn handleQuery(
     }
 
     var question = Question{};
-    question.init(gpa) catch {
-        std.log.err("Failed to init question", .{});
-        return;
-    };
-    defer question.deinit(gpa);
-    const q_end = question.parseQuestion(gpa, data) catch |err| {
+    const q_end = question.parseQuestion(data, 12) catch |err| {
         std.log.debug("dropping malformed query from {f}: {s}", .{ incoming_addr, @errorName(err) });
         return;
     };
 
-    const domain: []const u8 = question.qname.name_list.items;
+    // Borrows `question`'s inline buffer, so it stays valid for exactly as long
+    // as `question` is in scope — through the policy decision and the send below.
+    const domain: []const u8 = question.qname.slice();
 
     switch (ctx.policy.decide(domain)) {
         .allow => {
@@ -502,8 +499,8 @@ pub fn main(init: std.process.Init) !void {
 test {
     _ = @import("dns/authority.zig");
     _ = @import("dns/blocked_response.zig");
-    _ = @import("dns/domain_name.zig");
     _ = @import("dns/header.zig");
+    _ = @import("dns/name_reader.zig");
     _ = @import("dns/question.zig");
     _ = @import("blocklist/allowlist.zig");
     _ = @import("blocklist/domain_blocklist.zig");
