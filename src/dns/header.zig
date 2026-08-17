@@ -32,9 +32,16 @@ pub const Header = packed struct(u96) {
     /// Response Code - this 4 bit field is set as part of responses
     rcode: RCode = undefined,
 
+    /// QCOUNT
     question_count: u16 = undefined,
+
+    /// ANCOUNT
     answer_count: u16 = undefined,
+
+    /// NSCOUNT
     authority_record_count: u16 = undefined,
+
+    /// ARCOUNT
     additional_record_count: u16 = undefined,
 
     /// OPCODE - This value is set by the originator of a query and copied into the response
