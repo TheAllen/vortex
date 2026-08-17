@@ -1,6 +1,6 @@
 # DNS Message Format
 
-Wire-format reference for the question and answer sections, plus the blocked-path response we synthesize. Pairs with [src/dns/header.zig](../src/dns/header.zig) (the header is already implemented) and roadmap items #1, #2, #3, and #8 in [next_steps.md](next_steps.md).
+Wire-format reference for the question, compression, and resource-record formats, plus the blocked-path response we synthesize. The header ([src/dns/header.zig](../src/dns/header.zig)), the question parser ([question.zig](../src/dns/question.zig)), the name reader ([name_reader.zig](../src/dns/name_reader.zig), P3.1) and the blocked response ([blocked_response.zig](../src/dns/blocked_response.zig)) are implemented; the resource-record walk is [P3.2](next_steps.md#p32-in-detail--parsing-upstream-response-records) and is not.
 
 ## Overall packet layout (RFC 1035 §4.1)
 
@@ -122,7 +122,7 @@ parser:
 | Function | Used by | On a pointer |
 |---|---|---|
 | `readNameNoPointers` | `Question.parseQuestion` — the client's query | `error.UnexpectedCompressionInQuery` |
-| `readName` | P3.2's record walk — upstream's reply | follow it |
+| `readName` | [P3.2's record walk](#resource-records-rfc-1035-43) — upstream's reply | follow it |
 
 ### Storage
 
@@ -149,9 +149,92 @@ wire cap restated, not a second limit.
 | Trailing bytes after the question section | Allowed — either an OPT record (EDNS0, item #5) or ignored. |
 | Unknown QTYPE values | Forwarded as-is. The block decision still runs on QNAME. |
 
+## Resource records (RFC 1035 §4.3)
+
+The Answer, Authority and Additional sections are all the same thing: a flat stream of
+resource records, `ANCOUNT + NSCOUNT + ARCOUNT` of them, back to back with no framing
+between sections. You know which section a record is in only by counting.
+
+Parsing them is **P3.2** ([plan](next_steps.md#p32-in-detail--parsing-upstream-response-records)) —
+not needed to *block*, needed to read TTLs, log answers, and eventually cache. Today
+`dispatcherLoop` relays these bytes without looking at them.
+
+### Wire layout
+
+```
++--------------------+--------+--------+--------+----------+---------------+
+| NAME (variable,    | TYPE   | CLASS  | TTL    | RDLENGTH | RDATA         |
+| labels or pointer) | 16-bit | 16-bit | 32-bit | 16-bit   | RDLENGTH bytes|
++--------------------+--------+--------+--------+----------+---------------+
+```
+
+The name is both the **first** field and the **variable-length** one, which is why nothing
+in a record — not the TYPE, not the TTL, not the step to the next record — is reachable
+without a name reader. A record is at least 11 octets: a root-label name (1) plus the ten
+bytes of fixed fields.
+
+### Walking the stream
+
+| Step | Rule |
+|---|---|
+| Where it starts | One past the question section. In a reply Vortex forwards, that offset is already known and verified — see [P3.2's plan](next_steps.md#p32-in-detail--parsing-upstream-response-records) |
+| Read the owner name | `readName` — pointers are the normal case here, not an error |
+| Advance past the name | `readName`'s `next_offset` |
+| Read the fixed fields | TYPE, CLASS, TTL, RDLENGTH at `next_offset`, big-endian |
+| **Advance past RDATA** | `rdata_start + RDLENGTH` — **never** the `next_offset` of a name read inside RDATA |
+| When to stop | After the declared record count, which must land exactly on the end of the message |
+
+### The RDATA-name trap
+
+A CNAME, NS, PTR or MX target inside RDATA is a name, and usually a compressed one. It is
+read against the **whole message** — a pointer in RDATA may target any earlier offset,
+which the strictly-backwards rule accommodates — but the *record walk* resumes at
+`rdata_start + RDLENGTH`, not where that name's `next_offset` says. Both values are
+legitimate; using the wrong one desynchronizes the stream on every compressed RDATA and
+produces garbage records rather than an error. This is the same `next_offset` subtlety as
+[above](#next_offset-is-not-where-the-name-ended), in the one place `Read` cannot disambiguate
+for the caller.
+
+### OPT is not a normal record (RFC 6891)
+
+An EDNS0 OPT record is a resource record structurally and a header extension semantically.
+It reuses two fields for entirely different purposes:
+
+| Field | In a normal RR | In OPT (TYPE 41) |
+|---|---|---|
+| NAME | The owner name | Always root (`0x00`) |
+| CLASS | `IN` (1) | The requestor's UDP payload size (e.g. 4096) |
+| TTL | Seconds the record may be cached | Extended RCODE, EDNS version, and the DO bit |
+| RDATA | Type-specific data | `{code, length, data}` option triples |
+
+So an OPT record must be recognized by type and excluded from any TTL aggregate — folding
+its TTL field into a minimum yields whatever those flag bits happened to encode. This
+applies from the first line of P3.2, not from P3.5: replies carrying an OPT record arrive
+today.
+
+### TTL semantics
+
+| Case | Which TTL governs |
+|---|---|
+| Positive answer | The minimum TTL across the records actually answering the question |
+| Negative answer (NXDOMAIN/NODATA) | `min(SOA.MINIMUM, the SOA record's own TTL)` — RFC 2308 §5 |
+| OPT | None. Not a cacheable record |
+
+### Types worth decoding first
+
+| TYPE | Name | RDATA | Why |
+|---|---|---|---|
+| 1 | `A` | 4 bytes, IPv4 | The answer, for logging |
+| 28 | `AAAA` | 16 bytes, IPv6 | Same, and the reason blocking is QNAME-only rather than per-qtype |
+| 5 | `CNAME` | one name | The alias chain — and the vector for CNAME-cloaked trackers |
+| 6 | `SOA` | 2 names + 5 × 32-bit | `MINIMUM` governs negative caching; we already *write* one ([authority.zig](../src/dns/authority.zig)) |
+| 41 | `OPT` | option triples | Must be identified so it can be excluded, even before EDNS0 is implemented |
+
+Everything else is walked past by RDLENGTH without being interpreted.
+
 ## Answer section (for blocked responses)
 
-A full RR-section parser is roadmap [item #3](next_steps.md) — we don't need it to *block*, only to *forward* normal responses, which today is byte-for-byte relay. This section covers only what we synthesize when a query *is* blocked: the `craftBlockedResponse` function referenced throughout [next_steps.md](next_steps.md) and [async-migration.md](async-migration.md).
+A full RR-section parser is **P3.2** ([above](#resource-records-rfc-1035-43)) — we don't need it to *block*, only to *forward* normal responses, which today is byte-for-byte relay. This section covers only what we synthesize when a query *is* blocked: the `craftBlockedResponse` function referenced throughout [next_steps.md](next_steps.md) and [async-migration.md](async-migration.md).
 
 ### Which sections `craftBlockedResponse` modifies
 
@@ -302,12 +385,31 @@ question parser's own.
 A label length above 63 is not a separate error: the top two bits make it either a pointer
 or a reserved type, so it is already covered by the two rows above.
 
+### Record-walk errors are different: log, then relay anyway
+
+The table above is about *queries*, where a parse failure means the request is unusable and
+dropping is the only honest answer. A malformed **reply** is not the same situation: the
+client asked a question, upstream answered it, and the answer has already passed the
+anti-spoofing checks. P3.2 parses those records to *observe* them, so a failure there is
+logged and the reply is relayed byte-for-byte regardless.
+
+| Condition | Outcome |
+|---|---|
+| Reply's records are truncated (TC / oversized datagram) | Skip the walk — the records are known-incomplete. Relay, with TC set |
+| Reply's `QDCOUNT != 1` | Skip the walk — the record stream is not where we computed it to be. Relay |
+| RR fixed fields or RDATA run past the message | `error.Truncated`, log, relay |
+| Declared record count does not match the bytes present | `error.CountMismatch`, log, relay |
+| Any `NameError` reading an owner name or an RDATA name | Log, relay |
+
+That changes once records are *stored* rather than logged: a reply that cannot be parsed
+cannot be cached (P3.3), and one whose records are out of bailiwick must not be.
+
 ## Cross-references
 
 - [src/dns/header.zig](../src/dns/header.zig) — header parser (done)
 - [src/dns/question.zig](../src/dns/question.zig) — question parser (done)
 - [src/dns/name_reader.zig](../src/dns/name_reader.zig) — name reader with compression pointer following (done, P3.1)
-- [next_steps.md P3.2](next_steps.md) — answer-section parser (needed for caching, not blocking)
+- [next_steps.md P3.2 in detail](next_steps.md#p32-in-detail--parsing-upstream-response-records) — resource-record walk: the plan, the decisions, and what is deliberately out of scope (`resource_record.zig` / `resource_data.zig` do not exist yet)
 - [next_steps.md item #8](next_steps.md) — defensive bounds-checking on parsing
 - [async-migration.md](async-migration.md) — where `craftBlockedResponse` slots into the blocked path (Pattern 2)
 - [upstream-design.md](upstream-design.md) — what happens to non-blocked queries
