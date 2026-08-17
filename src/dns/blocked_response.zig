@@ -32,6 +32,7 @@ pub fn build(
     std.debug.assert(question_end >= 12);
     std.debug.assert(question_end <= query.len);
 
+    // The Question end position plus the Authority wire length.
     const out = try gpa.alloc(u8, question_end + Authority.WIRE_LEN);
     errdefer gpa.free(out);
 

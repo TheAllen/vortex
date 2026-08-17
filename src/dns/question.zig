@@ -32,7 +32,7 @@ pub const Question = struct {
         self.qtype = std.mem.readInt(u16, byte_slice[idx..][0..2], .big);
         self.qclass = std.mem.readInt(u16, byte_slice[idx + 2 ..][0..2], .big);
 
-        return idx + 4;
+        return idx + 4; // offset accounts for the qtype and qclass.
     }
 };
 
