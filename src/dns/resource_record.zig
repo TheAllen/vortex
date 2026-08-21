@@ -12,6 +12,6 @@ pub const ResourceRecord = struct {
     class: u16,
     ttl: u32,
     rdlength: u16,
-    rdata: u32,
+    rdata: []const u8,
     section: Section,
 };
