@@ -209,6 +209,13 @@ fn dispatcherLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
             continue;
         };
 
+        var reply_header = Header{};
+        reply_header.parseHeader(reply_msg.data[0..12]);
+
+        var reply_question = Question{};
+        var offset: usize = 12;
+        offset = reply_question.parseQuestion(&reply_msg.data, offset);
+
         std.mem.writeInt(u16, reply_msg.data[0..2], entry.client_id, .big);
 
         // The datagram was larger than `msg_buf` and the tail was discarded. We
