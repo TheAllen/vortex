@@ -214,7 +214,13 @@ fn dispatcherLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
 
         var reply_question = Question{};
         var offset: usize = 12;
-        offset = reply_question.parseQuestion(&reply_msg.data, offset);
+        offset = reply_question.parseQuestion(reply_msg.data, offset) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {
+                std.log.warn("failed to parse reply question: {s}", .{@errorName(err)});
+                continue;
+            },
+        };
 
         std.mem.writeInt(u16, reply_msg.data[0..2], entry.client_id, .big);
 

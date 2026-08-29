@@ -23,7 +23,7 @@ pub const Question = struct {
     /// Compression is refused outright: a pointer in a query's question section
     /// is a protocol violation, and reading one would let a client aim the
     /// parser at bytes it did not send.
-    pub fn parseQuestion(self: *Question, byte_slice: []const u8, name_start: usize) !usize {
+    pub fn parseQuestion(self: *Question, byte_slice: []const u8, name_start: usize) anyerror!usize {
         const read = try name_reader.readNameNoPointers(byte_slice, name_start);
         self.qname = read.name;
 
