@@ -1,6 +1,8 @@
 const std = @import("std");
 const name_reader = @import("name_reader.zig");
 
+const Header = @import("header.zig").Header;
+
 pub const Section = enum {
     answer,
     authority,
@@ -70,19 +72,89 @@ pub const ResourceRecord = struct {
     rdlength: u16,
     rdata: []const u8,
     section: Section,
+};
 
-    pub fn parseRecord(self: *ResourceRecord, byte_slice: []const u8, idx_start: usize) !usize {
-        const read = try name_reader.readNameNoPointers(byte_slice, idx_start);
-        self.name = read.name;
+/// A parsed record plus where the walk resumes — the same shape, and for the
+/// same reason, as `name_reader.Read`.
+pub const Read = struct {
+    record: ResourceRecord,
+    next_offset: usize,
+};
 
-        var idx = read.next_offset;
+/// Parses one record at `idx_start`. A free function returning a whole record
+/// rather than a method filling out `self`: every field is set in one
+/// expression, so there is no window in which a `ResourceRecord` exists
+/// half-built and no field needs an `undefined` default to make the caller
+/// compile.
+pub fn parseRecord(byte_slice: []const u8, idx_start: usize, section: Section) !Read {
+    // `readName`, not the no-pointers variant: this is the reply path, where an
+    // owner name compressed back to the qname at offset 12 is what every
+    // upstream sends, not a protocol violation.
+    const read = try name_reader.readName(byte_slice, idx_start);
+    const idx = read.next_offset;
 
-        self.type = std.mem.readInt(u16, byte_slice[idx..][0..2], .big);
-        self.class = std.mem.readInt(u16, byte_slice[idx..][2..4], .big);
-        self.ttl = std.mem.readInt(u32, byte_slice[idx..][4..8], .big);
-        self.rdlength = std.mem.readInt(u16, byte_slice[idx..][8..10], .big);
-        idx += 10;
+    // TYPE(2) CLASS(2) TTL(4) RDLENGTH(2) - checked as one block, before any read.
+    if (idx + 10 > byte_slice.len) return error.Truncated;
+    const rdlength = std.mem.readInt(u16, byte_slice[idx..][8..10], .big);
 
-        return idx;
+    const rdata_start = idx + 10;
+    // RDLENGTH is upstream's claim about the message, not a fact about it.
+    if (rdata_start + rdlength > byte_slice.len) return error.Truncated;
+
+    return .{
+        .record = .{
+            .name = read.name,
+            .type = std.mem.readInt(u16, byte_slice[idx..][0..2], .big),
+            .class = std.mem.readInt(u16, byte_slice[idx..][2..4], .big),
+            .ttl = std.mem.readInt(u32, byte_slice[idx..][4..8], .big),
+            .rdlength = rdlength,
+            .rdata = byte_slice[rdata_start..][0..rdlength],
+            .section = section,
+        },
+        // The walk resumes past RData - never at a contained name's next_offset.
+        .next_offset = rdata_start + rdlength,
+    };
+}
+
+pub const ResourceRecordIter = struct {
+    msg: []const u8,
+    offset: usize,
+    /// Records still owed per section, in wire order. Drained left to right.
+    remaining: [3]u16,
+    section_idx: usize = 0,
+
+    pub fn init(msg: []const u8, offset: usize, header: Header) ResourceRecordIter {
+        return .{
+            .msg = msg,
+            .offset = offset,
+            .remaining = .{
+                header.answer_count,
+                header.authority_record_count,
+                header.additional_record_count,
+            },
+        };
+    }
+
+    pub fn next(self: *ResourceRecordIter) !?ResourceRecord {
+        // An empty section is normal, not an ending - a reply with ANCOUNT=0
+        // and NSCOUNT=1 (NXDOMAIN with a SOA) is the common case, so skip forward
+        // rather than stopping.
+        while (self.section_idx < 3 and self.remaining[self.section_idx] == 0) {
+            self.section_idx += 1;
+        }
+
+        if (self.section_idx == 3) {
+            // Every declared record consumed. Bytes left over means the framing
+            if (self.offset != self.msg.len) return error.CountMismatch;
+            return null;
+        }
+
+        // Records still owned, no bytes left to pay with.
+        if (self.offset >= self.msg.len) return error.CountMismatch;
+
+        const read = try parseRecord(self.msg, self.offset, @enumFromInt(self.section_idx));
+        self.offset = read.next_offset;
+        self.remaining[self.section_idx] -= 1;
+        return read.record;
     }
 };
