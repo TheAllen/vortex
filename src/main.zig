@@ -12,6 +12,7 @@ const Policy = @import("blocklist/policy.zig").Policy;
 const obs_log = @import("obs/log.zig");
 const Settings = @import("settings.zig").Settings;
 const SuffixBlockList = @import("blocklist/suffix_blocklist.zig").SuffixBlockList;
+const ResourceRecordIter = @import("dns/resource_record.zig").ResourceRecordIter;
 const Question = @import("dns/question.zig").Question;
 
 /// Every `std.log.*` call in the process — ours and the standard library's —
@@ -221,6 +222,25 @@ fn dispatcherLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
                 continue;
             },
         };
+
+        // Parse resource records. Read-only: the datapath below relays upstream's
+        // bytes verbatim whatever this finds, so a parse failure abandons the
+        // walk and nothing else. A resolver that stopped resolving because it
+        // disagreed with a record it was only logging would be a worse outcome
+        // than any log line is worth.
+        // The label is load-bearing: an unlabelled `break` in a `while`
+        // *condition* binds to the enclosing loop — here the dispatcher's own
+        // `while (true)` — which silently swallows the reply and drops out of
+        // the loop entirely instead of just ending the walk.
+        var resourceRecordIter = ResourceRecordIter.init(reply_msg.data, offset, reply_header);
+        walk: while (true) {
+            const next = resourceRecordIter.next() catch |err| {
+                std.log.debug("record walk for id={x}: {s}", .{ proxy_id, @errorName(err) });
+                break :walk;
+            };
+            const record = next orelse break :walk;
+            std.log.info("name: {s}", .{record.name.slice()});
+        }
 
         std.mem.writeInt(u16, reply_msg.data[0..2], entry.client_id, .big);
 
