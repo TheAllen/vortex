@@ -10,9 +10,9 @@ const PendingTable = pending_table_mod.PendingTable;
 const PendingQuery = pending_table_mod.PendingQuery;
 const Policy = @import("blocklist/policy.zig").Policy;
 const obs_log = @import("obs/log.zig");
+const ResourceRecordIter = @import("dns/resource_record.zig").ResourceRecordIter;
 const Settings = @import("settings.zig").Settings;
 const SuffixBlockList = @import("blocklist/suffix_blocklist.zig").SuffixBlockList;
-const ResourceRecordIter = @import("dns/resource_record.zig").ResourceRecordIter;
 const Question = @import("dns/question.zig").Question;
 
 /// Every `std.log.*` call in the process — ours and the standard library's —
@@ -535,6 +535,7 @@ test {
     _ = @import("dns/header.zig");
     _ = @import("dns/name_reader.zig");
     _ = @import("dns/question.zig");
+    _ = @import("dns/resource_record.zig");
     _ = @import("blocklist/allowlist.zig");
     _ = @import("blocklist/domain_blocklist.zig");
     _ = @import("blocklist/suffix_blocklist.zig");

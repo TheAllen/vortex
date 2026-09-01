@@ -195,7 +195,7 @@ pub const Header = packed struct(u96) {
     }
 
     /// Deserialize Header section to little-endian format
-    pub fn parseHeader(self: *Header, header_slice: *[12]u8) void {
+    pub fn parseHeader(self: *Header, header_slice: *const [12]u8) void {
         // Read in the Header ID in wire format
         self.*.id = std.mem.readInt(u16, header_slice[0..2], .big);
 
