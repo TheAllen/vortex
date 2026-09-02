@@ -449,6 +449,7 @@ pub fn main(init: std.process.Init) !void {
     var question_seed: u64 = undefined;
     io.random(std.mem.asBytes(&question_seed));
 
+    // process-wide bundle of shared, long-lived resources that every coroutine in the proxy needs.
     const ctx = Context.init(
         &client_socket,
         &upstream_socket,

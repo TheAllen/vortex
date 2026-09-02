@@ -68,6 +68,8 @@ pub const PendingTable = struct {
         self.map.deinit();
     }
 
+    /// Appends a query to the pending table and generate a random u16 integer value
+    /// as the proxy_id. Provides mechanism to retry if deduping proxy_id.
     pub fn appendQuery(self: *PendingTable, pending_query: PendingQuery) !u16 {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
