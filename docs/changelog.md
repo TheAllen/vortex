@@ -9,6 +9,109 @@ Newest first. Open work lives in [next_steps.md](next_steps.md).
 
 ---
 
+## Landed 2026-08-30 — P3.2 upstream response record parsing
+
+Planned 2026-08-16 (the plan lived in `next_steps.md` and is folded into this entry), built
+2026-08-30, tests 2026-08-31, comments 2026-09-01.
+[resource_record.zig](../src/dns/resource_record.zig) walks a reply's Answer/Authority/
+Additional sections, and `dispatcherLoop` is the name reader's **first datapath caller** —
+the thing P3.1 shipped without on purpose.
+
+`zig build test` → **69/69 pass** (59 → 69, all ten new ones on the record walk).
+
+### Scope: a read-only observer, and nothing else
+
+**The datapath relays upstream's bytes verbatim, whatever the walk finds.** A parse error
+logs at debug and abandons the walk; there is no path from a record-parsing verdict to a
+dropped or rewritten reply. This is the first time a hostile-input parser sits on the live
+response path, and a resolver that stops resolving because it disagreed with an RR it was
+only logging is a worse outcome than any log line is worth.
+
+The walk sits in `dispatcherLoop` between `pending_table.complete` and the transaction-ID
+rewrite. Everything above that line is anti-spoofing and stays first; everything below it is
+the client's copy of the packet. Records start at `12 + question_len` — a field lookup
+against bytes `hashQuestion` has already proven to be our own question echoed back, not a
+re-parse that trusts the reply's framing.
+
+### The decisions worth keeping
+
+- **A pull-based iterator, not an eager parse.** The section counts are upstream-controlled
+  `u16`s, so an eager parse needs either an allocation or an arbitrary cap on how many
+  records it will hold. The iterator needs neither, and `rdata` is a subslice rather than a
+  copy — the borrow is lifetime-obvious because the datagram outlives the walk by
+  construction, the same argument that keeps `Name` in inline storage.
+- **The walk resumes past RDATA, never at a contained name's `next_offset`.** A CNAME's
+  target is a name inside RDATA; reading it leaves `next_offset` wherever that name ended,
+  which for a compressed target is *behind* the record. Advancing by `rdata_start + rdlength`
+  is the only correct move, and it is pinned by its own test.
+- **An empty section is skipped, not terminal.** ANCOUNT=0 with NSCOUNT=1 is NXDOMAIN-with-a-
+  SOA — the common case, and the shape Vortex itself emits. Stopping at the first zero count
+  would see nothing in its own blocked responses.
+- **`CountMismatch` fires in both directions:** records still owed with no bytes left, and
+  bytes left over after the last declared record. Framing that does not add up is a finding,
+  not something to walk past.
+- **`readName`, not the no-pointer variant.** This is the reply path, where an owner name
+  compressed back to the qname at offset 12 is what every upstream sends.
+- **`Type` is an open enum** (`_`), so an unknown code stays representable instead of
+  becoming illegal behavior on `@enumFromInt`.
+
+### Tests
+
+Ten, including a `std.testing.fuzz` target over arbitrary bytes — the second in the project,
+and for the same reason as the first: the whole threat model of this function is hostile
+input, and under ReleaseSafe an out-of-bounds read becomes a clean crash the fuzzer catches.
+The fixture is a realistic reply (CNAME chain, EDNS0 OPT in Additional, every owner name
+compressed *and* the CNAME's RDATA target compressed) rather than a hand-built one, because
+the compressed-target case is what a hand-built fixture gets wrong and a real resolver never
+does. One test walks Vortex's own blocked response and asserts it yields exactly the
+synthetic SOA, which ties the reader to the writer.
+
+### What actually shipped — four divergences from the plan
+
+1. **Both planned guards are missing.** The plan specified skipping the walk when
+   `reply_msg.flags.trunc` (those records are known-incomplete, so errors from them mean
+   nothing) and unless the reply's QDCOUNT is 1 (`12 + question_len` is where records start
+   *given one question*; walking from the wrong offset is exactly the silent
+   desynchronization the design is built to avoid). Neither is implemented —
+   [main.zig:235](../src/main.zig#L235) runs the walk unconditionally, and the `trunc` check
+   is twenty lines *below* it. Low blast radius today, because a bad offset yields a parse
+   error and a parse error changes nothing. It is still the guard the plan argued for.
+2. **`parseRdata` does not compile, and nothing noticed.** It has **zero callers** — not in
+   the datapath, not in its own file, not in a test — so Zig never analyses it and both
+   `zig build` and `zig build test` stay green. Forcing analysis fails immediately:
+   `incompatible types` on the `switch`, because the prongs are peer-resolved as anonymous
+   struct literals with no `return` and no `Rdata` coercion target. Two further defects sit
+   behind that one: `.MX` sets `.exchange = rdata[0..2]`, which is the *preference* bytes and
+   not the exchange name, and `.A`/`.AAAA` index `rdata[0..4]` / `rdata[0..16]` with no
+   length check, so a short-but-well-framed RDATA is an out-of-bounds read. `Rdata` and
+   `Type` are used; `parseRdata` is dead.
+
+   **This is the 2026-08-09 lazy-analysis lesson recurring**, one step worse. That entry
+   recorded that `zig build test` does not type-check `main`; this records that it does not
+   type-check *any* uncalled `pub fn`, in any file, including one the aggregator imports.
+   `_ = @import("dns/resource_record.zig")` collects the file's `test` blocks — it does not
+   reference its declarations. **A green suite is not evidence that a file compiles; only a
+   caller is.** The cheapest permanent fix is a `std.testing.refAllDecls(@This())` in the
+   aggregator, which turns every unreferenced `pub` decl into a compile error at test time.
+3. **`resource_data.zig` was never created.** The plan named two files; `Rdata` and
+   `parseRdata` live in `resource_record.zig` instead. Fine at 481 lines — worth revisiting
+   only if rdata decoding grows once it has a caller.
+4. **Naming drifted from the sketch.** `Record`/`RecordIter` shipped as
+   `ResourceRecord`/`ResourceRecordIter`, `rtype` as `type`, and `rdlength` was added as a
+   field rather than being implied by `rdata.len`. `parseRecord` returns a `Read`
+   (`{ record, next_offset }`) — deliberately the same shape, and for the same reason, as
+   `name_reader.Read`.
+
+### What this does not do
+
+No TTL extraction, no caching, no structured per-record event. The record log line is
+`std.log.info("name: {s}", …)` at [main.zig:242](../src/main.zig#L242) — a placeholder that
+prints one field at `info` for every record of every query, which is both the wrong level and
+the wrong shape for the per-query event P2.3 phase 3 owes. The **capability** is what landed;
+P3.3 is what spends it.
+
+---
+
 ## Landed 2026-08-13 — P3.1 compression pointer following
 
 Planned 2026-08-11, built 2026-08-13. The plan is kept below as written, with a

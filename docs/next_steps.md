@@ -1,12 +1,18 @@
 # Next Steps — Road to Production-Ready
 
-Reviewed **2026-08-19** against the current source (Zig 0.16.0, `zig build test` →
-**59/59 pass**, of which 56 are real behavior tests). **No open P0s, and no open P1 bugs** —
+Reviewed **2026-09-05** against the current source (Zig 0.16.0, `zig build test` →
+**69/69 pass**, of which 66 are real behavior tests). **No open P0s, and no open P1 bugs** —
 all three P0s are pinned by regression tests that fail under mutation.
 
+One new correctness item is on the board as of this review: `parseRdata` in
+[resource_record.zig](../src/dns/resource_record.zig) **does not compile** and nobody noticed,
+because it has no callers and Zig never analysed it. It is dead code, so it is Housekeeping
+rather than P0 — but the *reason* it went unseen generalizes, and that fix is on the board
+too. See [Housekeeping](#housekeeping).
+
 **History lives in [changelog.md](changelog.md)** — dated entries for everything that landed,
-the three closed P0s in detail, and the shipped P3.1 plan. This file is the board: open work
-only.
+the three closed P0s in detail, and the shipped P3.1 and P3.2 plans. This file is the board:
+open work only.
 
 The single largest remaining gap is that `handleQuery`, `dispatcherLoop` and the ingress loop
 have **no automated coverage at all**, and cannot get any by extracting another pure
@@ -35,6 +41,10 @@ does not cost 25 seconds per case.
 - Multi-label QName parsing with bounds checks, lowercased in place ([question.zig](../src/dns/question.zig)),
   on top of an allocator-free name reader that follows compression pointers on the response
   path and refuses them on the query path ([name_reader.zig](../src/dns/name_reader.zig))
+- A resource-record walk over upstream replies ([resource_record.zig](../src/dns/resource_record.zig)),
+  wired into `dispatcherLoop` as a **read-only observer** — a parse failure abandons the walk
+  and the client still receives upstream's bytes verbatim. The name reader's first datapath
+  caller
 - A `Policy` filter chain — allowlist → exact blocklist → suffix blocklist — with a
   three-valued `Verdict` (`allow`/`block`/`pass`) ([policy.zig](../src/blocklist/policy.zig))
   - Exact-match blocklist fetched over HTTP ([domain_blocklist.zig](../src/blocklist/domain_blocklist.zig))
@@ -111,19 +121,21 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
    `dispatcherLoop`.
 4. **Graceful shutdown.** No signal handling; the only exit is a crash or Ctrl-C mid-write.
    Catch SIGINT/SIGTERM, `group.cancel`, flush the log, run the deferred deinits.
-5. **Test coverage.** `zig build test` → **59/59, of which 56 are real**: 17 `name_reader`
-   (including the fuzz target), 9 `Header`, 8 `obs/log`, 7 `PendingTable`, 5 `settings`,
-   4 `parseQuestion`, 3 `blocked_response` golden-bytes, `backoffSeconds`, allowlist
-   hit/miss, and `SuffixBlockList.decide`. The 3 that assert nothing about Vortex are
-   `root.zig`'s `add(3, 7)` stub, `main.zig`'s "initialize sockets", and the
-   `test { _ = @import(…) }` aggregator, which the runner counts as a passing test.
+5. **Test coverage.** `zig build test` → **69/69, of which 66 are real**: 17 `name_reader`
+   (including a fuzz target), 10 `resource_record` (including the second), 9 `Header`,
+   8 `obs/log`, 7 `PendingTable`, 5 `settings`, 4 `parseQuestion`, 3 `blocked_response`
+   golden-bytes, `backoffSeconds`, allowlist hit/miss, and `SuffixBlockList.decide`. The 3
+   that assert nothing about Vortex are `root.zig`'s `add(3, 7)` stub, `main.zig`'s
+   "initialize sockets", and the `test { _ = @import(…) }` aggregator, which the runner
+   counts as a passing test.
 
-   **The lesson, now confirmed five times.** C3 became testable when the check moved into
+   **The lesson, now confirmed six times.** C3 became testable when the check moved into
    pure `Header.validateQuery`; C2 when assembly moved into pure `blocked_response.build`;
    P2.1 when the dotenv parser split from the file read; P1.1 when `sweepExpiredQueries` was
    changed to *report* evictions instead of sending them; P3.1 when name reading became a
-   pure function over a byte slice. Every one is the same move: **separate deciding from
-   doing, and the test needs no `Io`.**
+   pure function over a byte slice; P3.2 when the record walk was built as an iterator over
+   that slice, testable against golden bytes before it had a caller. Every one is the same
+   move: **separate deciding from doing, and the test needs no `Io`.**
 
    Three more worth keeping:
    - **Assert against literal bytes**, not values recomputed from the same constants the
@@ -148,9 +160,20 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
      plus a ReleaseSafe pair. Anything you want the compiler to check must be reachable from
      a `test`, or you must build the exe.
 
+     **Worse than recorded, found 2026-09-05.** This is not limited to `main`. `parseRdata`
+     in [resource_record.zig](../src/dns/resource_record.zig) has no callers anywhere, so it
+     is never analysed and **does not compile** — while `zig build` *and* `zig build test`
+     both stay green, in both optimization modes. Adding the file to the aggregator does not
+     help: `_ = @import("dns/resource_record.zig")` collects that file's `test` blocks; it
+     does not reference its declarations. So the rule is stronger than "build the exe too":
+     **an uncalled `pub fn` is unchecked no matter what you run.** The fix is one line —
+     `std.testing.refAllDecls(@This())` in each module's test block, which forces analysis of
+     every public declaration and turns exactly this class of rot into a test-time compile
+     error. See [Housekeeping](#housekeeping).
+
    Still missing:
    - **An integration harness for the coroutine-bound code — now the largest gap.**
-     The 59 tests are almost entirely over pure functions. `handleQuery`, `dispatcherLoop`
+     The 69 tests are almost entirely over pure functions. `handleQuery`, `dispatcherLoop`
      and the ingress loop have **no automated coverage of any kind** — not runtime, and (per
      the third lesson above) not even compile-time from `zig build test`. Everything proven
      about them on 2026-08-09 was proven by hand with `dig` and throwaway Python.
@@ -212,12 +235,23 @@ the previous.
    The full rationale is retained in
    [changelog.md](changelog.md#landed-2026-08-13--p31-compression-pointer-following),
    because P3.2 and P3.3 both build directly on its decisions.
-2. **Parse upstream response records.** Decode Answer/Authority/Additional RRs to log
-   resolved IPs/CNAMEs and extract TTLs — prerequisite for caching.
-   (`resource_record.zig`/`resource_data.zig` do not exist yet — create them fresh, on top
-   of the name reader from P3.1.) **This is where the reader gets its first datapath
-   caller**: `dispatcherLoop` after `upstream_socket.receive`. See
-   [P3.2 in detail](#p32-in-detail--parsing-upstream-response-records) below.
+2. ~~**Parse upstream response records.**~~ **Done 2026-08-30** —
+   [resource_record.zig](../src/dns/resource_record.zig) walks Answer/Authority/Additional
+   with a pull-based `ResourceRecordIter`, and `dispatcherLoop` is the name reader's first
+   datapath caller. Ships as a read-only observer: the datapath relays upstream's bytes
+   whatever the walk finds. The plan, the decisions, and **four divergences from it** are in
+   [changelog.md](changelog.md#landed-2026-08-30--p32-upstream-response-record-parsing).
+   **Residue, all of it feeding P3.3:**
+   - The two planned guards were not implemented — skip the walk when `reply_msg.flags.trunc`,
+     and unless the reply's QDCOUNT is 1. Cheap, and the second one prevents walking from an
+     offset that is not where the records start
+   - No TTL extraction yet, which is the half P3.3 actually needs. **OPT is not a TTL** —
+     TYPE 41 reuses the TTL field for extended-RCODE/version/DO, so it must be excluded by
+     type from any minimum-TTL computation
+   - `parseRdata` is broken and dead — see [Housekeeping](#housekeeping)
+   - The record log line is a placeholder (`std.log.info("name: {s}", …)`, one line per
+     record per query, at `info`). It should become fields on P2.3's per-query event, not a
+     second line beside it
 3. **TTL-aware response caching.** Keyed on `(qname, qtype, qclass)`; store response
    bytes + expiry; on hit rewrite txid and reply without touching upstream. Plugs in
    cleanly: check in `handleQuery` before `appendQuery`, populate in `dispatcherLoop`
@@ -247,178 +281,13 @@ the previous.
    to accommodate (a connection pool replaces `upstream_socket`, same `PendingTable`
    pattern). See the evolution table in [upstream-design.md](upstream-design.md).
 
-### P3.2 in detail — parsing upstream response records
+### P3.2 in detail — shipped
 
-Planned 2026-08-16. Not built. The wire-format half of this lives in
-[dns-message-format.md § Resource records](dns-message-format.md#resource-records-rfc-1035-43);
-what follows is the plan, the decisions, and the two questions still open.
-
-#### Three things that are already in place
-
-Worth stating first, because the plan reads shorter once they are accounted for:
-
-1. **The record stream's start offset is already known — and already verified.** The plan in
-   P3.1 said this walk begins "from `q_end`", which implies re-parsing the question out of
-   the reply. It does not have to. `PendingQuery.question_len` is stored at send time, and by
-   the time `dispatcherLoop` reaches the forwarding path,
-   [`hashQuestion`](../src/utils/pending_table.zig) has already checked that the reply's
-   bytes `[12..12+question_len]` hash-match the query's. So records start at
-   `12 + pending.question_len`, established by a field lookup against bytes that have already
-   been proven to be our own question echoed back — not by trusting the reply's framing.
-2. **The insertion point is unambiguous**: in `dispatcherLoop`, between
-   `pending_table.complete` and the transaction-ID rewrite. Everything above that line is
-   anti-spoofing and must stay first; everything below it is the client's copy of the packet.
-3. **The section counts are already decoded.** `answer_count`, `authority_record_count` and
-   `additional_record_count` are live fields on [`Header`](../src/dns/header.zig).
-   `dispatcherLoop` never builds a `Header` for a reply today — it reads the ID raw — so this
-   costs one `parseHeader` call.
-
-#### Scope: a read-only observer, and nothing else
-
-**The datapath keeps relaying upstream's bytes verbatim, whatever the walk finds.** A parse
-error logs at debug and changes nothing about what the client receives; there is no path
-from a record-parsing verdict to a dropped or rewritten reply in this item. That preserves
-the property P3.1 shipped under — no existing behavior changes — and it matters more here
-than it did there, because this is the first time a hostile-input parser sits on the live
-response path. A resolver that stops resolving because it disagreed with an RR it was only
-logging is a worse outcome than any log line is worth.
-
-Two guards fall out of that stance, both cheap:
-
-- **Skip the walk when `reply_msg.flags.trunc`.** Those records are known-incomplete —
-  `dispatcherLoop` already handles that case by setting TC — so parsing them yields errors
-  that mean nothing.
-- **Skip the walk unless the reply's QDCOUNT is 1.** `12 + question_len` is where records
-  start *given one question*. An upstream that echoes a second question puts the record
-  stream somewhere else, and walking from the wrong offset is exactly the silent
-  desynchronization the rest of this design is built to avoid.
-
-#### API — an iterator, not an eager parse
-
-```zig
-pub const Record = struct {
-    name: name_reader.Name,
-    rtype: u16,
-    class: u16,
-    ttl: u32,
-    /// Borrows `msg`. Valid exactly as long as the datagram buffer is.
-    rdata: []const u8,
-    /// Which section this record came from, so a caller can tell an answer
-    /// from a hint without counting.
-    section: Section,
-};
-
-pub const RecordIter = struct {
-    pub fn init(msg: []const u8, offset: usize, header: Header) RecordIter;
-    pub fn next(self: *RecordIter) RecordError!?Record;
-};
-```
-
-Pull-based because the counts are upstream-controlled `u16`s: an eager parse into a slice
-needs either an allocation or an arbitrary cap on how many records it will hold, and the
-iterator needs neither. `rdata` is a subslice rather than a copy, which keeps the allocator
-off the response path for the same reason `Name` is inline storage — the borrow is
-lifetime-obvious because the datagram outlives the walk by construction.
-
-#### The two mistakes worth writing comments about
-
-Both are silent-corruption bugs rather than crashes, which is what makes them worth pinning
-in the source rather than only here.
-
-**OPT is not a TTL.** An OPT record (TYPE 41, RFC 6891) reuses the CLASS field to carry the
-requestor's UDP payload size and the TTL field to carry extended-RCODE, version, and the DO
-bit. Folding it into a minimum-TTL computation produces a number with no meaning — it is
-whatever the flags happened to encode. It has to be recognized by type and excluded, and
-that is live from day one, not a P3.5 concern: replies with an OPT record arrive today.
-
-**Names inside RDATA advance by RDLENGTH, never by `next_offset`.** A CNAME/NS/PTR target is
-read with `readName` against the whole message — a pointer in RDATA may legally target any
-earlier offset, which the strictly-backwards rule accommodates — but the *walk* resumes at
-`rdata_start + rdlength`. Using the name's `next_offset` to continue the record stream
-desynchronizes on every compressed RDATA. This is precisely the confusion `Read` was shaped
-to prevent, in the one place where the struct cannot prevent it for you: both values are
-legitimate, and the caller has to pick the right one.
-
-#### Bounding the walk
-
-Both bounds are load-bearing, in the same way `max_jumps` turned out to be for the name
-reader:
-
-- **Counts.** Stop after `ANCOUNT + NSCOUNT + ARCOUNT` records. A reply claiming
-  `ANCOUNT=65535` in a 40-byte datagram must fail on the second record, not iterate.
-- **Bytes.** Every record consumes at least 11 octets — a root-label name (1) plus TYPE (2),
-  CLASS (2), TTL (4), RDLENGTH (2) — so the byte budget bounds the loop independently of
-  what the header claims. Reaching the end of the message with records still owed, or
-  finishing the declared records with bytes left over, is a `CountMismatch`, not a shrug.
-- **RDLENGTH is a claim, not a fact.** `rdata_start + rdlength > msg.len` is `Truncated`.
-
-#### Errors
-
-`RecordError` is its own set that includes `NameError`, so a caller can switch on the
-precise cause without the record walk having to rename the name reader's errors:
-
-| Condition | Error |
-|---|---|
-| RR fixed fields (TYPE/CLASS/TTL/RDLENGTH) run past `msg.len` | `Truncated` |
-| RDATA runs past `msg.len` | `Truncated` |
-| Declared record count not satisfied by the bytes present | `CountMismatch` |
-| Anything the name reader raises while reading an owner name or RDATA name | `NameError` |
-
-#### Tests
-
-Golden byte vectors again, and for the same reason — the format is bytes, and each of these
-fails differently:
-
-- A real-shaped reply: question, then `CNAME` → `A`, with the owner names compressed back to
-  offset 12. The case every upstream actually sends
-- Walking that reply yields exactly `ANCOUNT + NSCOUNT + ARCOUNT` records and lands precisely
-  on `msg.len`
-- A CNAME whose RDATA target is itself compressed — the RDLENGTH-vs-`next_offset` trap, with
-  the assertion on the *next* record's name rather than on this one's
-- RDLENGTH that overruns the message → `Truncated`
-- ANCOUNT larger than the records present → `CountMismatch`
-- Trailing bytes after the last declared record → `CountMismatch`
-- An OPT record in Additional → surfaced as a record, excluded from any TTL aggregate
-- Round trip against `blocked_response.build`: walking our own NXDOMAIN reply yields exactly
-  one authority record, the synthetic SOA, with its owner name resolving to the qname. The
-  same writer-vs-reader check P3.1 ended on
-- Fuzz over arbitrary bytes at an arbitrary offset, asserting only termination and that
-  every yielded record's `rdata` lies inside `msg`. Highest-value test here, same as it was
-  for the name reader
-
-#### Explicitly out of scope
-
-- **CNAME-cloak blocking.** The most interesting item in P3.1's rationale, and a genuine
-  behavior change: it turns the walk into a decision rather than an observation. It needs its
-  own entry, with its own answer to what happens to a reply whose CNAME chain is blocked
-  (synthesize NXDOMAIN? drop? relay and log?) — questions that have nothing to do with
-  parsing and would swallow the review of the parser if bundled.
-- **Bailiwick checking.** Only matters once records are stored (P3.3). An observer that logs
-  an out-of-bailiwick record is not poisoned by it.
-- **Typed RDATA decode beyond A / AAAA / CNAME.** Enough to log an answer. `resource_data.zig`
-  exists to be extended, not to be exhaustive on the first pass.
-- **The per-query structured event log.** Emitting these as real fields (client, qtype,
-  rcode, answer, latency) is P2.3's remaining phase. P3.2 hands it the data.
-
-#### Sequencing
-
-1. `resource_record.zig` — `RecordIter` plus golden vectors and the fuzz target,
-   self-contained, no callers, reviewable on its own
-2. `resource_data.zig` — A / AAAA / CNAME decoding over `Record.rdata`
-3. Wire into `dispatcherLoop` behind the two guards above, logging under the `query` scope;
-   confirm a normal lookup is still byte-identical end to end
-4. Add the file to `main.zig`'s test aggregation block, and run `zig build` as well as
-   `zig build test` — the P2.5 lesson: a green suite is not evidence the exe still compiles
-
-#### Open decisions
-
-1. **Observer-only, as written above — or is CNAME-cloak blocking the point?** The plan above
-   assumes the former. If the answer is the latter, the parser is unchanged and one more
-   entry gets written; nothing here is wasted either way.
-2. **Where the walk's output goes in this pass.** Simplest is a `query`-scoped debug line
-   naming the answer. The alternative is holding P3.2's caller until P2.3's per-query event
-   is defined, so the answer arrives as fields in that record rather than as a second line
-   beside it.
+The plan that was written here on 2026-08-16 built out on 2026-08-30 and moved to
+[changelog.md](changelog.md#landed-2026-08-30--p32-upstream-response-record-parsing),
+following the convention P3.1 set: a plan stops being board material the day it ships, but
+the reasoning is kept because P3.3 builds directly on it. What is still open from that work
+is listed under P3.2 above, not here.
 
 ---
 
@@ -472,6 +341,26 @@ real sinkhole (the Pi-hole / AdGuard Home / Unbound-`local-zone` feature class).
 
 ## Housekeeping
 
+- **`parseRdata` does not compile** ([resource_record.zig](../src/dns/resource_record.zig)).
+  Found 2026-09-05. It has zero callers — not in the datapath, not in its own file, not in a
+  test — so Zig never analyses it and the suite stays green. Force analysis and it fails at
+  once: `incompatible types` on the `switch`, whose prongs are peer-resolved as anonymous
+  struct literals with **no `return`** and no `Rdata` coercion target. Two more defects sit
+  behind that one, and both are the silent kind rather than the crashing kind:
+  - `.MX` sets `.exchange = rdata[0..2]`, which is the *preference* field. The exchange name
+    starts at `rdata[2..]`.
+  - `.A` and `.AAAA` index `rdata[0..4]` / `rdata[0..16]` with no length check. `parseRecord`
+    bounds RDLENGTH against the message but not against the type's fixed width, so a
+    well-framed record with a short RDATA is an out-of-bounds read.
+
+  Fix the signature (`return switch (t) { … }`), the MX slice, and add the two length checks
+  — then give it a caller or a test, because nothing else will keep it compiling. `Rdata` and
+  `Type` are used and fine; only `parseRdata` is dead.
+- **Add `std.testing.refAllDecls(@This())` to each module's test block.** One line per file
+  that turns every unreferenced `pub` declaration into a test-time compile error. This is the
+  general fix for the item above, and for the 2026-08-09 `backoffSeconds` finding before it —
+  the same failure mode, twice, seven weeks apart, and the second one shipped through four
+  merged PRs and CI without a murmur. Cheapest guard rail on this list by a wide margin.
 - Delete or repurpose the remaining template leftovers: the stub
   [src/root.zig](../src/root.zig) (`add`/`printAnotherMessage`), which is also the misleading
   module root, and the boilerplate comment walls in [build.zig](../build.zig). (`copy.zig`
@@ -528,10 +417,12 @@ P1.4 and the coroutine-supervisor half of P1.2 are small and can be sprinkled in
 C3 removed the reflector and P1.2 stopped OOM from being fatal, but nothing yet *bounds*
 the number of in-flight handlers a flood can create.
 
-> ⚠️ **This section is stale** and was left verbatim on 2026-08-19 by request. Items 1 and 2
-> are done (P4.2 landed 08-09, both test suites landed 08-09, CI exists), and P2.1/P2.3 both
-> shipped. Rewriting it against what is actually open — P1.5, P2.1's local-file blocklist
-> source → P2.5's harness, P2.2, P2.3's per-query event, then P3.2 or P4.1 — is a separate
+> ⚠️ **This section is stale** and is kept verbatim by request; only this note is maintained.
+> As of 2026-09-05: items 1 and 2 are done (P4.2 landed 08-09, both test suites landed 08-09,
+> CI exists), P2.1/P2.3 both shipped, and the P3 track it offers as a *branch* has since been
+> walked two thirds of the way — compression landed 08-13 and record parsing 08-30, leaving
+> caching. Rewriting it against what is actually open — P1.5, P2.1's local-file blocklist
+> source → P2.5's harness, P2.2, P2.3's per-query event, then P3.3 or P4.1 — is a separate
 > pass.
 
 For the view from above — how far along the whole project is, which of these bands is worth
