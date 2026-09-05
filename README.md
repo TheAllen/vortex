@@ -62,12 +62,17 @@ and edit. Running with no `.env` at all is a supported mode.
 | `VORTEX_UPSTREAM_HOST` / `VORTEX_UPSTREAM_PORT` | `192.168.1.1` / `53` |
 | `VORTEX_UPSTREAM_BIND_HOST` / `VORTEX_UPSTREAM_BIND_PORT` | `0.0.0.0` / `0` (ephemeral) |
 | `VORTEX_BLOCKLIST_URL` | StevenBlack `hosts` |
-| `VORTEX_SUFFIX_BLOCKLIST_URL` | hagezi `light-onlydomains` |
+| `VORTEX_SUFFIX_BLOCKLIST_URL` | oisd `small.oisd.nl/domainswild2` |
 | `VORTEX_ENV_FILE` | `.env` |
 
 A missing `.env` is fine; a file named explicitly via `VORTEX_ENV_FILE` that
 doesn't exist is fatal, and so is a malformed port. Silently listening on the
 default port because someone typed `535e` is the config bug that costs an hour.
+
+If you change the suffix list, it must be a **bare-domain** list —
+`domainswild2`, not `domainswild`. The parser does not strip a leading `*.`, so
+a `*.`-prefixed list loads without any error and then matches nothing. Both
+lists are fetched at startup and a failure is currently fatal (P2.2).
 
 ## How it works
 
@@ -87,7 +92,9 @@ default port because someone typed `535e` is the config bug that costs an hour.
                     │              upstream socket ────────────┼──▶ resolver
                     │                                          │
                     │  dispatcher loop ◀───────────────────────┼──── reply
-                    │    demux by proxy ID, restore client ID  │
+                    │    ├─ demux by proxy ID, verify question │
+                    │    ├─ walk RRs   (resource_record.zig)   │  log only
+                    │    └─ restore client ID ─────────────────┼──▶ client
                     └──────────────────────────────────────────┘
 ```
 
@@ -111,7 +118,7 @@ mutating under live readers.
 
 ## Where it actually stands
 
-Roughly **40%** of the way to "production-ready home sinkhole," with the caveat
+Roughly **50%** of the way to "production-ready home sinkhole," with the caveat
 that the expensive-to-reverse architectural decisions are the ones already made.
 [`docs/progress.md`](docs/progress.md) has the weighted breakdown and what would
 actually move it.
@@ -120,8 +127,15 @@ actually move it.
 QDCOUNT), QName case normalization, cacheable SOA on blocked answers, replies
 verified against the question that provoked them, SERVFAIL on upstream timeout,
 and TC=1 rather than silent corruption when a reply overflows the receive buffer.
-`zig build test` runs 31 tests, 28 asserting real behavior, under both Debug and
+`zig build test` runs 69 tests, 66 asserting real behavior, under both Debug and
 ReleaseSafe.
+
+**Names and records are parsed, but nothing acts on them yet.** Compression
+pointer following (P3.1) and the resource-record walk (P3.2) both landed; the
+walk runs in `dispatcherLoop` as a **read-only observer** that logs what came
+back. A parse failure abandons the walk and changes nothing — the client still
+receives upstream's bytes verbatim. That is the groundwork for caching, not
+caching.
 
 > [!WARNING]
 > **Do not bind this off localhost yet.** There is no cap on in-flight handlers —
@@ -130,22 +144,28 @@ ReleaseSafe.
 > convenience. Since configuration became runtime, removing that guard rail is a
 > one-line edit rather than a recompile, so this matters more than it used to.
 
-The gap is everything around the datapath: response caching, DNS message
-compression, EDNS0, TCP fallback, graceful shutdown, structured logging and
-metrics, and blocklist refresh with an on-disk cache — today a failed fetch at
-startup is fatal. [`docs/next_steps.md`](docs/next_steps.md) is the full
-prioritized board.
+The gap is everything around the datapath: response caching, EDNS0, TCP
+fallback, graceful shutdown, metrics, and blocklist refresh with an on-disk
+cache — today a failed fetch at startup is fatal.
+[`docs/next_steps.md`](docs/next_steps.md) is the full prioritized board.
+
+The largest *testing* gap is a different shape: all 69 tests are over pure
+functions, so `handleQuery`, `dispatcherLoop` and the ingress loop have no
+automated coverage of any kind. That needs an integration harness (P2.5), which
+needs a local-file blocklist source first so startup does not cost 25s per case.
 
 ## Documentation
 
 | Doc | What's in it |
 |---|---|
 | [next_steps.md](docs/next_steps.md) | The prioritized board: every open item, why it matters, and how it should be shaped |
+| [changelog.md](docs/changelog.md) | Dated entries for everything that landed, and why it is shaped that way |
 | [progress.md](docs/progress.md) | Completion assessment and what moves the number |
 | [dns-message-format.md](docs/dns-message-format.md) | Wire format reference and error table |
 | [upstream-design.md](docs/upstream-design.md) | Why the shared-socket + `PendingTable` architecture |
 | [async-migration.md](docs/async-migration.md) | `std.Io` async patterns used here |
 | [filter-design.md](docs/filter-design.md) | The `Filter`/`Chain` design the policy chain is converging on |
+| [memory-review.md](docs/memory-review.md) | Closed record of one memory-bug review; 7 of 9 resolved |
 
 ## License
 

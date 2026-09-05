@@ -317,6 +317,13 @@ coverage:
 https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/light-onlydomains.txt
 ```
 
+> **This URL is dead** (noted 2026-09-05). The hagezi GitHub *account* disappeared on
+> 2026-08-10 — the account, not just the file — so there is no successor path. The shipped
+> default is now `https://small.oisd.nl/domainswild2`, and it must be `domainswild2`, not
+> `domainswild`: the `2` variant omits the `*.` prefix. The design below is unaffected —
+> `normalizeZone`'s `*.`-stripping is exactly what makes the loader source-agnostic, and it
+> stopped being a no-op the day the source changed.
+
 Loader delta vs the hosts parser: skip `#`/blank lines, then each remaining line *is* the
 whole zone — no whitespace split, no `0.0.0.0` prefix. `normalizeZone` (§4b) strips a
 leading `*.` and is a **no-op** on HaGeZi's onlydomains (they carry none), but keep it so
@@ -332,7 +339,7 @@ spawns, so the README's no-mutex argument holds for each:
 | Matcher            | Source URL                                                                                          | Shape / match          |
 |--------------------|-----------------------------------------------------------------------------------------------------|------------------------|
 | `ExactBlockList`   | `raw.githubusercontent.com/StevenBlack/hosts/refs/heads/master/hosts`                               | concrete FQDNs, O(1) set membership |
-| `SuffixBlockList`  | `raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/light-onlydomains.txt`               | declared zones, label-walk (apex + all subdomains) |
+| `SuffixBlockList`  | `small.oisd.nl/domainswild2` (was hagezi `light-onlydomains.txt` until 2026-08-10)                   | declared zones, label-walk (apex + all subdomains) |
 
 Two operational notes now that it's two lists:
 
