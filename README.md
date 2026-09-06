@@ -63,6 +63,7 @@ and edit. Running with no `.env` at all is a supported mode.
 | `VORTEX_UPSTREAM_BIND_HOST` / `VORTEX_UPSTREAM_BIND_PORT` | `0.0.0.0` / `0` (ephemeral) |
 | `VORTEX_BLOCKLIST_URL` | StevenBlack `hosts` |
 | `VORTEX_SUFFIX_BLOCKLIST_URL` | oisd `small.oisd.nl/domainswild2` |
+| `VORTEX_CACHE_MAX_ENTRIES` | `10000` (`0` disables the cache) |
 | `VORTEX_ENV_FILE` | `.env` |
 
 A missing `.env` is fine; a file named explicitly via `VORTEX_ENV_FILE` that
@@ -93,9 +94,15 @@ lists are fetched at startup and a failure is currently fatal (P2.2).
                     │                                          │
                     │  dispatcher loop ◀───────────────────────┼──── reply
                     │    ├─ demux by proxy ID, verify question │
-                    │    ├─ walk RRs   (resource_record.zig)   │  log only
+                    │    ├─ walk RRs   (resource_record.zig)   │
+                    │    ├─ store      (cache.zig)             │
                     │    └─ restore client ID ─────────────────┼──▶ client
                     └──────────────────────────────────────────┘
+
+A cache hit never reaches the upstream socket at all: `handleQuery` checks
+`cache.zig` **after** the policy verdict — so a refreshed blocklist is never
+shadowed by a stale entry — and answers from memory with the client's
+transaction ID restored and every TTL aged by how long the entry has been held.
 ```
 
 One coroutine per query via `std.Io.Group`, plus two long-lived loops (dispatcher
@@ -110,15 +117,17 @@ allowlist entry can override a block.
 
 **Why the blocklists need no mutex:** they are write-once, read-many with a clean
 phase boundary. The lists are fully built before any coroutine spawns, and the
-only later access is a pure read. `PendingTable` *does* need one — it is mutated
-concurrently for the whole process lifetime by inserts, the dispatcher's removes,
-and the sweeper's iterate-and-remove. This changes the day blocklist refresh
-(P2.2) lands: build a fresh set off to the side and swap the pointer rather than
-mutating under live readers.
+only later access is a pure read. `PendingTable` and the response cache *do* need
+one — both are mutated for the whole process lifetime by inserts, removes, and a
+sweeper's iterate-and-remove. That is not a formality: `std.process.Init` hands
+us a `std.Io.Threaded` whose async limit defaults to `cpu_count - 1`, so handlers
+run on a real thread pool and two can be inside the same map at the same instant.
+This changes the day blocklist refresh (P2.2) lands: build a fresh set off to the
+side and swap the pointer rather than mutating under live readers.
 
 ## Where it actually stands
 
-Roughly **50%** of the way to "production-ready home sinkhole," with the caveat
+Roughly **57%** of the way to "production-ready home sinkhole," with the caveat
 that the expensive-to-reverse architectural decisions are the ones already made.
 [`docs/progress.md`](docs/progress.md) has the weighted breakdown and what would
 actually move it.
@@ -127,15 +136,17 @@ actually move it.
 QDCOUNT), QName case normalization, cacheable SOA on blocked answers, replies
 verified against the question that provoked them, SERVFAIL on upstream timeout,
 and TC=1 rather than silent corruption when a reply overflows the receive buffer.
-`zig build test` runs 69 tests, 66 asserting real behavior, under both Debug and
+`zig build test` runs 101 tests, 98 asserting real behavior, under both Debug and
 ReleaseSafe.
 
-**Names and records are parsed, but nothing acts on them yet.** Compression
-pointer following (P3.1) and the resource-record walk (P3.2) both landed; the
-walk runs in `dispatcherLoop` as a **read-only observer** that logs what came
-back. A parse failure abandons the walk and changes nothing — the client still
-receives upstream's bytes verbatim. That is the groundwork for caching, not
-caching.
+**Responses are cached, with honest TTLs.** The compression → parsing → caching
+chain is complete: pointer following (P3.1), the record walk (P3.2), and a
+TTL-aware cache (P3.3) keyed on `(qname, qtype, qclass)`. A repeat query is
+answered from memory in ~0 ms, and its TTLs are counted down by the entry's age
+rather than replayed at full value — so a client is never told 300 seconds
+remain on a record held for 250 (RFC 2181 §5.2). Negative answers are cached
+per RFC 2308, and OPT is excluded from every TTL computation, since TYPE 41
+reuses that field for flags rather than a duration.
 
 > [!WARNING]
 > **Do not bind this off localhost yet.** There is no cap on in-flight handlers —
@@ -144,15 +155,16 @@ caching.
 > convenience. Since configuration became runtime, removing that guard rail is a
 > one-line edit rather than a recompile, so this matters more than it used to.
 
-The gap is everything around the datapath: response caching, EDNS0, TCP
-fallback, graceful shutdown, metrics, and blocklist refresh with an on-disk
-cache — today a failed fetch at startup is fatal.
-[`docs/next_steps.md`](docs/next_steps.md) is the full prioritized board.
+The gap is everything around the datapath: EDNS0, TCP fallback, graceful
+shutdown, metrics, and blocklist refresh with an on-disk cache — today a failed
+fetch at startup is fatal. [`docs/next_steps.md`](docs/next_steps.md) is the
+full prioritized board.
 
-The largest *testing* gap is a different shape: all 69 tests are over pure
+The largest *testing* gap is a different shape: all 101 tests are over pure
 functions, so `handleQuery`, `dispatcherLoop` and the ingress loop have no
-automated coverage of any kind. That needs an integration harness (P2.5), which
-needs a local-file blocklist source first so startup does not cost 25s per case.
+automated coverage of any kind — and caching just made both of them more
+complex. That needs an integration harness (P2.5), which needs a local-file
+blocklist source first so startup does not cost 25s per case.
 
 ## Documentation
 

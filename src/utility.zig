@@ -3,6 +3,7 @@ const std = @import("std");
 const DomainBlockList = @import("blocklist/domain_blocklist.zig").DomainBlockList;
 const PendingTable = @import("utils/pending_table.zig").PendingTable;
 const Policy = @import("blocklist/policy.zig").Policy;
+const Cache = @import("dns/cache.zig").Cache;
 
 pub const Context = struct {
     client_socket: *const std.Io.net.Socket = undefined,
@@ -10,6 +11,10 @@ pub const Context = struct {
     upstream_addr: std.Io.net.IpAddress = undefined,
     pending_table: *PendingTable = undefined,
     policy: *Policy = undefined,
+    /// TTL-aware response cache (P3.3). Null when caching is disabled, which is
+    /// an option rather than an edge case: it is the first thing to turn off
+    /// when diagnosing a stale-answer complaint.
+    cache: ?*Cache = null,
 
     /// Long-lived allocator. Carried here so every background loop has the same
     /// `fn (Io, *const Context)` shape and can go through one supervisor.
@@ -25,6 +30,7 @@ pub const Context = struct {
         upstream_addr: std.Io.net.IpAddress,
         pending_table: *PendingTable,
         policy: *Policy,
+        cache: ?*Cache,
         gpa: std.mem.Allocator,
         question_seed: u64,
     ) Context {
@@ -34,6 +40,7 @@ pub const Context = struct {
             .upstream_addr = upstream_addr,
             .pending_table = pending_table,
             .policy = policy,
+            .cache = cache,
             .gpa = gpa,
             .question_seed = question_seed,
         };

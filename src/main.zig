@@ -2,6 +2,9 @@
 const std = @import("std");
 
 const blocked_response = @import("dns/blocked_response.zig");
+const cache_mod = @import("dns/cache.zig");
+const Cache = cache_mod.Cache;
+const CacheKey = cache_mod.CacheKey;
 const Context = @import("utility.zig").Context;
 const DomainBlockList = @import("blocklist/domain_blocklist.zig").DomainBlockList;
 const Header = @import("dns/header.zig").Header;
@@ -135,6 +138,43 @@ fn handleQuery(
         },
     }
 
+    // Cache lookup, and note where it sits: **after** the policy verdict, never
+    // before. A name can be cached and then appear in a refreshed blocklist
+    // (P2.2); checking the cache first would keep serving the old answer and
+    // silently defeat the block for up to a TTL. The blocklist wins, always.
+    if (ctx.cache) |cache| serve: {
+        const key = CacheKey.fromQuestion(&question);
+        const now: i64 = @intCast(std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds);
+
+        // On the coroutine stack, like the ingress and dispatcher buffers. Note
+        // this is per in-flight handler, so it is one of the things P1.5's cap
+        // will be sizing against once that lands.
+        var hit_buf: [4096]u8 = undefined;
+        const hit = cache.get(key, now, &hit_buf) orelse break :serve;
+
+        // `get` handed back a copy, so this cannot reach the stored entry —
+        // which is what lets one entry serve many clients with different IDs.
+        //
+        // `q_end` is the right records offset for the cached reply too: upstream
+        // echoes our question verbatim, so its question section is the same
+        // length as the one we just parsed out of the query.
+        const served = hit_buf[0..hit.len];
+        cache_mod.finalizeServed(served, q_end, header.id, hit.age_secs) catch |err| {
+            // Fall through to a normal upstream query rather than failing the
+            // client: a cache that cannot render a hit is a slow cache, not a
+            // broken resolver.
+            std.log.warn("cache hit for {s} unusable: {s}", .{ domain, @errorName(err) });
+            break :serve;
+        };
+
+        query_log.debug("verdict=hit qname={s} age={d}s", .{ domain, hit.age_secs });
+        ctx.client_socket.send(io, &incoming_addr, served) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => std.log.warn("cache hit send failed: {s}", .{@errorName(err)}),
+        };
+        return;
+    }
+
     // q_end is one past the question section, so the question occupies
     // data[12..q_end]. parseQuestion already bounded it against data.len.
     const question_len: u16 = @intCast(q_end - 12);
@@ -232,14 +272,61 @@ fn dispatcherLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
         // *condition* binds to the enclosing loop — here the dispatcher's own
         // `while (true)` — which silently swallows the reply and drops out of
         // the loop entirely instead of just ending the walk.
+        //
+        // The two guards below were specified with P3.2 and skipped. They stop
+        // being cosmetic here: while the walk only logged, a wrong offset cost
+        // one bad log line, but its output now decides what gets *stored*.
+        //
+        //   * TC=1 — the records are known-incomplete, so errors from walking
+        //     them mean nothing and the result must not be cached.
+        //   * QDCOUNT != 1 — records begin at `12 + question_len` only when
+        //     there is exactly one question. Walking from the wrong offset is
+        //     the silent desynchronization this design exists to avoid.
+        const walkable = !reply_msg.flags.trunc and reply_header.question_count == 1;
+
         var resourceRecordIter = ResourceRecordIter.init(reply_msg.data, offset, reply_header);
-        walk: while (true) {
-            const next = resourceRecordIter.next() catch |err| {
+        var min_ttl: ?u32 = null;
+        if (walkable) walk: {
+            min_ttl = cache_mod.replyTtlSeconds(reply_msg.data, offset, reply_header) catch |err| {
+                // A malformed reply is still relayed verbatim — the read-only
+                // stance P3.2 shipped under holds. It is simply not cached.
                 std.log.debug("record walk for id={x}: {s}", .{ proxy_id, @errorName(err) });
                 break :walk;
             };
-            const record = next orelse break :walk;
-            std.log.info("name: {s}", .{record.name.slice()});
+
+            // Kept at debug and behind the walk: one line per record per query
+            // is a lot of log for a home network, and P2.3's per-query event is
+            // where these fields eventually belong.
+            walk_log: while (true) {
+                const next = resourceRecordIter.next() catch break :walk_log;
+                const record = next orelse break :walk_log;
+                query_log.debug("record name={s} type={d} ttl={d}", .{
+                    record.name.slice(),
+                    record.type,
+                    record.ttl,
+                });
+            }
+        }
+
+        // Store before the transaction ID is rewritten, so the entry holds
+        // upstream's bytes rather than one client's view of them. Every serve
+        // rewrites the ID anyway, but caching the un-rewritten form keeps the
+        // stored copy honest about what actually arrived.
+        if (ctx.cache) |cache| {
+            if (cache_mod.isCacheable(reply_header, reply_msg.flags.trunc, min_ttl)) {
+                const now: i64 = @intCast(std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds);
+                const ttl_ns = @as(i64, min_ttl.?) * std.time.ns_per_s;
+                cache.put(
+                    CacheKey.fromQuestion(&reply_question),
+                    reply_msg.data,
+                    now,
+                    now + ttl_ns,
+                ) catch |err| {
+                    // A cache that cannot store is a slow cache. The client's
+                    // reply is already in hand and goes out regardless.
+                    std.log.warn("cache put failed: {s}", .{@errorName(err)});
+                };
+            }
         }
 
         std.mem.writeInt(u16, reply_msg.data[0..2], entry.client_id, .big);
@@ -276,11 +363,29 @@ fn sweeperLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
     var evicted: std.ArrayList(PendingQuery) = .empty;
     defer evicted.deinit(gpa);
 
+    // The cache rides this loop rather than getting a coroutine of its own, but
+    // not at the same cadence: pending queries need a 1 s tick because a client
+    // is waiting on the SERVFAIL, whereas an expired cache entry is already
+    // inert — `get` treats it as a miss — so sweeping it is only about
+    // reclaiming memory. Every 30th tick keeps a full walk of a 10k-entry map
+    // off the once-a-second path.
+    const cache_sweep_ticks = 30;
+    var tick: usize = 0;
+
     while (true) {
         // A relative sleep on the settable wall clock would stutter or race
         // ahead whenever NTP adjusts it; the sweep cadence should track the same
         // monotonic clock the deadlines are measured on.
         try io.sleep(std.Io.Duration.fromSeconds(1), std.Io.Clock.boot);
+
+        tick +%= 1;
+        if (tick % cache_sweep_ticks == 0) {
+            if (ctx.cache) |cache| {
+                const now: i64 = @intCast(std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds);
+                const dropped = cache.sweepExpired(now);
+                if (dropped > 0) std.log.debug("cache: swept {d} expired entries", .{dropped});
+            }
+        }
 
         evicted.clearRetainingCapacity();
         ctx.pending_table.sweepExpiredQueries(&evicted);
@@ -449,6 +554,22 @@ pub fn main(init: std.process.Init) !void {
     var question_seed: u64 = undefined;
     io.random(std.mem.asBytes(&question_seed));
 
+    // Its own seed, not `question_seed`. Different threat: `hashQuestion`'s
+    // seed stops an off-path attacker precomputing a colliding question, while
+    // this one stops chosen qnames from being piled into one hash bucket.
+    // Sharing one seed would tie two unrelated defences together for no gain.
+    var cache_seed: u64 = undefined;
+    io.random(std.mem.asBytes(&cache_seed));
+
+    var cache = Cache.init(gpa, io, cache_seed, cfg.cache_max_entries);
+    defer cache.deinit();
+
+    // Zero entries means "no cache" rather than "a cache that instantly
+    // refuses everything" — the null keeps the lookup out of the hot path
+    // entirely instead of paying for a lock and a miss on every query.
+    const cache_ptr: ?*Cache = if (cfg.cache_max_entries == 0) null else &cache;
+    if (cache_ptr == null) std.log.info("response cache disabled (VORTEX_CACHE_MAX_ENTRIES=0)", .{});
+
     // process-wide bundle of shared, long-lived resources that every coroutine in the proxy needs.
     const ctx = Context.init(
         &client_socket,
@@ -456,6 +577,7 @@ pub fn main(init: std.process.Init) !void {
         upstream_addr,
         &pending_table,
         &policy,
+        cache_ptr,
         gpa,
         question_seed,
     );
@@ -533,6 +655,7 @@ pub fn main(init: std.process.Init) !void {
 test {
     _ = @import("dns/authority.zig");
     _ = @import("dns/blocked_response.zig");
+    _ = @import("dns/cache.zig");
     _ = @import("dns/header.zig");
     _ = @import("dns/name_reader.zig");
     _ = @import("dns/question.zig");
