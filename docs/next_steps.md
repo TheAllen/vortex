@@ -1,14 +1,18 @@
 # Next Steps — Road to Production-Ready
 
 Reviewed **2026-09-05** against the current source (Zig 0.16.0, `zig build test` →
-**69/69 pass**, of which 66 are real behavior tests). **No open P0s, and no open P1 bugs** —
+**101/101 pass**, of which 98 are real behavior tests). **No open P0s, and no open P1 bugs** —
 all three P0s are pinned by regression tests that fail under mutation.
 
-One new correctness item is on the board as of this review: `parseRdata` in
+**P3.3 response caching landed 2026-09-05**, closing the compression → parsing → caching
+chain. The P3 band is now the EDNS0/TCP remainder rather than the main event.
+
+One correctness item remains from this review: `parseRdata` in
 [resource_record.zig](../src/dns/resource_record.zig) **does not compile** and nobody noticed,
 because it has no callers and Zig never analysed it. It is dead code, so it is Housekeeping
 rather than P0 — but the *reason* it went unseen generalizes, and that fix is on the board
-too. See [Housekeeping](#housekeeping).
+too. `cache.zig` now carries the `refAllDecls` guard; nothing else does. See
+[Housekeeping](#housekeeping).
 
 **History lives in [changelog.md](changelog.md)** — dated entries for everything that landed,
 the three closed P0s in detail, and the shipped P3.1 and P3.2 plans. This file is the board:
@@ -42,9 +46,13 @@ does not cost 25 seconds per case.
   on top of an allocator-free name reader that follows compression pointers on the response
   path and refuses them on the query path ([name_reader.zig](../src/dns/name_reader.zig))
 - A resource-record walk over upstream replies ([resource_record.zig](../src/dns/resource_record.zig)),
-  wired into `dispatcherLoop` as a **read-only observer** — a parse failure abandons the walk
-  and the client still receives upstream's bytes verbatim. The name reader's first datapath
-  caller
+  wired into `dispatcherLoop` behind two guards (skip on TC=1, skip unless QDCOUNT is 1). It
+  began as a read-only observer; its output now also decides what may be cached
+- A TTL-aware response cache ([cache.zig](../src/dns/cache.zig)) keyed on
+  `(qname, qtype, qclass)`, checked in `handleQuery` **after** the policy verdict so a
+  refreshed blocklist is never shadowed by a stale entry, and filled in `dispatcherLoop`.
+  Serves a copy with the client's transaction ID restored and every TTL aged by the entry's
+  age; RFC 2308 negative caching; swept every 30 s. `VORTEX_CACHE_MAX_ENTRIES=0` disables it
 - A `Policy` filter chain — allowlist → exact blocklist → suffix blocklist — with a
   three-valued `Verdict` (`allow`/`block`/`pass`) ([policy.zig](../src/blocklist/policy.zig))
   - Exact-match blocklist fetched over HTTP ([domain_blocklist.zig](../src/blocklist/domain_blocklist.zig))
@@ -89,7 +97,7 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
    [settings.zig](../src/settings.zig) resolves a runtime `Settings` struct at startup from
    **defaults < `.env` file < process environment**.
    - **Done:** listen host+port, upstream host+port, upstream bind host+port, both blocklist
-     URLs, log level and log format. All `VORTEX_`-prefixed; `VORTEX_ENV_FILE` picks a
+     URLs, log level and log format, and `VORTEX_CACHE_MAX_ENTRIES` (0 disables the cache). All `VORTEX_`-prefixed; `VORTEX_ENV_FILE` picks a
      different file. A missing default `.env` is fine; a file named explicitly that isn't
      there is fatal, as is a malformed port — silently listening on 5354 because someone
      typed `535e` is the config bug that costs an hour.
@@ -121,13 +129,21 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
    `dispatcherLoop`.
 4. **Graceful shutdown.** No signal handling; the only exit is a crash or Ctrl-C mid-write.
    Catch SIGINT/SIGTERM, `group.cancel`, flush the log, run the deferred deinits.
-5. **Test coverage.** `zig build test` → **69/69, of which 66 are real**: 17 `name_reader`
-   (including a fuzz target), 10 `resource_record` (including the second), 9 `Header`,
-   8 `obs/log`, 7 `PendingTable`, 5 `settings`, 4 `parseQuestion`, 3 `blocked_response`
-   golden-bytes, `backoffSeconds`, allowlist hit/miss, and `SuffixBlockList.decide`. The 3
-   that assert nothing about Vortex are `root.zig`'s `add(3, 7)` stub, `main.zig`'s
-   "initialize sockets", and the `test { _ = @import(…) }` aggregator, which the runner
-   counts as a passing test.
+5. **Test coverage.** `zig build test` → **101/101, of which 98 are real**: 32 `cache`,
+   17 `name_reader` (including a fuzz target), 10 `resource_record` (including the second),
+   9 `Header`, 8 `obs/log`, 7 `PendingTable`, 5 `settings`, 4 `parseQuestion`,
+   3 `blocked_response` golden-bytes, `backoffSeconds`, allowlist hit/miss, and
+   `SuffixBlockList.decide`. The 3 that assert nothing about Vortex are `root.zig`'s
+   `add(3, 7)` stub, `main.zig`'s "initialize sockets", and the `test { _ = @import(…) }`
+   aggregator, which the runner counts as a passing test.
+
+   **A third testing lesson, learned the hard way on 2026-09-05.** Mutation-testing the
+   cache found **four assertions that could not fail**, each because the fixture was built
+   to be *realistic* rather than to *discriminate*. The clearest: the OPT record's TTL was
+   set to 0 — exactly what a plain EDNS0 reply carries — so "aging skips the OPT" passed
+   whether or not it did, since `0 -| 60` is still 0. Realism is what hid the bug.
+   **Write the fixture that fails when the rule is broken, then confirm it does by breaking
+   the rule.** Alongside "assert against literal bytes" and "test the interaction".
 
    **The lesson, now confirmed six times.** C3 became testable when the check moved into
    pure `Header.validateQuery`; C2 when assembly moved into pure `blocked_response.build`;
@@ -173,7 +189,7 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
 
    Still missing:
    - **An integration harness for the coroutine-bound code — now the largest gap.**
-     The 69 tests are almost entirely over pure functions. `handleQuery`, `dispatcherLoop`
+     The 101 tests are almost entirely over pure functions. `handleQuery`, `dispatcherLoop`
      and the ingress loop have **no automated coverage of any kind** — not runtime, and (per
      the third lesson above) not even compile-time from `zig build test`. Everything proven
      about them on 2026-08-09 was proven by hand with `dig` and throwaway Python.
@@ -225,8 +241,8 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
 
 ## P3 — Protocol completeness
 
-Priority order unchanged: **compression → response parsing → caching**, each depending on
-the previous.
+The **compression → response parsing → caching** chain is complete as of 2026-09-05.
+What remains in this band is EDNS0, TCP fallback, and the multi-upstream arc.
 
 1. ~~**DNS message compression (pointer following).**~~ **Done 2026-08-13** —
    [name_reader.zig](../src/dns/name_reader.zig) reads names with pointer following, bounded
@@ -241,21 +257,32 @@ the previous.
    datapath caller. Ships as a read-only observer: the datapath relays upstream's bytes
    whatever the walk finds. The plan, the decisions, and **four divergences from it** are in
    [changelog.md](changelog.md#landed-2026-08-30--p32-upstream-response-record-parsing).
-   **Residue, all of it feeding P3.3:**
-   - The two planned guards were not implemented — skip the walk when `reply_msg.flags.trunc`,
-     and unless the reply's QDCOUNT is 1. Cheap, and the second one prevents walking from an
-     offset that is not where the records start
-   - No TTL extraction yet, which is the half P3.3 actually needs. **OPT is not a TTL** —
-     TYPE 41 reuses the TTL field for extended-RCODE/version/DO, so it must be excluded by
-     type from any minimum-TTL computation
-   - `parseRdata` is broken and dead — see [Housekeeping](#housekeeping)
-   - The record log line is a placeholder (`std.log.info("name: {s}", …)`, one line per
-     record per query, at `info`). It should become fields on P2.3's per-query event, not a
-     second line beside it
-3. **TTL-aware response caching.** Keyed on `(qname, qtype, qclass)`; store response
-   bytes + expiry; on hit rewrite txid and reply without touching upstream. Plugs in
-   cleanly: check in `handleQuery` before `appendQuery`, populate in `dispatcherLoop`
-   before forwarding to the client.
+   **Residue — all but one closed by P3.3 on 2026-09-05:**
+   - ~~The two planned guards~~ ✅ landed with P3.3, where they stopped being cosmetic:
+     while the walk only logged, a wrong offset cost one bad log line; it now decides what
+     gets cached
+   - ~~TTL extraction, excluding OPT~~ ✅ `replyTtlSeconds` in
+     [cache.zig](../src/dns/cache.zig)
+   - ~~The placeholder `std.log.info("name: …")`~~ ✅ now a `query`-scoped debug record
+     carrying name, type and TTL. Still a line per record rather than fields on P2.3's
+     per-query event, which is where it belongs
+   - **`parseRdata` is broken and dead** — the one item still open. See
+     [Housekeeping](#housekeeping)
+3. ~~**TTL-aware response caching.**~~ **Done 2026-09-05** —
+   [cache.zig](../src/dns/cache.zig). Keyed on `(qname, qtype, qclass)` with a hand-written
+   hash context (`AutoHashMap` silently cannot work here — see the changelog), entries
+   holding the datagram plus `.boot` insert and expiry timestamps. TTLs are aged on the way
+   out per RFC 2181 §5.2, OPT is excluded from every TTL computation, and negative answers
+   use RFC 2308's `min(SOA.TTL, SOA.MINIMUM)`. Full rationale, the two bugs caught during
+   the build, and the four vacuous tests found by mutation are in
+   [changelog.md](changelog.md#landed-2026-09-05--p33-ttl-aware-response-caching).
+   **Deliberately out of scope, each worth its own item:**
+   - **Request coalescing** — N clients missing the same name during one upstream round
+     trip all forward. Wasteful, not wrong; needs an in-flight set
+   - **An eviction policy** — at `max_entries` the cache refuses new keys rather than
+     choosing a victim, because there is no recency data to justify one
+   - **The question-section casing echo** — a hit returns the first requester's casing,
+     which breaks a client doing 0x20 verification
 4. ~~**Wildcard / suffix blocking.**~~ **Done 2026-07-30.** Remaining polish: fold the
    hand-rolled `Policy` into the comptime duck-typed `Filter`/`Chain` from
    [filter-design.md](filter-design.md), and add a suffix-*allow* matcher for the entries
@@ -361,6 +388,9 @@ real sinkhole (the Pi-hole / AdGuard Home / Unbound-`local-zone` feature class).
   general fix for the item above, and for the 2026-08-09 `backoffSeconds` finding before it —
   the same failure mode, twice, seven weeks apart, and the second one shipped through four
   merged PRs and CI without a murmur. Cheapest guard rail on this list by a wide margin.
+  **Applied to [cache.zig](../src/dns/cache.zig) on 2026-09-05** — where it was load-bearing
+  from the first commit, since `Cache`'s methods had no production caller for several hours.
+  Every other file is still unguarded, `resource_record.zig` most urgently.
 - Delete or repurpose the remaining template leftovers: the stub
   [src/root.zig](../src/root.zig) (`add`/`printAnotherMessage`), which is also the misleading
   module root, and the boilerplate comment walls in [build.zig](../build.zig). (`copy.zig`
@@ -419,11 +449,12 @@ the number of in-flight handlers a flood can create.
 
 > ⚠️ **This section is stale** and is kept verbatim by request; only this note is maintained.
 > As of 2026-09-05: items 1 and 2 are done (P4.2 landed 08-09, both test suites landed 08-09,
-> CI exists), P2.1/P2.3 both shipped, and the P3 track it offers as a *branch* has since been
-> walked two thirds of the way — compression landed 08-13 and record parsing 08-30, leaving
-> caching. Rewriting it against what is actually open — P1.5, P2.1's local-file blocklist
-> source → P2.5's harness, P2.2, P2.3's per-query event, then P3.3 or P4.1 — is a separate
-> pass.
+> CI exists), P2.1/P2.3 both shipped, and the P3 track it offers as a *branch* has now been
+> walked end to end — compression 08-13, record parsing 08-30, caching 09-05. Rewriting it
+> against what is actually open — **P1.5, P2.1's local-file blocklist source → P2.5's
+> harness, P2.2, P2.3's per-query event, then P4.1** — is a separate pass, and the case for
+> it is stronger now that the largest remaining feature is gone and what is left is almost
+> entirely the deployability block.
 
 For the view from above — how far along the whole project is, which of these bands is worth
 the most per unit of effort, and why "no open P0s" does **not** mean "safe to deploy" — see

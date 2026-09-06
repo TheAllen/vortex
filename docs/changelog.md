@@ -9,6 +9,133 @@ Newest first. Open work lives in [next_steps.md](next_steps.md).
 
 ---
 
+## Landed 2026-09-05 — P3.3 TTL-aware response caching
+
+The last of the **compression → parsing → caching** chain, and the first item in it
+that changes what a client receives. [cache.zig](../src/dns/cache.zig) holds the key, the
+entry, the map, and the TTL policy; `handleQuery` checks it and `dispatcherLoop` fills it.
+
+`zig build test` → **101/101 pass** (69 → 101, all 32 new ones on the cache), `zig build`
+green, both under Debug and ReleaseSafe.
+
+### The key: `(qname, qtype, qclass)`, and why a struct
+
+A named struct rather than a tuple, because `qtype` and `qclass` are both `u16` and
+adjacent — a tuple's `key[1]`/`key[2]` lets a transposition compile, hash cleanly, and
+simply never hit. The same shape of defect as a byte-reversed SERIAL.
+
+`qname` is an inline `name_reader.Name` (253 bytes) rather than an owned slice. The slice
+is ~10× smaller — 384 KB against 4.1 MB of key array at 10k entries, since `std.HashMap`
+reserves capacity in powers of two and **empty slots cost a full key each** — but it buys
+that with manual key ownership across five sites in a mutex-guarded, TTL-evicting map, and
+[memory-review.md](memory-review.md) #5 is an open instance of exactly that bug class. The
+inline form also keeps probe and stored keys the same type with the same lifetime rules.
+Revisit above ~50k entries.
+
+**`AutoHashMap` cannot be used, and the failure is silent.** `Name` is
+`buf: [253]u8 = undefined` plus `len`, so structural hashing walks the uninitialized tail
+and structural equality compares it. Two identical questions parsed from two different
+datagrams become different keys — a cache with a 0% hit rate that passes any test which
+stores and reads back one `CacheKey` value. Hence a hand-written `Context` over
+`qname.slice()`.
+
+The context carries a per-process seed, for a **different reason** than `hashQuestion`'s.
+There a collision forges a reply, so the seed blocks offline precomputation; here keys are
+compared in full on `eql`, so a collision costs only a probe and the seed is against hash
+flooding. Same mechanism, different threat.
+
+### The entry, and the TTL rules
+
+`bytes` (the datagram as received), `inserted_at`, `expires_at` — both `.boot` nanoseconds,
+the same clock and unit as `PendingQuery.expires_at`, for the same B1 reasons.
+
+`inserted_at` is not redundant. **Serving a reply with its TTLs untouched is the classic
+forwarder bug**: a 300-second record handed back 250 seconds later gets cached downstream
+for a further 300, and every hit re-extends it (RFC 2181 §5.2). Age is what
+`ageTtlsInPlace` subtracts.
+
+Four rules, each pinned by a test:
+
+- **Positive** — minimum TTL across answer and authority. Additional records are hints and
+  must not shorten the entry.
+- **Negative** — RFC 2308's `min(SOA.TTL, SOA.MINIMUM)`, read from the last four bytes of
+  RDATA so MNAME/RNAME lengths do not matter.
+- **OPT is never a TTL** — TYPE 41 reuses the field for extended-RCODE/version/DO.
+  Excluded from the minimum and skipped by the aging pass.
+- **RFC 2181 §8** — a TTL with the top bit set is zero, not ~68 years.
+
+### Where the lookup goes
+
+**After `Policy.decide`, never before.** A name can be cached and then appear in a
+refreshed blocklist (P2.2); a cache-first order would keep serving the old answer and
+silently defeat the block for up to a TTL. The blocklist wins, always.
+
+The insert sits in `dispatcherLoop` after the record walk and before the transaction-ID
+rewrite, so the entry holds upstream's bytes rather than one client's view of them.
+
+### P3.2's two skipped guards landed here
+
+`dispatcherLoop` now skips the walk when TC=1 or QDCOUNT ≠ 1. They were cosmetic while the
+walk only logged — a wrong offset cost one bad log line. They are load-bearing now that the
+walk's output decides what gets *stored*.
+
+### What actually shipped — two bugs caught during the build
+
+1. **An overlapping `@memcpy`.** The serve path was first written as
+   `prepareServed(src, …, dst)` and called as `prepareServed(hit_buf, …, &hit_buf)` —
+   `Cache.get` had already copied, so the second copy was both wasted and, with one buffer
+   passed twice, undefined behaviour that would very likely have passed a test. Replaced by
+   `finalizeServed`, taking **one** mutable slice, which makes the aliasing question
+   impossible to ask.
+2. **A race between `get` and a separate `ageOf`.** The age was originally a second lookup;
+   the sweeper can evict between the two, leaving the caller serving bytes it can no longer
+   date. `get` now returns `Hit { len, age_secs }` from one lock acquisition.
+
+### On the tests — four vacuous assertions, found by mutation
+
+Every rule above is pinned, and every pin was checked by mutating the code to break it. Four
+assertions initially **could not fail**, which is worth recording because the cause was the
+same each time:
+
+| Claimed | Why it was vacuous |
+|---|---|
+| two parses of a name produce one key | both `keyFromWire` calls reused the same stack slot, so the `undefined` tails were identical |
+| minimum TTL "ignoring OPT" | OPT sits in *additional*, already excluded wholesale — the type guard was untested |
+| aging skips the OPT | the fixture's OPT TTL was 0, and `0 -| 60` is still 0 |
+| additional records excluded | the only additional record in any fixture was that same OPT |
+
+Each needed a fixture built to *discriminate* rather than to be realistic: an explicitly
+poisoned `Name` tail, an OPT misplaced in the authority section, an OPT carrying the DO bit,
+and a non-OPT glue record with a short TTL. **A realistic fixture is not automatically a
+discriminating one** — the OPT TTL was 0 precisely because that is what a plain EDNS0 reply
+carries, and that realism is what hid the bug. This is the third testing lesson worth
+keeping, alongside "assert against literal bytes" and "test the interaction."
+
+The two leak rules in `Cache` — free the displaced entry, free the refused one — are
+enforced by `testing.allocator` and by nothing in the type system.
+
+### Verified by hand, because the datapath has no harness
+
+`handleQuery` and `dispatcherLoop` still have no automated coverage (P2.5), so this was
+proven with `dig` against 1.1.1.1: cold miss 11 ms → warm hit 0 ms; TTL counting down
+275 → 269 → 263 at 6-second intervals; a 1-second entry correctly missing and re-fetching;
+blocked names still NXDOMAIN with the synthetic SOA; upstream NXDOMAIN cached (11 ms → 0 ms);
+A and AAAA as separate entries; `dig` accepting every ID; `VORTEX_CACHE_MAX_ENTRIES=0`
+disabling and `=lots` failing loud. No warnings across ~90 s and 40 sweeper ticks.
+
+### Explicitly out of scope
+
+- **Request coalescing.** N clients asking for the same uncached name during one upstream
+  round trip all miss and all forward. Correct, just wasteful; the fix is a separate
+  in-flight set, and it is named in a comment so it is not later read as a cache bug.
+- **Eviction policy.** At `max_entries` the cache refuses *new* keys rather than choosing a
+  victim — there is no recency data to justify a choice, and refusing cannot serve a stale
+  answer. Existing keys stay refreshable.
+- **The question-section casing echo.** A hit returns the first requester's qname casing.
+  Harmless against normal clients, wrong for one doing 0x20 verification.
+
+---
+
 ## Landed 2026-08-30 — P3.2 upstream response record parsing
 
 Planned 2026-08-16 (the plan lived in `next_steps.md` and is folded into this entry), built

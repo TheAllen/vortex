@@ -72,6 +72,20 @@ pub const ResourceRecord = struct {
     rdlength: u16,
     rdata: []const u8,
     section: Section,
+
+    /// Offset of this record's 4-byte TTL field within the message.
+    ///
+    /// A *location*, on a struct that otherwise holds decoded values — the one
+    /// exception, and it earns it: serving a cached reply has to decrement
+    /// every TTL by the entry's age (RFC 2181 §5.2), which means writing back
+    /// into the datagram at exactly this offset. Without it a caller would have
+    /// to re-derive the position by re-walking the name, which is both wasted
+    /// work and a second place to get it wrong.
+    ///
+    /// `parseRecord` already computes it to read `ttl`; this only stops
+    /// throwing it away. Note it is **not** `next_offset`'s sibling: that one
+    /// says where the walk resumes, this one points *inside* the record.
+    ttl_offset: usize,
 };
 
 /// A parsed record plus where the walk resumes — the same shape, and for the
@@ -110,6 +124,9 @@ pub fn parseRecord(byte_slice: []const u8, idx_start: usize, section: Section) !
             .rdlength = rdlength,
             .rdata = byte_slice[rdata_start..][0..rdlength],
             .section = section,
+            // TYPE(2) CLASS(2) then TTL — the same `idx + 4` the read above
+            // slices, kept as a number so it can be written back to.
+            .ttl_offset = idx + 4,
         },
         // The walk resumes past RData - never at a contained name's next_offset.
         .next_offset = rdata_start + rdlength,

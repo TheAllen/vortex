@@ -11,46 +11,72 @@ are stated explicitly below so the number can be argued with rather than just qu
 
 ---
 
-## Snapshot — 2026-09-05
+## Snapshot — 2026-09-05 (pm)
 
-> **≈ 50.2% complete** against the yardstick in
+> **≈ 57.4% complete** against the yardstick in
 > [next_steps.md](next_steps.md): *"production-ready DNS sinkhole for a home network."*
 >
-> Source: 3,820 lines of Zig across 16 files. `zig build test` → 69/69 pass under both
-> Debug and ReleaseSafe, of which **66 are real behavior tests**.
+> Source: 5,215 lines of Zig across 17 files. `zig build test` → 101/101 pass under both
+> Debug and ReleaseSafe, of which **98 are real behavior tests**.
 >
-> Moved by P3.2 (upstream response record parsing): the protocol band from ~20% to ~32%, and
-> tests from 59 to 69. The datapath is again unchanged in what the client receives — the walk
-> is a read-only observer — so this buys the *capability* caching needs, not caching.
+> Moved by P3.3 (TTL-aware response caching): the protocol band from ~32% to ~62%, and tests
+> from 69 to 101. **The largest single feature left on the board is now done**, and this is
+> the first P3 item that changes what a client receives — a repeat query is answered in
+> 0 ms from memory, with its TTLs correctly counted down.
 >
-> Also closed since the last snapshot: the default suffix blocklist URL that 404'd, which
-> had made the software unusable on its own defaults. See
-> [the counterweight that retired](#the-counterweight-that-retired-the-default-config-boots-again).
+> The compression → parsing → caching chain is complete: P3.1 on 08-13, P3.2 on 08-30,
+> P3.3 today. The two earlier items bought no behavior at all by design; this one spends
+> everything they built.
 
 ### Breakdown
 
 | Area | Weight | Done | Contribution | Notes |
 |---|---:|---:|---:|---|
 | Core query datapath | 30% | ~98% | 29.4 | **Closed out 08-09.** Header validation complete, no silent-failure modes left, replies verified against their query, every query lifecycle has a defined answer including timeout |
-| Operability | 25% | ~28% | 7.0 | P2.1 config done; P2.3 structured logging **phases 1 and 2 of 3** done. +1 point of band for the suffix-URL fix — it boots on defaults again. The per-query event log, metrics, graceful shutdown, deployment, blocklist refresh still unbuilt |
-| Protocol completeness | 20% | ~32% | 6.4 | Wildcard blocking, **P3.1 compression 08-13**, and **P3.2 record parsing 08-30** all done. Caching — the big one — plus EDNS0 and TCP fallback still open |
+| Operability | 25% | ~30% | 7.5 | P2.1 config done and grown a cache knob; P2.3 logging **phases 1 and 2 of 3**. The per-query event log, metrics, graceful shutdown, deployment, blocklist refresh still unbuilt |
+| Protocol completeness | 20% | ~62% | 12.4 | Wildcard blocking, compression (08-13), record parsing (08-30) and **caching (09-05)** all done. EDNS0, TCP fallback and multi-upstream remain — real work, but none of it is the centrepiece caching was |
 | Sinkhole feature set | 15% | ~5% | 0.75 | Per-qtype strategy, local records, dashboards, DNSSEC posture — all open |
-| Tests + CI | 10% | ~66% | 6.6 | 66 real tests, and a second fuzz target with `resource_record.zig`. Still no integration harness, which is the largest gap. **And the suite is weaker than the count suggests — see below** |
-| **Total** | **100%** | | **≈ 50.2** | |
+| Tests + CI | 10% | ~73% | 7.3 | 98 real tests, two fuzz targets, and the first module carrying `refAllDecls`. Still no integration harness, which is now unambiguously the largest gap on the board |
+| **Total** | **100%** | | **≈ 57.4** | |
 
 *What "98%" on the datapath means:* the remaining 2% is the hard-coded 5 s deadline and 1 s
 sweep cadence (newly unblocked for P2.1) and the QDCOUNT=0 SERVFAIL. Both are known, both are
 documented, neither is a correctness defect.
 
-*What P3.2 bought, and what it did not:* the protocol band moved 12 points for a walk that
-changes nothing a client can observe. That is the correct shape — P3.1 and P3.2 are both
-pure capability, and the payoff is P3.3. What is worth noticing is that **the two guards the
-plan specified were not built** (skip the walk on TC=1, and unless QDCOUNT is 1), so the
-band is credited at ~32% rather than the ~35% a complete P3.2 would earn. Neither is
-reachable as a bug today, because a parse error changes nothing; both get cheaper to add now
-than after P3.3 gives the walk consequences.
+*What P3.3 bought:* the biggest single jump this project has recorded, and the first one an
+operator would *feel*. A warm query is answered from memory in 0 ms instead of a round trip,
+and the answer is honest about its age — TTLs are aged on the way out, so a client cannot be
+told 300 seconds remain on a record the cache has held for 250. That last part is the whole
+difference between a cache and a correctness bug, and it is why `inserted_at` sits beside
+`expires_at` rather than being derivable from it.
 
-*The counting problem this snapshot exposes:* **69 passing tests is a weaker signal than 59
+*What it did not buy:* three named exclusions, each of which should be read as scope rather
+than oversight. There is **no request coalescing** — N clients missing the same name inside
+one upstream round trip all forward, which is wasteful but never wrong. There is **no
+eviction policy** — at the cap the cache refuses new keys rather than choosing a victim,
+because there is no recency data to justify a choice and refusing cannot serve a stale
+answer. And a hit echoes **the first requester's qname casing**, which is invisible to
+ordinary clients and wrong for one doing 0x20 verification.
+
+*The counting caveat, restated:* 98 real tests is a better number than 66, but the shape of
+the gap has not changed. All of them are over pure functions. `handleQuery` and
+`dispatcherLoop` — which P3.3 just made materially more complex, with a lookup, an insert,
+two new guards and a serve path — still have **no automated coverage of any kind**. P3.3 was
+verified with `dig` against a live upstream, and that verification found nothing, but the two
+most recent real bugs in this project were both found exactly there and by nothing else.
+
+*What P3.2 bought, and what it did not* (written at the 09-05 am snapshot, kept because the
+prediction is worth grading): the protocol band moved 12 points for a walk that changed
+nothing a client could observe — the correct shape, since P3.1 and P3.2 are both pure
+capability and the payoff is P3.3. The band was credited at ~32% rather than ~35% because
+**the two guards the plan specified were not built** (skip on TC=1, and unless QDCOUNT is 1),
+with the note that both would get cheaper to add before P3.3 gave the walk consequences.
+
+**Graded: they landed with P3.3 the same day, and the reasoning held.** They stopped being
+cosmetic exactly where predicted — a wrong offset used to cost one bad log line and now
+decides what gets stored. The ~3 points are collected in this snapshot's ~62%.
+
+*The counting problem the 09-05 am snapshot exposed:* **69 passing tests is a weaker signal than 59
 was.** `parseRdata` shipped, was reviewed, was merged, and does not compile — nothing calls
 it, so Zig never analysed it, and `zig build` plus `zig build test` are both green in both
 optimization modes. The suite grew by ten while the *guarantee* the suite offers shrank,
@@ -90,17 +116,21 @@ than after the data has been written.
 
 ### Two other yardsticks, for calibration
 
-- **"Have the hard problems been solved?" → ~68%.** Percentage-complete *understates*
-  Vortex, because the expensive-to-reverse decisions are the ones already made: the shared
-  upstream socket with `PendingTable` demux, the `std.Io.Group` coroutine structure, and the
-  three-valued filter chain. What remains is mostly *volume* of well-understood work
-  (arg parsing, log lines, signal handlers, a service unit) plus exactly two substantial
-  features — **response caching** (P3.3) and **bounded concurrency** (P1.5). This moved 6
-  points because caching's two prerequisites are now both done: P3.3 no longer needs anything
-  built before it can start, which is a different kind of progress than a percentage shows.
-- **"Pi-hole competitor?" → ~20%.** The whole P4 band (per-qtype strategy, local records,
-  observability dashboard, DNSSEC posture) is untouched, and that band *is* the difference
-  between a forwarder-with-a-blocklist and the thing people actually install.
+- **"Have the hard problems been solved?" → ~82%.** Of the two substantial features named at
+  the last snapshot, **response caching is done** and only **bounded concurrency** (P1.5)
+  remains. The expensive-to-reverse decisions were already made — the shared upstream socket
+  with `PendingTable` demux, the `std.Io.Group` coroutine structure, the three-valued filter
+  chain — and the cache's own irreversible choices (inline keys, a hand-written hash context,
+  aging on the way out) are now made too. What is left is overwhelmingly *volume* of
+  well-understood work — arg parsing, signal handlers, a service unit, counters — plus one
+  genuinely unsolved problem that is not a feature at all: an integration harness for the
+  socket-bound code.
+- **"Pi-hole competitor?" → ~28%.** Caching is the first thing on this axis a user would
+  actually notice, and it moves this number more than its weight suggests, because "is it
+  fast?" is the question people put to a resolver. But the whole P4 band — per-qtype
+  strategy, local records, observability dashboard, DNSSEC posture — is still untouched, and
+  that band remains the difference between a forwarder-with-a-blocklist and the thing people
+  install.
 
 ---
 
@@ -215,20 +245,16 @@ Note the shape of this: it moves completion by ~20 points but moves **utility fr
 most of the way there**. It is the single most underweighted block if you judge by the
 percentage alone.
 
-### → ~70%: caching
-~~P3.1~~ ✅ 08-13 → ~~P3.2~~ ✅ 08-30 → **P3.3 is now unblocked.** Both prerequisites are
-done: compression pointer following, then the record walk that needs it. What is left is the
-feature itself — a table keyed on `(qname, qtype, qclass)` holding response bytes plus an
-expiry, checked in `handleQuery` before `appendQuery` and populated in `dispatcherLoop`
-before the reply goes out. This is the largest single feature left and the one that most
-changes how the thing *feels* to use.
+### ~~→ ~70%: caching~~ ✅ done 2026-09-05
+~~P3.1~~ ✅ 08-13 → ~~P3.2~~ ✅ 08-30 → ~~P3.3~~ ✅ 09-05. The chain is complete, and it
+landed close to the ~70% this tier predicted for the protocol band alone (~62%). The walk
+also stopped being an observer exactly where this entry said it would: a parse error used to
+change nothing precisely *because* nothing depended on it, and P3.2's two skipped guards
+became load-bearing the moment a record's TTL started deciding how long an answer is served.
 
-Two things P3.2 owes it before that starts, both small: **TTL extraction excluding OPT**
-(TYPE 41 reuses the TTL field for extended-RCODE/version/DO, so folding it into a minimum-TTL
-computation yields a meaningless number), and the two skipped guards. Caching is also the
-point where the walk stops being an observer — a parse error currently changes nothing
-precisely *because* nothing depends on it, and that stops being true the moment a record's
-TTL decides how long an answer is served.
+**The remaining tiers are now the whole board.** With the largest feature gone, what is left
+is the deployability block below plus the sinkhole band — which is a better position than the
+percentage suggests, because that block moves *utility* far more than it moves this number.
 
 ### → beyond: the sinkhole band
 P4.1 (per-qtype strategy), P4.4 (local records / conditional forwarding), P4.6 (observability
@@ -240,12 +266,13 @@ DNS" — the branch [next_steps.md](next_steps.md) flags at the end of its Sugge
 ## Where the code actually is
 
 ```
-3,820 lines of Zig, 16 files
+5,215 lines of Zig, 17 files
 
-src/main.zig                    588   ingress, handleQuery, dispatcher, sweeper, supervisor  3 tests
-src/dns/resource_record.zig     481   RR walk, iterator, rdata types                 10 tests
+src/dns/cache.zig              1215   key + context, entry, map, TTL policy          32 tests
+src/main.zig                    711   ingress, handleQuery, dispatcher, sweeper, supervisor  3 tests
+src/dns/resource_record.zig     498   RR walk, iterator, rdata types                 10 tests
+src/settings.zig                498   runtime config: .env parse, precedence          5 tests
 src/obs/log.zig                 478   logfmt logFn, escaping writer, level + format   8 tests
-src/settings.zig                465   runtime config: .env parse, precedence          5 tests
 src/dns/header.zig              403   parse, validateQuery, reply builders            9 tests
 src/dns/name_reader.zig         364   name reading, pointer following                17 tests
 src/utils/pending_table.zig     360   proxy-ID table, sweeper, question hashing       7 tests
@@ -255,10 +282,17 @@ src/blocklist/allowlist.zig      90   comptime allowlist                        
 src/blocklist/suffix_blocklist.zig 82 parent-label walk                               1 test
 src/blocklist/domain_blocklist.zig 61 exact-match list over HTTP                      0 tests
 src/dns/authority.zig            60   34-byte synthetic SOA                           0 tests
-src/utility.zig                  41   Context                                         0 tests
+src/utility.zig                  48   Context                                         0 tests
 src/blocklist/policy.zig         40   allow -> exact -> suffix chain                  0 tests  <- logic, no tests
 src/root.zig                     18   template stub -- delete (Housekeeping)
 ```
+
+`cache.zig` arrives as the largest file in the project at 1,215 lines, which deserves the
+same raised eyebrow `obs/log.zig` got at 478. Roughly half is comment and a further third is
+tests, so the executable core is on the order of 300 lines — but it is carrying four distinct
+things (the key and its hash context, the entry, the TTL policy, and the map wrapper), and
+the first natural split if it grows again is the TTL policy, which is pure message
+arithmetic with no relationship to storage.
 
 *(The 08-13 snapshot's copy of this table was stale on arrival — it carried a 2,951-line
 total that contradicted its own header, and still listed `src/dns/domain_name.zig`, which
@@ -284,9 +318,18 @@ file can be both the best-tested in its band and contain a function that does no
 
 The best-tested files are also the ones deliberately built or restructured to be pure:
 `header.zig`, `blocked_response.zig`, `settings.zig`, `pending_table.zig`, `obs/log.zig`,
-`name_reader.zig`, and now `resource_record.zig`. That is not a coincidence — see the lesson
-in [next_steps.md](next_steps.md) P2.5. It has now held seven times, and the last three were
-files where it was applied *before* the code existed rather than as a rescue.
+`name_reader.zig`, `resource_record.zig`, and now `cache.zig`. That is not a coincidence —
+see the lesson in [next_steps.md](next_steps.md) P2.5. It has now held eight times, and the
+last four were files where it was applied *before* the code existed rather than as a rescue.
+
+`cache.zig` is the clearest instance yet, and also the one that shows the limit of the
+pattern. Its pure half — the key, the hash context, the TTL rules, the serve-path
+arithmetic — is exhaustively tested and was **mutation-verified rule by rule**. Its impure
+half is four call sites in `handleQuery` and `dispatcherLoop`, and those remain untested,
+because separating deciding from doing shrinks the untestable surface without ever
+eliminating it. Both bugs caught during the build (the overlapping `@memcpy`, the get/age
+race) were in the seam between the two halves, not in either half — which is exactly where
+P2.5's harness would look.
 
 ---
 
@@ -300,13 +343,17 @@ files where it was applied *before* the code existed rather than as a rescue.
 | 2026-08-10 | ~43.5% | P2.3 phase 1: `Console` deleted, custom `std.options.logFn` emitting logfmt records, escaping writer closing a live **log-injection hole**. Tests → 36/36 (33 real). Smallest move yet, and correctly so — logging is one third done and metrics untouched. The pass's real value was a *finding*, not a feature: the default suffix blocklist 404s and **the binary does not start on its defaults** |
 | 2026-08-10 (pm) | ~44.5% | P2.3 phase 2: `VORTEX_LOG_LEVEL` (incl. `off`) and `VORTEX_LOG_FORMAT` (`auto`/`logfmt`/`text`), both fail-loud on a bad value; closed P2.1's deferred `log level` field. Tests → 40/40 (37 real). Also a process finding: `zig build test` **passed while `zig build` failed** — lazy analysis never reached code only `main` calls, so the test step alone does not prove the binary compiles |
 | 2026-08-13 | ~47.1% | P3.1 compression pointer following: [name_reader.zig](../src/dns/name_reader.zig) with a strictly-backwards rule *plus* a 64-jump cap (the cap turned out to be load-bearing, not decorative), the project's first fuzz target, and `DomainName` deleted along with its allocator. Tests → 59/59 (58 real). Shipped with no datapath caller by design |
+| 2026-09-05 (pm) | ~57.4% | **P3.3 TTL-aware response caching** — [cache.zig](../src/dns/cache.zig), keyed on `(qname, qtype, qclass)` with a hand-written hash context, TTLs aged on the way out per RFC 2181 §5.2, RFC 2308 negative caching, OPT excluded throughout. Tests → 101/101 (98 real), 69 → 101. Closes the compression → parsing → caching chain and the largest single feature on the board. Two bugs caught during the build (an overlapping `@memcpy`, a get/age race), and **four vacuous tests found by mutation** — each because the fixture was built to be realistic rather than to discriminate. First module to carry `refAllDecls` |
 | 2026-09-05 | ~50.2% | P3.2 upstream record parsing: [resource_record.zig](../src/dns/resource_record.zig), a pull-based iterator wired into `dispatcherLoop` as a read-only observer — the name reader's first datapath caller. Tests → 69/69 (66 real), second fuzz target. **Two guards from the plan were not built** (TC=1 and QDCOUNT≠1 skips). The pass's real value was again a *finding*: **`parseRdata` does not compile** and four merged PRs plus CI never noticed, because nothing calls it. Lazy analysis, round two — and this time `zig build` does not catch it either |
 
 *Add a row per review pass. If the number doesn't move, that is itself the finding — the
 coverage count sat still from 2026-07-27 to 2026-08-08 and nobody noticed until it was
 written down.*
 
-*Two passes in a row (08-10, 09-05) delivered more value as a finding than as a feature, and
-both findings were the same shape: **something the tooling was assumed to be checking, and
-was not.** Worth asking at the top of the next pass what else is assumed rather than
-verified.*
+*Three passes in a row (08-10, 09-05, 09-05 pm) delivered a finding at least as valuable as
+the feature, and all three were the same shape: **something assumed to be checked that was
+not.** First the default config nobody had booted; then `parseRdata`, which the compiler was
+assumed to be checking; then four cache tests that were assumed to be asserting. The pattern
+is now well enough established to act on rather than note — the question to open the next
+pass with is not "what is left to build" but "what do we believe is verified, and what
+actually verifies it?"*

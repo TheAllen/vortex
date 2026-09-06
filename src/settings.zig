@@ -77,6 +77,15 @@ pub const Settings = struct {
     log_level: obs_log.Level,
     log_format: obs_log.Format,
 
+    /// Hard cap on resident response-cache entries.
+    ///
+    /// A bound, not a tuning hint: without one the cache is an unbounded,
+    /// network-fed allocation, since a flood of distinct names would grow it
+    /// until the allocator failed. Keys are 258 bytes and `std.HashMap`
+    /// reserves capacity in powers of two at 80% load, so 10k entries costs
+    /// ~4.1 MB of key array whether or not it is full. Zero disables caching.
+    cache_max_entries: usize,
+
     pub const defaults: Settings = .{
         .listen_host = "127.0.0.1",
         .listen_port = 5354,
@@ -99,6 +108,11 @@ pub const Settings = struct {
         // anyone who does not set it.
         .log_level = obs_log.Level.fromStd(std.log.default_level),
         .log_format = .auto,
+
+        // ~4.1 MB of key array at 80% load. Comfortable for a home network,
+        // and well under the ~50k mark where the inline-key representation
+        // stops being obviously the right trade.
+        .cache_max_entries = 10_000,
     };
 
     /// Environment file consulted when `VORTEX_ENV_FILE` is unset. Missing is
@@ -115,6 +129,8 @@ pub const Settings = struct {
         InvalidLogLevel,
         /// `VORTEX_LOG_FORMAT` was set to something that isn't a format.
         InvalidLogFormat,
+        /// `VORTEX_CACHE_MAX_ENTRIES` was set to something that isn't a count.
+        InvalidCacheSize,
     };
 
     /// Reads the environment file into `environ`, then resolves every field.
@@ -159,6 +175,23 @@ pub const Settings = struct {
                 error.InvalidLogFormat,
                 "auto, logfmt, or text",
             ),
+            .cache_max_entries = try envCount(
+                environ,
+                "VORTEX_CACHE_MAX_ENTRIES",
+                defaults.cache_max_entries,
+            ),
+        };
+    }
+
+    /// Same fail-loud contract as `envPort`: silently falling back to the
+    /// default because someone typed `10_000` is the config bug that costs an
+    /// hour of wondering why memory looks wrong.
+    fn envCount(environ: *const Environ.Map, key: []const u8, fallback: usize) ParseError!usize {
+        const raw = environ.get(key) orelse return fallback;
+        if (raw.len == 0) return fallback;
+        return std.fmt.parseInt(usize, raw, 10) catch {
+            log.err("{s}: '{s}' is not a whole number of entries", .{ key, raw });
+            return error.InvalidCacheSize;
         };
     }
 
