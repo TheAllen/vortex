@@ -108,3 +108,12 @@ test "parseQuestion rejects a label with a reserved length prefix" {
     var question = Question{};
     try testing.expectError(error.ReservedLabelType, question.parseQuestion(&wire, 12));
 }
+
+// One line of guard per container. `refAllDecls` is shallow and 0.16.0 has no
+// recursive variant, so a type that is not named here has its methods left
+// unanalysed — see resource_record.zig, where exactly that let a `pub fn` ship
+// broken through four merged PRs and CI.
+test "refAllDecls" {
+    testing.refAllDecls(@This());
+    testing.refAllDecls(Question);
+}

@@ -476,3 +476,19 @@ test "writeTimestamp handles leap years and clamps a pre-epoch clock" {
         try testing.expectEqualStrings("1970-01-01T00:00:00.000Z", w.buffered());
     }
 }
+
+// One line of guard per container. `refAllDecls` is shallow and 0.16.0 has no
+// recursive variant, so a type that is not named here has its methods left
+// unanalysed — see resource_record.zig, where exactly that let a `pub fn` ship
+// broken through four merged PRs and CI.
+//
+// `EscapingWriter` is named explicitly because it is file-private:
+// `std.meta.declarations` reports only `pub` declarations, so `@This()` alone
+// would never reach it — and it is the one type here whose correctness no call
+// site can bypass.
+test "refAllDecls" {
+    testing.refAllDecls(@This());
+    testing.refAllDecls(Level);
+    testing.refAllDecls(Format);
+    testing.refAllDecls(EscapingWriter);
+}

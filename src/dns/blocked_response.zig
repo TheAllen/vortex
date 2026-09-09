@@ -177,3 +177,11 @@ test "build drops a trailing OPT record and clears ARCOUNT" {
     try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, reply[10..12], .big));
     try testing.expectEqualSlices(u8, &golden_soa, reply[ads_question_end..]);
 }
+
+// One line of guard per container. `refAllDecls` is shallow and 0.16.0 has no
+// recursive variant, so a type that is not named here has its methods left
+// unanalysed — see resource_record.zig, where exactly that let a `pub fn` ship
+// broken through four merged PRs and CI.
+test "refAllDecls" {
+    testing.refAllDecls(@This());
+}

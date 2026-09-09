@@ -80,3 +80,12 @@ test "suffix blocklist blocks a zone and its subdomains" {
     try testing.expectEqual(Verdict.pass, sbl.decide("notexample.com")); // suffix ≠ label boundary
     try testing.expectEqual(Verdict.pass, sbl.decide("example.org")); // different zone
 }
+
+// One line of guard per container. `refAllDecls` is shallow and 0.16.0 has no
+// recursive variant, so a type that is not named here has its methods left
+// unanalysed — see resource_record.zig, where exactly that let a `pub fn` ship
+// broken through four merged PRs and CI.
+test "refAllDecls" {
+    testing.refAllDecls(@This());
+    testing.refAllDecls(SuffixBlockList);
+}

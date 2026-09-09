@@ -362,3 +362,17 @@ fn fuzzReadName(_: void, smith: *std.testing.Smith) anyerror!void {
         try testing.expect(got.next_offset <= msg.len);
     } else |_| {}
 }
+
+// One line of guard per container. `refAllDecls` is shallow and 0.16.0 has no
+// recursive variant, so a type that is not named here has its methods left
+// unanalysed — see resource_record.zig, where exactly that let a `pub fn` ship
+// broken through four merged PRs and CI.
+//
+// `NameError` is deliberately absent: it is an error set, and
+// `std.meta.declarations` only accepts struct/enum/union/opaque. The
+// `@This()` line still references it as a declaration, which is all it needs.
+test "refAllDecls" {
+    testing.refAllDecls(@This());
+    testing.refAllDecls(Name);
+    testing.refAllDecls(Read);
+}

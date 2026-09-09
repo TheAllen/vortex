@@ -38,19 +38,43 @@ pub const Rdata = union(enum) {
     unknown: []const u8,
 };
 
+/// Decode one record's RDATA according to its TYPE.
+///
+/// `parseRecord` bounds RDLENGTH against the message, which proves `rdata` is
+/// inside the datagram — it does **not** prove the length matches what the type
+/// requires. A well-framed A record carrying 2 bytes of RDATA is a legal
+/// message and an out-of-bounds read here, so every fixed-width type checks its
+/// own width before slicing.
+///
+/// Names are returned in wire form and are **not** decompressed: a pointer in
+/// RDATA is only resolvable against the whole message, which this function does
+/// not have. Callers that need text must run the slice through `name_reader`.
 pub fn parseRdata(t: Type, rdata: []const u8) !Rdata {
-    switch (t) {
-        .A => .{ .a = std.mem.bytesAsValue([4]u8, rdata[0..4]) },
-        .AAAA => .{ .aaaa = std.mem.bytesAsValue([16]u8, rdata[0..16]) },
+    return switch (t) {
+        .A => blk: {
+            if (rdata.len < 4) return error.MalformedRdata;
+            break :blk .{ .a = rdata[0..4] };
+        },
+        .AAAA => blk: {
+            if (rdata.len < 16) return error.MalformedRdata;
+            break :blk .{ .aaaa = rdata[0..16] };
+        },
         .NS, .CNAME, .PTR => .{ .name = rdata },
         .MX => blk: {
+            // 2-byte preference plus at least the one-byte root name.
             if (rdata.len < 3) return error.MalformedRdata;
-            break :blk .{ .mx = .{
-                .preference = std.mem.readInt(u16, rdata[0..2], .big),
-                .exchange = rdata[0..2],
-            } };
+            break :blk .{
+                .mx = .{
+                    .preference = std.mem.readInt(u16, rdata[0..2], .big),
+                    // The name starts *after* the preference. Slicing [0..2] here
+                    // returned the preference bytes as the exchange — the silent
+                    // kind of wrong, since both are well-formed slices.
+                    .exchange = rdata[2..],
+                },
+            };
         },
         .SRV => blk: {
+            // 6 bytes of priority/weight/port plus at least the root target.
             if (rdata.len < 7) return error.MalformedRdata;
             break :blk .{ .srv = .{
                 .priority = std.mem.readInt(u16, rdata[0..2], .big),
@@ -61,7 +85,7 @@ pub fn parseRdata(t: Type, rdata: []const u8) !Rdata {
         },
         .TXT => .{ .txt = rdata },
         else => .{ .unknown = rdata },
-    }
+    };
 }
 
 pub const ResourceRecord = struct {
@@ -178,6 +202,108 @@ pub const ResourceRecordIter = struct {
 
 const testing = std.testing;
 const blocked_response = @import("blocked_response.zig");
+
+test "refAllDecls: an uncalled pub decl is never analysed without this" {
+    // This file is why the guard exists. `parseRdata` shipped through four
+    // merged PRs and CI without compiling, because nothing referenced it and
+    // Zig analyses lazily — `zig build` does not catch it either, and neither
+    // does the aggregator in main.zig, which collects this file's `test` blocks
+    // without referencing its declarations.
+    //
+    // `refAllDecls` is shallow — it references a container type without
+    // analysing what is inside it — and 0.16.0's std has no recursive variant.
+    // Most of this codebase's logic lives in struct methods, so every container
+    // has to be named. That is the cost of the guard, and it is still the
+    // cheapest one on the board.
+    testing.refAllDecls(@This());
+    testing.refAllDecls(Section);
+    testing.refAllDecls(Type);
+    testing.refAllDecls(Rdata);
+    testing.refAllDecls(ResourceRecord);
+    testing.refAllDecls(Read);
+    testing.refAllDecls(ResourceRecordIter);
+}
+
+// --- parseRdata ------------------------------------------------------------
+//
+// `refAllDecls` above proves this function *compiles*. It cannot prove it is
+// right, and the two defects that sat behind the compile error were both the
+// silent kind — a slice of the wrong field, and a missing width check. These
+// are the tests that fail when either comes back.
+
+test "MX exchange starts after the preference, not at it" {
+    // The fixture discriminates on purpose: preference bytes (0x00 0x0A) are
+    // chosen to be nothing like the name that follows, so the old
+    // `.exchange = rdata[0..2]` cannot pass by coincidence. A realistic
+    // preference of 0 with a name starting 0x00 would have hidden this.
+    const rdata = [_]u8{ 0x00, 0x0A, 3, 'm', 'x', '1', 0 };
+
+    const parsed = try parseRdata(.MX, &rdata);
+    try testing.expectEqual(@as(u16, 10), parsed.mx.preference);
+    try testing.expectEqualSlices(u8, &[_]u8{ 3, 'm', 'x', '1', 0 }, parsed.mx.exchange);
+}
+
+test "MX with no room for a name is rejected" {
+    // Two bytes is a well-framed preference and nothing else. Accepting it
+    // would hand the caller a zero-length name.
+    try testing.expectError(error.MalformedRdata, parseRdata(.MX, &[_]u8{ 0x00, 0x0A }));
+}
+
+test "A and AAAA reject an RDATA shorter than the address" {
+    // `parseRecord` bounds RDLENGTH against the message, not against the type's
+    // fixed width, so both of these are reachable from a well-framed record.
+    // Before the length checks they were out-of-bounds reads, not errors.
+    try testing.expectError(error.MalformedRdata, parseRdata(.A, &[_]u8{ 192, 168, 1 }));
+    try testing.expectError(error.MalformedRdata, parseRdata(.A, &[_]u8{}));
+    try testing.expectError(error.MalformedRdata, parseRdata(.AAAA, &[_]u8{ 0x20, 0x01 }));
+}
+
+test "A and AAAA decode at exactly their width" {
+    const a = try parseRdata(.A, &[_]u8{ 192, 168, 1, 42 });
+    try testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 42 }, a.a);
+
+    const v6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{0x01};
+    const aaaa = try parseRdata(.AAAA, &v6);
+    try testing.expectEqualSlices(u8, &v6, aaaa.aaaa);
+}
+
+test "SRV splits its three fixed fields from the target name" {
+    const rdata = [_]u8{ 0x00, 0x0A, 0x00, 0x14, 0x01, 0xBB, 3, 's', 'v', '1', 0 };
+
+    const parsed = try parseRdata(.SRV, &rdata);
+    try testing.expectEqual(@as(u16, 10), parsed.srv.priority);
+    try testing.expectEqual(@as(u16, 20), parsed.srv.weight);
+    try testing.expectEqual(@as(u16, 443), parsed.srv.port);
+    try testing.expectEqualSlices(u8, &[_]u8{ 3, 's', 'v', '1', 0 }, parsed.srv.target);
+
+    // Six bytes is the fixed block with no target at all.
+    try testing.expectError(
+        error.MalformedRdata,
+        parseRdata(.SRV, rdata[0..6]),
+    );
+}
+
+test "an unmodelled type stays opaque rather than being misread" {
+    // RFC 3597: we are not obliged to understand every type, only to not
+    // pretend. HTTPS (65) is modelled in `Type` but has no parse arm, which is
+    // exactly the case that must fall through to `.unknown`.
+    const rdata = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+
+    const https = try parseRdata(.HTTPS, &rdata);
+    try testing.expectEqualSlices(u8, &rdata, https.unknown);
+
+    // And a code with no enum name at all.
+    const unknown = try parseRdata(@enumFromInt(9999), &rdata);
+    try testing.expectEqualSlices(u8, &rdata, unknown.unknown);
+}
+
+test "NS, CNAME and PTR hand back the whole RDATA as one wire name" {
+    const rdata = [_]u8{ 3, 'n', 's', '1', 0 };
+    for ([_]Type{ .NS, .CNAME, .PTR }) |t| {
+        const parsed = try parseRdata(t, &rdata);
+        try testing.expectEqualSlices(u8, &rdata, parsed.name);
+    }
+}
 
 /// A reply shaped like the ones upstreams actually send: `www.example.com` A,
 /// answered by a CNAME to `cdn.example.com` and then that name's A record, with
