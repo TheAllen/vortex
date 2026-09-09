@@ -9,6 +9,90 @@ Newest first. Open work lives in [next_steps.md](next_steps.md).
 
 ---
 
+## Landed 2026-09-08 — housekeeping sweep
+
+The whole Housekeeping backlog, closed in one pass. Individually these are chores; together
+they retire a **failure mode that had bitten twice, seven weeks apart** — and the second
+time it shipped through four merged PRs and CI without a murmur.
+
+`zig build test` → **122/122 pass** (101 → 122), `zig build` green, both under Debug and
+ReleaseSafe. One test artifact now, down from two.
+
+### The guard, and what it caught
+
+`std.testing.refAllDecls` in every module's test block, forcing the compiler to analyse
+declarations that nothing calls. **It caught `parseRdata` on its first run** — which is the
+whole argument for it, and worth recording precisely because a guard that finds nothing on
+the day it lands is indistinguishable from ceremony.
+
+Two corrections to how the fix was specified on 2026-09-05, both found by applying it:
+
+- **It is not "one line per file."** Zig 0.16.0's `std.testing` ships only the *shallow*
+  `refAllDecls`; `refAllDeclsRecursive` is a later-Zig API and does not exist here. Shallow
+  means `_ = &@field(T, decl.name)` over `T`'s own declarations — referencing a container
+  type without analysing anything inside it. Most of this codebase's logic lives in struct
+  *methods* (`ResourceRecordIter.next`, `Header.validateQuery`, `Cache.get`), so every
+  container has to be named explicitly. [cache.zig](../src/dns/cache.zig) was already doing
+  this on 09-05; the reason was not recorded, and the board item was written as if the one
+  line sufficed.
+- **`std.meta.declarations` yields only `pub` declarations.** A file-private type is never
+  reached through `@This()` and must be named directly — `EscapingWriter` in
+  [obs/log.zig](../src/obs/log.zig) is the case that matters, since it is the type whose
+  escaping no call site can bypass.
+
+### The largest win was `main.zig`, and it retires a documented caveat
+
+Referencing `main` forces analysis of everything reachable from it: `handleQuery`,
+`dispatcherLoop`, `sweeperLoop`, `supervise`, and all the wiring. **None of that sits in a
+`test` block**, which is why "`zig build test` does not type-check `main`" had been true
+since 2026-08-09 and was written into the board as a permanent caveat.
+
+Verified rather than assumed: reintroducing the exact original regression — `backoffSeconds`
+returning `u64` where `Io.Duration.fromSeconds` takes `i64` — now fails `zig build test` at
+`main.zig:489`, *inside `supervise`*, which no test calls.
+
+**The claim this does and does not support.** The coroutine layer is now **compiled** by
+`zig build test`. It is not **tested**. That is a strictly weaker property than the rest of
+this file describes, and P2.5's integration harness is still what closes the gap — the two
+most recent real bugs in this project were both found by driving sockets, and no amount of
+semantic analysis would have caught either.
+
+### `parseRdata`: one compile error hiding two silent bugs
+
+The compile error was the cheap part — `switch` prongs peer-resolved as anonymous struct
+literals with no `return` and no `Rdata` coercion target, fixed by `return switch (t) {…}`.
+The two defects *behind* it were the ones worth having:
+
+- **`.MX` sliced `rdata[0..2]` as the exchange**, which is the preference field. The name
+  starts at `rdata[2..]`. Both are well-formed slices, so this fails silently forever.
+- **`.A`/`.AAAA` indexed a fixed width with no length check.** `parseRecord` bounds RDLENGTH
+  against the message but *not* against the type's required width, so a well-framed record
+  carrying 3 bytes of A RDATA was an out-of-bounds read, reachable from any upstream.
+
+Seven tests, and all three defects mutation-checked per the 09-05 lesson — the fixture has
+to fail when the rule is broken. The MX fixture uses a preference of `0x000A` specifically
+so it cannot be confused with the name that follows; a realistic preference of `0` with a
+name starting `0x00` would have passed either way, which is exactly how the four vacuous
+cache assertions happened. Removing the A width check reproduces as a genuine
+`index out of bounds: index 4, len 3` panic, not a silent pass.
+
+It still has **no datapath caller** — it is capability for EDNS0 and P4.1, shipping ahead of
+its consumer in the same shape as P3.1. What is different is that the guard now keeps it
+compiling, which is the only reason that is an acceptable state to leave it in.
+
+### `root.zig` and the second test artifact
+
+Deleted, along with the `addModule("vortex")` that rooted it and the template comment walls
+around it in [build.zig](../build.zig). Nothing imported the module, and its only test
+asserted `add(3, 7) == 10` — but it was the *first* module a reader met, so it read as the
+project's public surface while being template residue. It also cost a whole second test
+binary: `zig build test` ran two artifacts, one of which existed to run that one stub.
+
+`Question.question_str_slice` turned out to be already gone from the source; only the board
+entry still referenced it.
+
+---
+
 ## Landed 2026-09-05 — P3.3 TTL-aware response caching
 
 The last of the **compression → parsing → caching** chain, and the first item in it

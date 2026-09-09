@@ -136,7 +136,7 @@ actually move it.
 QDCOUNT), QName case normalization, cacheable SOA on blocked answers, replies
 verified against the question that provoked them, SERVFAIL on upstream timeout,
 and TC=1 rather than silent corruption when a reply overflows the receive buffer.
-`zig build test` runs 101 tests, 98 asserting real behavior, under both Debug and
+`zig build test` runs 122 tests, 120 asserting real behavior, under both Debug and
 ReleaseSafe.
 
 **Responses are cached, with honest TTLs.** The compression → parsing → caching
@@ -160,11 +160,17 @@ shutdown, metrics, and blocklist refresh with an on-disk cache — today a faile
 fetch at startup is fatal. [`docs/next_steps.md`](docs/next_steps.md) is the
 full prioritized board.
 
-The largest *testing* gap is a different shape: all 101 tests are over pure
-functions, so `handleQuery`, `dispatcherLoop` and the ingress loop have no
-automated coverage of any kind — and caching just made both of them more
-complex. That needs an integration harness (P2.5), which needs a local-file
-blocklist source first so startup does not cost 25s per case.
+The largest *testing* gap is a different shape: every one of the 122 tests is over
+a pure function, so `handleQuery`, `dispatcherLoop` and the ingress loop have no
+runtime coverage of any kind — and caching just made both of them more complex.
+That needs an integration harness (P2.5), which needs a local-file blocklist
+source first so startup does not cost 25s per case.
+
+They are at least *compiled* now: as of 2026-09-08 every module carries a
+`std.testing.refAllDecls` guard, and the one on `main.zig` reaches the whole
+coroutine layer. That retired a real caveat — `zig build test` used to report
+zero errors on code that could not build — but compiling is not testing, and
+these are the two functions where this project's last two real bugs lived.
 
 ## Documentation
 

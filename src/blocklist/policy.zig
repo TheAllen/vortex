@@ -38,3 +38,13 @@ pub const Policy = struct {
         self.suffix_blocklist.deinit(gpa);
     }
 };
+
+// One line of guard per container. `refAllDecls` is shallow and 0.16.0 has no
+// recursive variant, so a type that is not named here has its methods left
+// unanalysed — see resource_record.zig, where exactly that let a `pub fn` ship
+// broken through four merged PRs and CI.
+test "refAllDecls" {
+    std.testing.refAllDecls(@This());
+    std.testing.refAllDecls(Verdict);
+    std.testing.refAllDecls(Policy);
+}

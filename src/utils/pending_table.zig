@@ -358,3 +358,13 @@ test "peek does not consume the entry" {
     try testing.expectEqual(@as(u16, 0x4242), table.complete(id).?.client_id);
     try testing.expect(table.peek(id) == null);
 }
+
+// One line of guard per container. `refAllDecls` is shallow and 0.16.0 has no
+// recursive variant, so a type that is not named here has its methods left
+// unanalysed — see resource_record.zig, where exactly that let a `pub fn` ship
+// broken through four merged PRs and CI.
+test "refAllDecls" {
+    testing.refAllDecls(@This());
+    testing.refAllDecls(PendingQuery);
+    testing.refAllDecls(PendingTable);
+}

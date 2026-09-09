@@ -401,3 +401,12 @@ test "synthesizedReply builds a reply from an ID alone" {
         std.mem.readInt(u16, Header.synthesizedReply(0, .no_error)[2..4], .big),
     );
 }
+
+// One line of guard per container. `refAllDecls` is shallow and 0.16.0 has no
+// recursive variant, so a type that is not named here has its methods left
+// unanalysed — see resource_record.zig, where exactly that let a `pub fn` ship
+// broken through four merged PRs and CI.
+test "refAllDecls" {
+    testing.refAllDecls(@This());
+    testing.refAllDecls(Header);
+}

@@ -11,6 +11,60 @@ are stated explicitly below so the number can be argued with rather than just qu
 
 ---
 
+## Snapshot — 2026-09-08
+
+> **≈ 57.9% complete** (57.4 → 57.9). A deliberately small move for a sweep that
+> touched every file in the project, and the size is the point.
+>
+> Source: 5,471 lines of Zig across 16 files (`root.zig` deleted). `zig build test` →
+> **122/122 pass** under both Debug and ReleaseSafe, of which **120 are real**, from one test
+> artifact instead of two.
+>
+> Moved by the housekeeping sweep: **Tests + CI from ~73% to ~78%** (+0.5 weighted). Nothing
+> else moved.
+
+### Breakdown
+
+| Area | Weight | Done | Contribution | Notes |
+|---|---:|---:|---:|---|
+| Core query datapath | 30% | ~98% | 29.4 | Unchanged. Still the 5 s deadline, the 1 s sweep cadence and the QDCOUNT=0 SERVFAIL |
+| Operability | 25% | ~30% | 7.5 | Unchanged. Per-query event log, metrics, graceful shutdown, deployment, blocklist refresh all still unbuilt |
+| Protocol completeness | 20% | ~62% | 12.4 | Unchanged by choice — `parseRdata` compiles and is tested but has no datapath caller yet; see below |
+| Sinkhole feature set | 15% | ~5% | 0.75 | Unchanged |
+| Tests + CI | 10% | ~78% | 7.8 | **+5.** 120 real tests, two fuzz targets, `refAllDecls` on all 16 modules, one test artifact. The suite now type-checks `main`. Still no integration harness |
+| **Total** | **100%** | | **≈ 57.9** | |
+
+### What changed, and why it is worth only half a point
+
+The sweep closed the entire Housekeeping backlog — `parseRdata` fixed and given 7 tests,
+`refAllDecls` guards on all 16 modules, the `root.zig` template stub and its module deleted.
+Full detail in [changelog.md](changelog.md#landed-2026-09-08--housekeeping-sweep).
+
+**It bought one genuinely new property:** `zig build test` now type-checks `main` and
+everything reachable from it. Since 2026-08-09 the board had carried "a green test suite is
+not evidence that Vortex compiles" as a standing caveat; that is now false, verified by
+reintroducing the original `backoffSeconds` regression and watching the suite fail at
+`main.zig:489` inside `supervise`. It also caught a real bug the day it landed — `parseRdata`
+failed on the guard's first run, which is the difference between a guard and a ritual.
+
+**It did not move the number much, because compiling is not testing.** The coroutine layer
+went from *unanalysed* to *analysed*. It is still *unexercised*: `handleQuery` and
+`dispatcherLoop` have no runtime coverage, and the two most recent real bugs in this project
+were both found by driving sockets against a hostile upstream, where no amount of semantic
+analysis would have helped. The integration harness (P2.5) remains the single largest gap on
+the board and the sweep did not touch it.
+
+**Why the protocol band did not move at all.** `parseRdata` works now, but it has no datapath
+caller — it is capability for EDNS0 and P4.1. P3.1 was credited for exactly this shape of
+work, so an argument for +1 exists; it is not taken here because P3.1's pure capability had a
+committed consumer two items later on the board, and this does not yet.
+
+**The counting caveat, once more.** 122 is a better number than 101, but 15 of the 22 new
+tests are guards and unit tests over one dead function. The shape of the gap is unchanged
+from the 09-05 snapshot: everything is still over pure functions.
+
+---
+
 ## Snapshot — 2026-09-05 (pm)
 
 > **≈ 57.4% complete** against the yardstick in

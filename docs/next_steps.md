@@ -1,18 +1,23 @@
 # Next Steps — Road to Production-Ready
 
-Reviewed **2026-09-05** against the current source (Zig 0.16.0, `zig build test` →
-**101/101 pass**, of which 98 are real behavior tests). **No open P0s, and no open P1 bugs** —
+Reviewed **2026-09-08** against the current source (Zig 0.16.0, `zig build test` →
+**122/122 pass**, of which 120 are real behavior tests). **No open P0s, and no open P1 bugs** —
 all three P0s are pinned by regression tests that fail under mutation.
 
 **P3.3 response caching landed 2026-09-05**, closing the compression → parsing → caching
 chain. The P3 band is now the EDNS0/TCP remainder rather than the main event.
 
-One correctness item remains from this review: `parseRdata` in
-[resource_record.zig](../src/dns/resource_record.zig) **does not compile** and nobody noticed,
-because it has no callers and Zig never analysed it. It is dead code, so it is Housekeeping
-rather than P0 — but the *reason* it went unseen generalizes, and that fix is on the board
-too. `cache.zig` now carries the `refAllDecls` guard; nothing else does. See
-[Housekeeping](#housekeeping).
+**The housekeeping sweep landed 2026-09-08** and closed the whole Housekeeping backlog:
+`parseRdata` is fixed and tested, every module carries the `refAllDecls` guard, and the
+`root.zig` template stub and its module are deleted. Two of those are worth carrying forward
+as facts rather than chores:
+
+- **`zig build test` now type-checks `main`.** The guard on [main.zig](../src/main.zig)
+  reaches `handleQuery`, `dispatcherLoop`, `sweeperLoop` and `supervise` — none of which sit
+  in a `test` block — so the long-standing "a green test suite is not evidence that Vortex
+  compiles" caveat is retired. That layer is now *compiled*, still not *tested*.
+- **The guard works.** It caught `parseRdata` on its first run, exactly the class of rot it
+  was proposed for. See [Housekeeping](#housekeeping).
 
 **History lives in [changelog.md](changelog.md)** — dated entries for everything that landed,
 the three closed P0s in detail, and the shipped P3.1 and P3.2 plans. This file is the board:
@@ -129,13 +134,15 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
    `dispatcherLoop`.
 4. **Graceful shutdown.** No signal handling; the only exit is a crash or Ctrl-C mid-write.
    Catch SIGINT/SIGTERM, `group.cancel`, flush the log, run the deferred deinits.
-5. **Test coverage.** `zig build test` → **101/101, of which 98 are real**: 32 `cache`,
-   17 `name_reader` (including a fuzz target), 10 `resource_record` (including the second),
-   9 `Header`, 8 `obs/log`, 7 `PendingTable`, 5 `settings`, 4 `parseQuestion`,
-   3 `blocked_response` golden-bytes, `backoffSeconds`, allowlist hit/miss, and
-   `SuffixBlockList.decide`. The 3 that assert nothing about Vortex are `root.zig`'s
-   `add(3, 7)` stub, `main.zig`'s "initialize sockets", and the `test { _ = @import(…) }`
-   aggregator, which the runner counts as a passing test.
+5. **Test coverage.** `zig build test` → **122/122, of which 120 are real**: 32 `cache`,
+   17 `resource_record` (10 walk tests including a fuzz target, plus **7 new `parseRdata`
+   tests** from 09-08), 17 `name_reader` (including a fuzz target), 9 `Header`, 8 `obs/log`,
+   7 `PendingTable`, 5 `settings`, 4 `parseQuestion`, 3 `blocked_response` golden-bytes,
+   `backoffSeconds`, allowlist hit/miss, `SuffixBlockList.decide`, and **14 `refAllDecls`
+   guards** — one per module, which assert nothing at runtime and everything at compile time.
+   Only 2 now assert nothing about Vortex: `main.zig`'s "initialize sockets" and the
+   `test { _ = @import(…) }` aggregator, which the runner counts as a passing test.
+   (`root.zig`'s `add(3, 7)` stub was the third; it is deleted.)
 
    **A third testing lesson, learned the hard way on 2026-09-05.** Mutation-testing the
    cache found **four assertions that could not fail**, each because the fixture was built
@@ -171,21 +178,28 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
      project: the ingress loop, `supervise`, and all the wiring in `main` sit outside any
      `test` block.
 
-     **Consequence: a green test suite is not evidence that Vortex compiles.** Always run
-     `zig build` too. CI already does — `zig build` and `zig build test` are separate steps,
-     plus a ReleaseSafe pair. Anything you want the compiler to check must be reachable from
-     a `test`, or you must build the exe.
-
      **Worse than recorded, found 2026-09-05.** This is not limited to `main`. `parseRdata`
      in [resource_record.zig](../src/dns/resource_record.zig) has no callers anywhere, so it
-     is never analysed and **does not compile** — while `zig build` *and* `zig build test`
-     both stay green, in both optimization modes. Adding the file to the aggregator does not
+     was never analysed and **did not compile** — while `zig build` *and* `zig build test`
+     both stayed green, in both optimization modes. Adding the file to the aggregator does not
      help: `_ = @import("dns/resource_record.zig")` collects that file's `test` blocks; it
-     does not reference its declarations. So the rule is stronger than "build the exe too":
-     **an uncalled `pub fn` is unchecked no matter what you run.** The fix is one line —
-     `std.testing.refAllDecls(@This())` in each module's test block, which forces analysis of
-     every public declaration and turns exactly this class of rot into a test-time compile
-     error. See [Housekeeping](#housekeeping).
+     does not reference its declarations. So the rule was stronger than "build the exe too":
+     **an uncalled `pub fn` is unchecked no matter what you run.**
+
+     **Resolved 2026-09-08 — this entry is kept as the reasoning, not as a live caveat.**
+     Every module now carries a `refAllDecls` guard, `main.zig` included, so both halves of
+     the failure mode are closed: the uncalled `pub fn` (caught immediately — `parseRdata`
+     failed on the guard's first run) and the `main`-only reachable code. Reintroducing the
+     original `backoffSeconds` `u64` regression now fails `zig build test` at `main.zig:489`,
+     inside `supervise`. Two corrections to the fix as it was written above: it is **not** one
+     line per file, because 0.16.0 ships only the shallow `refAllDecls` and struct methods
+     need their container named explicitly; and `std.meta.declarations` yields only `pub`
+     declarations, so file-private types must be named directly. Details in
+     [Housekeeping](#housekeeping).
+
+     **What has not changed:** keep `zig build` and `zig build test` as separate CI steps.
+     The guard forces analysis of declarations, which is not the same as linking an
+     executable, and the ReleaseSafe pair still catches what Debug lets through.
 
    Still missing:
    - **An integration harness for the coroutine-bound code — now the largest gap.**
@@ -266,8 +280,10 @@ What remains in this band is EDNS0, TCP fallback, and the multi-upstream arc.
    - ~~The placeholder `std.log.info("name: …")`~~ ✅ now a `query`-scoped debug record
      carrying name, type and TTL. Still a line per record rather than fields on P2.3's
      per-query event, which is where it belongs
-   - **`parseRdata` is broken and dead** — the one item still open. See
-     [Housekeeping](#housekeeping)
+   - ~~**`parseRdata` is broken and dead**~~ ✅ **fixed 2026-09-08** with 7 tests and the
+     `refAllDecls` guard that keeps it compiling. Still has no datapath caller — it is
+     capability for the EDNS0/P4.1 work, in the same "ships before its caller" shape as
+     P3.1. See [Housekeeping](#housekeeping)
 3. ~~**TTL-aware response caching.**~~ **Done 2026-09-05** —
    [cache.zig](../src/dns/cache.zig). Keyed on `(qname, qtype, qclass)` with a hand-written
    hash context (`AutoHashMap` silently cannot work here — see the changelog), entries
@@ -368,35 +384,46 @@ real sinkhole (the Pi-hole / AdGuard Home / Unbound-`local-zone` feature class).
 
 ## Housekeeping
 
-- **`parseRdata` does not compile** ([resource_record.zig](../src/dns/resource_record.zig)).
-  Found 2026-09-05. It has zero callers — not in the datapath, not in its own file, not in a
-  test — so Zig never analyses it and the suite stays green. Force analysis and it fails at
-  once: `incompatible types` on the `switch`, whose prongs are peer-resolved as anonymous
-  struct literals with **no `return`** and no `Rdata` coercion target. Two more defects sit
-  behind that one, and both are the silent kind rather than the crashing kind:
-  - `.MX` sets `.exchange = rdata[0..2]`, which is the *preference* field. The exchange name
-    starts at `rdata[2..]`.
-  - `.A` and `.AAAA` index `rdata[0..4]` / `rdata[0..16]` with no length check. `parseRecord`
-    bounds RDLENGTH against the message but not against the type's fixed width, so a
-    well-framed record with a short RDATA is an out-of-bounds read.
+- ~~**`parseRdata` does not compile**~~ **Fixed 2026-09-08**, along with the two silent
+  defects behind the compile error (`.MX` sliced the *preference* as the exchange name; `.A`
+  and `.AAAA` indexed a fixed width with no length check, so a well-framed record with short
+  RDATA was an out-of-bounds read). It now has **seven tests**, and all three defects were
+  mutation-checked — the missing width check reproduces as a real
+  `index out of bounds: index 4, len 3` panic when removed. See
+  [changelog.md](changelog.md#landed-2026-09-08--housekeeping-sweep).
+- ~~**Add `std.testing.refAllDecls(@This())` to each module's test block.**~~
+  **Done 2026-09-08 — every module now carries it**, and it caught `parseRdata` on the very
+  first run.
 
-  Fix the signature (`return switch (t) { … }`), the MX slice, and add the two length checks
-  — then give it a caller or a test, because nothing else will keep it compiling. `Rdata` and
-  `Type` are used and fine; only `parseRdata` is dead.
-- **Add `std.testing.refAllDecls(@This())` to each module's test block.** One line per file
-  that turns every unreferenced `pub` declaration into a test-time compile error. This is the
-  general fix for the item above, and for the 2026-08-09 `backoffSeconds` finding before it —
-  the same failure mode, twice, seven weeks apart, and the second one shipped through four
-  merged PRs and CI without a murmur. Cheapest guard rail on this list by a wide margin.
-  **Applied to [cache.zig](../src/dns/cache.zig) on 2026-09-05** — where it was load-bearing
-  from the first commit, since `Cache`'s methods had no production caller for several hours.
-  Every other file is still unguarded, `resource_record.zig` most urgently.
-- Delete or repurpose the remaining template leftovers: the stub
-  [src/root.zig](../src/root.zig) (`add`/`printAnotherMessage`), which is also the misleading
-  module root, and the boilerplate comment walls in [build.zig](../build.zig). (`copy.zig`
-  at the repo root and the empty `src/server.zig` are both already gone.)
-- `Question.question_str_slice` ([question.zig](../src/dns/question.zig)) is declared but
-  never assigned or read — drop it or wire it up.
+  Two things were learned applying it that the original entry got wrong:
+  - **It is not one line per file.** 0.16.0's `std.testing` has only the *shallow*
+    `refAllDecls`; there is no `refAllDeclsRecursive` (that is a later-Zig API). Shallow
+    means referencing a container type without analysing what is inside it, and most of this
+    codebase's logic lives in struct *methods*. So every container has to be named
+    explicitly — which is what [cache.zig](../src/dns/cache.zig) was already doing on
+    2026-09-05, and the reason why was not recorded at the time.
+  - **`std.meta.declarations` reports only `pub` declarations.** A file-private type is never
+    reached by `@This()` and must be named directly — see `EscapingWriter` in
+    [obs/log.zig](../src/obs/log.zig).
+
+  **The largest single win was [main.zig](../src/main.zig)**, and it is worth stating
+  separately because it retires a documented limitation rather than a bug: referencing `main`
+  forces analysis of everything reachable from it — `handleQuery`, `dispatcherLoop`,
+  `sweeperLoop`, `supervise` and all the wiring — none of which sits in a `test` block.
+  **"`zig build test` does not type-check `main`" is no longer true.** Verified by
+  reintroducing the exact 2026-08-09 `backoffSeconds` regression (`i64` → `u64`), which now
+  fails `zig build test` at `main.zig:489`, inside `supervise`. Note this makes that layer
+  *compiled*, not *tested* — a strictly weaker claim, and P2.5 is still what closes the rest.
+- ~~Delete or repurpose the remaining template leftovers~~ **Done 2026-09-08.** `src/root.zig`
+  is deleted and the `addModule("vortex")` that rooted it is gone from
+  [build.zig](../build.zig) along with the boilerplate walls around it. Nothing imported that
+  module, its only test asserted `add(3, 7) == 10`, and it was the first module a reader met
+  — so it read as the project's public surface while being template residue. It also cost a
+  second test artifact: `zig build test` ran two binaries, one of which existed to run that
+  one stub. **`zig build test` is now a single artifact, 122 tests, 120 of them real.**
+- ~~`Question.question_str_slice`~~ Already gone from
+  [question.zig](../src/dns/question.zig); only this entry still referenced it. Removed
+  2026-09-08.
 - **Three sibling docs still name `craftBlockedResponse`** (renamed 2026-08-08):
   [dns-message-format.md](dns-message-format.md) (§"Which sections … modifies", plus a code
   listing), [async-migration.md](async-migration.md) (three snippets and an explanatory

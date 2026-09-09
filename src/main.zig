@@ -670,6 +670,24 @@ test {
     _ = @import("settings.zig");
 }
 
+// The aggregator above collects each module's `test` blocks; it does not
+// reference their declarations. This does, for this file — and this file is the
+// one where it buys the most.
+//
+// Referencing `main` forces analysis of everything reachable from it:
+// `handleQuery`, `dispatcherLoop`, `sweeperLoop`, `supervise` and all the
+// wiring in between. None of that sits inside a `test` block, so until now
+// **`zig build test` did not type-check any of it** — the 2026-08-09 finding
+// where `backoffSeconds` returned the wrong integer type and the suite reported
+// 0 errors while `zig build` could not produce a binary at all.
+//
+// This does not make the coroutine layer *tested* — that still needs the P2.5
+// integration harness. It makes it *compiled*, which is a strictly weaker claim
+// and was previously not true either.
+test "refAllDecls: reaching main type-checks the whole coroutine layer" {
+    std.testing.refAllDecls(@This());
+}
+
 test "initialize sockets" {
     const test_socket = try initIpAddress("0.0.0.0", 5454);
 
