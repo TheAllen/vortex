@@ -1,11 +1,19 @@
 # Next Steps — Road to Production-Ready
 
-Reviewed **2026-09-08** against the current source (Zig 0.16.0, `zig build test` →
-**122/122 pass**, of which 120 are real behavior tests). **No open P0s, and no open P1 bugs** —
+Reviewed **2026-09-11** against the current source (Zig 0.16.0, `zig build test` →
+**131/131 pass**, of which 129 are real behavior tests). **No open P0s, and no open P1 bugs** —
 all three P0s are pinned by regression tests that fail under mutation.
 
 **P3.3 response caching landed 2026-09-05**, closing the compression → parsing → caching
 chain. The P3 band is now the EDNS0/TCP remainder rather than the main event.
+
+**The local-file blocklist source landed 2026-09-11**, closing P2.1's last blocking item.
+Either list may now be a path instead of a URL, so startup against the checked-in fixtures
+is instant rather than ~25 s and touches no network. **P2.5's hard prerequisite is
+therefore gone** — the integration harness is the next thing to build, and it is now the
+cheapest large win on this board. The same pass split acquisition from parsing in both
+blocklists, which gave the two files their first tests; see
+[changelog.md](changelog.md#landed-2026-09-11--p21-local-file-blocklist-source).
 
 **The housekeeping sweep landed 2026-09-08** and closed the whole Housekeeping backlog:
 `parseRdata` is fixed and tested, every module carries the `refAllDecls` guard, and the
@@ -26,8 +34,9 @@ open work only.
 The single largest remaining gap is that `handleQuery`, `dispatcherLoop` and the ingress loop
 have **no automated coverage at all**, and cannot get any by extracting another pure
 function, because what is untested is the socket plumbing itself. That needs an integration
-harness (**P2.5**), which in turn needs a local-file blocklist source (**P2.1**) so startup
-does not cost 25 seconds per case.
+harness (**P2.5**). As of 2026-09-11 nothing blocks it: the local-file blocklist source it
+was waiting on has landed, so a case now costs milliseconds of startup instead of 25
+seconds.
 
 ## What exists today
 
@@ -60,8 +69,11 @@ does not cost 25 seconds per case.
   age; RFC 2308 negative caching; swept every 30 s. `VORTEX_CACHE_MAX_ENTRIES=0` disables it
 - A `Policy` filter chain — allowlist → exact blocklist → suffix blocklist — with a
   three-valued `Verdict` (`allow`/`block`/`pass`) ([policy.zig](../src/blocklist/policy.zig))
-  - Exact-match blocklist fetched over HTTP ([domain_blocklist.zig](../src/blocklist/domain_blocklist.zig))
+  - Exact-match blocklist ([domain_blocklist.zig](../src/blocklist/domain_blocklist.zig))
   - Suffix/wildcard blocklist walking parent labels ([suffix_blocklist.zig](../src/blocklist/suffix_blocklist.zig))
+  - Both resolve from a URL **or** a local file path, chosen by the value's scheme
+    (`Settings.Source`), with acquisition split from parsing so the line grammar of each
+    is tested over literals
   - Comptime allowlist that overrides a block, validated lowercase at build time ([allowlist.zig](../src/blocklist/allowlist.zig))
 - NXDOMAIN synthesis for blocked names, assembled in one pure function
   ([blocked_response.zig](../src/dns/blocked_response.zig)) from `Header.writeResponseFlags`
@@ -102,19 +114,22 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
    [settings.zig](../src/settings.zig) resolves a runtime `Settings` struct at startup from
    **defaults < `.env` file < process environment**.
    - **Done:** listen host+port, upstream host+port, upstream bind host+port, both blocklist
-     URLs, log level and log format, and `VORTEX_CACHE_MAX_ENTRIES` (0 disables the cache). All `VORTEX_`-prefixed; `VORTEX_ENV_FILE` picks a
+     sources, log level and log format, and `VORTEX_CACHE_MAX_ENTRIES` (0 disables the cache). All `VORTEX_`-prefixed; `VORTEX_ENV_FILE` picks a
      different file. A missing default `.env` is fine; a file named explicitly that isn't
      there is fatal, as is a malformed port — silently listening on 5354 because someone
      typed `535e` is the config bug that costs an hour.
+   - ~~**Local file paths as a blocklist source alongside URLs**~~ **Done 2026-09-11.**
+     `VORTEX_BLOCKLIST_SOURCE` / `VORTEX_SUFFIX_BLOCKLIST_SOURCE` take a URL or a path,
+     decided by the value's scheme. This was P2.5's hard prerequisite; P2.5 is now
+     unblocked. The old `_URL` names are a fatal error naming the replacement rather than a
+     silent fall back to the default list.
    - **Still to do:** `std.process.args` for CLI flags (highest precedence, above process
-     env), multiple upstreams (P4.3), **local file paths as a blocklist source alongside
-     URLs — now a blocker for the P2.5 integration harness, since a 25s HTTP fetch at
-     startup makes per-case integration tests unusable**, and the three remaining knobs whose
+     env), multiple upstreams (P4.3), and the three remaining knobs whose
      *consumers* can't take a runtime value yet — **timeouts** (the 5 s deadline and 1 s sweep
      cadence, now unblocked), **negative-cache TTL** (needs `Authority`'s comptime fields
      un-`comptime`d, see Housekeeping), and **fail-open vs fail-closed** (needs P2.2). Each
      is one struct field plus one line in `fromEnviron` once its consumer is ready.
-2. **Blocklist resilience.** Both lists are fetched concurrently at startup; a non-OK
+2. **Blocklist resilience.** Both lists are resolved concurrently at startup; a non-OK
    status or network error returns `error.BlocklistFetchFailed`, which `main` propagates —
    so the server **fails closed: no blocklist means no DNS at all**. That's the opposite of
    the old silent fail-open, and arguably worse for a resolver (a transient GitHub blip takes
@@ -134,15 +149,22 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
    `dispatcherLoop`.
 4. **Graceful shutdown.** No signal handling; the only exit is a crash or Ctrl-C mid-write.
    Catch SIGINT/SIGTERM, `group.cancel`, flush the log, run the deferred deinits.
-5. **Test coverage.** `zig build test` → **122/122, of which 120 are real**: 32 `cache`,
+5. **Test coverage.** `zig build test` → **131/131, of which 129 are real**: 32 `cache`,
    17 `resource_record` (10 walk tests including a fuzz target, plus **7 new `parseRdata`
    tests** from 09-08), 17 `name_reader` (including a fuzz target), 9 `Header`, 8 `obs/log`,
-   7 `PendingTable`, 5 `settings`, 4 `parseQuestion`, 3 `blocked_response` golden-bytes,
-   `backoffSeconds`, allowlist hit/miss, `SuffixBlockList.decide`, and **14 `refAllDecls`
+   **8 `settings`** (3 new on 09-11 for `Source.parse` and the rename guard),
+   7 `PendingTable`, **4 `DomainBlockList`** and **4 `SuffixBlockList`** (all new on 09-11
+   bar one), 4 `parseQuestion`, 3 `blocked_response` golden-bytes,
+   `backoffSeconds`, allowlist hit/miss, and **16 `refAllDecls`
    guards** — one per module, which assert nothing at runtime and everything at compile time.
    Only 2 now assert nothing about Vortex: `main.zig`'s "initialize sockets" and the
    `test { _ = @import(…) }` aggregator, which the runner counts as a passing test.
    (`root.zig`'s `add(3, 7)` stub was the third; it is deleted.)
+
+   Counted exactly, so the headline number is not mistaken for behavior coverage:
+   **131 = 113 behavior tests + 16 guards + 1 aggregator + 1 no-op.** The guard count was
+   recorded as 14 from 09-08 until 09-11; it has been 16 — one per module — since the sweep,
+   and three of them are simply named something other than `test "refAllDecls"`.
 
    **A third testing lesson, learned the hard way on 2026-09-05.** Mutation-testing the
    cache found **four assertions that could not fail**, each because the fixture was built
@@ -202,11 +224,12 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
      executable, and the ReleaseSafe pair still catches what Debug lets through.
 
    Still missing:
-   - **An integration harness for the coroutine-bound code — now the largest gap.**
-     The 101 tests are almost entirely over pure functions. `handleQuery`, `dispatcherLoop`
-     and the ingress loop have **no automated coverage of any kind** — not runtime, and (per
-     the third lesson above) not even compile-time from `zig build test`. Everything proven
-     about them on 2026-08-09 was proven by hand with `dig` and throwaway Python.
+   - **An integration harness for the coroutine-bound code — the largest gap, and now
+     unblocked.** The 131 tests are almost entirely over pure functions. `handleQuery`,
+     `dispatcherLoop` and the ingress loop have **no runtime coverage of any kind**;
+     since the 09-08 sweep they are at least *compiled* by `zig build test` via the
+     `refAllDecls` guard on `main`, which is a strictly weaker claim. Everything ever
+     proven about their behavior was proven by hand with `dig` and throwaway Python.
 
      That is a different shape of gap from the rest of this list: it cannot be closed by
      extracting another pure function, because what is untested *is* the socket plumbing.
@@ -232,17 +255,16 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
      **P2.1 is what makes this feasible** — pointing the binary at a fake upstream on a
      scratch port is now a config file, not a recompile.
 
-     **But there is a hard prerequisite:** startup blocks on fetching two blocklists over
-     HTTP, which took ~25s in every manual run. At 25s per case this is unusable in CI. The
-     harness needs the **local-file blocklist source** already listed under P2.1's "still to
-     do" — or an injection seam for the lists. Do that first; the harness is cheap
-     afterwards and near-impossible before.
-   - `parseDomain`/`parseSuffixDomain` parsing tests. [policy.zig](../src/blocklist/policy.zig),
-     [domain_blocklist.zig](../src/blocklist/domain_blocklist.zig) and
-     [utility.zig](../src/utility.zig) are the only files carrying logic with **no `test`
-     blocks at all**.
-   - Housekeeping: `root.zig` is still the template stub and the module root of the second
-     test artifact — fold it into the aggregator or delete it.
+     ~~**But there is a hard prerequisite:** startup blocks on fetching two blocklists over
+     HTTP, which took ~25s in every manual run.~~ **Cleared 2026-09-11.** Both
+     `VORTEX_BLOCKLIST_SOURCE` and `VORTEX_SUFFIX_BLOCKLIST_SOURCE` take a local path, and
+     [testdata/](../testdata/) holds a fixture pair sized for exactly this. A case now
+     costs milliseconds of startup. **Nothing is left blocking this item — build it next.**
+   - ~~`parseDomain`/`parseSuffixDomain` parsing tests.~~ **Done 2026-09-11**, as a
+     by-product of splitting `build` (pure, over a byte slice) out of `load` in both
+     blocklists. [policy.zig](../src/blocklist/policy.zig) and
+     [utility.zig](../src/utility.zig) are now the only files carrying logic with **no
+     `test` blocks at all**.
 6. **Deployment surface.** `127.0.0.1:5354` is dev-only. Real use means `0.0.0.0:53`
    (privileged port → capability / launchd / systemd unit), an IPv6 listener, and a
    service definition. Pick the target platform and add the unit files.
@@ -363,7 +385,7 @@ real sinkhole (the Pi-hole / AdGuard Home / Unbound-`local-zone` feature class).
   split-horizon / conditional forwarding (send `*.internal` to a different upstream).
   These slot in ahead of the blocklist as another `Filter`/resolver stage.
 - **P4.5 — blocklist normalization & footprint.** The two lists (StevenBlack hosts + hagezi
-  wildcards) overlap heavily and the raw HTTP bodies are retained for the process
+  wildcards) overlap heavily and the raw bodies are retained for the process
   lifetime via `Writer.Allocating` inside each list (`file_body` is never freed until
   `deinit`, and the `StringHashMap` keys are slices *into* that body). Document/decide
   this ownership model, dedupe exact entries already covered by a suffix, and consider
@@ -475,13 +497,13 @@ C3 removed the reflector and P1.2 stopped OOM from being fatal, but nothing yet 
 the number of in-flight handlers a flood can create.
 
 > ⚠️ **This section is stale** and is kept verbatim by request; only this note is maintained.
-> As of 2026-09-05: items 1 and 2 are done (P4.2 landed 08-09, both test suites landed 08-09,
+> As of 2026-09-11: items 1 and 2 are done (P4.2 landed 08-09, both test suites landed 08-09,
 > CI exists), P2.1/P2.3 both shipped, and the P3 track it offers as a *branch* has now been
-> walked end to end — compression 08-13, record parsing 08-30, caching 09-05. Rewriting it
-> against what is actually open — **P1.5, P2.1's local-file blocklist source → P2.5's
-> harness, P2.2, P2.3's per-query event, then P4.1** — is a separate pass, and the case for
-> it is stronger now that the largest remaining feature is gone and what is left is almost
-> entirely the deployability block.
+> walked end to end — compression 08-13, record parsing 08-30, caching 09-05. The real order
+> is **P2.5's harness (now unblocked, and the largest win on the board), P2.2, P1.5, P2.3's
+> per-query event, then P4.1** — P2.1's local-file blocklist source came off that list on
+> 09-11. Rewriting this section against it is a separate pass, and the case for doing so
+> keeps getting stronger: what is left is almost entirely the deployability block.
 
 For the view from above — how far along the whole project is, which of these bands is worth
 the most per unit of effort, and why "no open P0s" does **not** mean "safe to deploy" — see

@@ -61,8 +61,8 @@ and edit. Running with no `.env` at all is a supported mode.
 | `VORTEX_LISTEN_HOST` / `VORTEX_LISTEN_PORT` | `127.0.0.1` / `5354` |
 | `VORTEX_UPSTREAM_HOST` / `VORTEX_UPSTREAM_PORT` | `192.168.1.1` / `53` |
 | `VORTEX_UPSTREAM_BIND_HOST` / `VORTEX_UPSTREAM_BIND_PORT` | `0.0.0.0` / `0` (ephemeral) |
-| `VORTEX_BLOCKLIST_URL` | StevenBlack `hosts` |
-| `VORTEX_SUFFIX_BLOCKLIST_URL` | oisd `small.oisd.nl/domainswild2` |
+| `VORTEX_BLOCKLIST_SOURCE` | StevenBlack `hosts` (URL or local path) |
+| `VORTEX_SUFFIX_BLOCKLIST_SOURCE` | oisd `small.oisd.nl/domainswild2` (URL or local path) |
 | `VORTEX_CACHE_MAX_ENTRIES` | `10000` (`0` disables the cache) |
 | `VORTEX_ENV_FILE` | `.env` |
 
@@ -70,10 +70,28 @@ A missing `.env` is fine; a file named explicitly via `VORTEX_ENV_FILE` that
 doesn't exist is fatal, and so is a malformed port. Silently listening on the
 default port because someone typed `535e` is the config bug that costs an hour.
 
+Either blocklist may be a **URL or a local file path**, decided by the value's
+scheme: `http://` and `https://` are fetched, `file://` is read from disk with
+the scheme stripped, and anything else is read as a path. Pointing both at the
+checked-in fixtures starts the server in milliseconds instead of the ~25 s two
+HTTP fetches cost, and without touching the network at all:
+
+```
+VORTEX_BLOCKLIST_SOURCE=./testdata/blocklist.hosts \
+VORTEX_SUFFIX_BLOCKLIST_SOURCE=./testdata/suffix.txt \
+zig build run
+```
+
 If you change the suffix list, it must be a **bare-domain** list —
 `domainswild2`, not `domainswild`. The parser does not strip a leading `*.`, so
 a `*.`-prefixed list loads without any error and then matches nothing. Both
-lists are fetched at startup and a failure is currently fatal (P2.2).
+lists are resolved at startup and a failure is currently fatal (P2.2) — a named
+file that doesn't exist included, because an operator who named a blocklist
+asked for that blocklist.
+
+These two were called `VORTEX_BLOCKLIST_URL` / `VORTEX_SUFFIX_BLOCKLIST_URL`
+before they learned to take a path. Setting a stale name is a startup error
+naming its replacement rather than a silent fall back to the default list.
 
 ## How it works
 

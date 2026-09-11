@@ -1,0 +1,16 @@
+# Suffix/wildcard blocklist fixture: one BARE domain per line.
+#
+# Point VORTEX_SUFFIX_BLOCKLIST_SOURCE at this file to start Vortex without the
+# ~25s HTTP fetch of the real oisd list. Names are under RFC 2606 / RFC 6761
+# reserved domains, so none can collide with a real lookup.
+#
+# NOTE the format: bare domains, NO `*.` prefix. A `*.` prefix is not stripped,
+# so such an entry loads without complaint and then matches nothing — see the
+# test pinning that in src/blocklist/suffix_blocklist.zig.
+#
+# Each entry below blocks the zone AND every subdomain of it, via the
+# parent-label walk in SuffixBlockList.decide.
+
+adnetwork.example
+metrics.example.org
+invalid

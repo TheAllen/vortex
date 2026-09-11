@@ -525,17 +525,19 @@ pub fn main(init: std.process.Init) !void {
     };
     defer http_client.deinit();
 
-    var f_domain = io.async(DomainBlockList.constructBlockList, .{
+    var f_domain = io.async(DomainBlockList.load, .{
         &policy.domain_blocklist,
         gpa,
+        io,
         &http_client,
-        cfg.blocklist_url,
+        cfg.blocklist_source,
     });
-    var f_suffix = io.async(SuffixBlockList.constructSuffixBlockList, .{
+    var f_suffix = io.async(SuffixBlockList.load, .{
         &policy.suffix_blocklist,
         gpa,
+        io,
         &http_client,
-        cfg.suffix_blocklist_url,
+        cfg.suffix_blocklist_source,
     });
 
     // Await both futures before propagating either error: a dropped future

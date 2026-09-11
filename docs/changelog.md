@@ -9,6 +9,121 @@ Newest first. Open work lives in [next_steps.md](next_steps.md).
 
 ---
 
+## Landed 2026-09-11 — P2.1 local-file blocklist source
+
+Either blocklist can now be a filesystem path instead of a URL. Small feature, and it was
+chosen next for one reason: **it is the hard prerequisite for P2.5**, the integration
+harness. Startup blocked on two HTTP fetches that cost ~25 s in every manual run, and a
+harness that spawns the binary per case cannot pay that per case. Startup against the
+checked-in fixtures is now instant and touches no network at all.
+
+`zig build test` → **131/131 pass** (122 → 131), `zig build` green, `zig fmt --check` clean.
+
+### The config surface: one variable per list, sniffed
+
+`VORTEX_BLOCKLIST_URL` / `VORTEX_SUFFIX_BLOCKLIST_URL` became
+`VORTEX_BLOCKLIST_SOURCE` / `VORTEX_SUFFIX_BLOCKLIST_SOURCE`, resolved through a new
+`Source` union in [settings.zig](../src/settings.zig):
+
+| Value | Resolves to |
+|---|---|
+| `https://…`, `http://…` (case-insensitive) | `.url` — fetched, exactly as before |
+| `file:///etc/vortex/hosts` | `.path` = `/etc/vortex/hosts` — scheme stripped |
+| `./testdata/hosts`, `/etc/hosts` | `.path` — read as written |
+
+The rejected alternative was a second variable per list (`…_PATH` beside `…_URL`), which
+buys explicitness at the cost of four variables and a "both set" precedence rule to define
+and document. One variable per list has no such case to get wrong.
+
+**`Source.parse` is deliberately total — there is no invalid-source error.** A typo'd
+`htps://example.com/hosts` becomes a path and then fails at open time with that exact
+string in the message. A dedicated parse error would name the offending value no more
+loudly, and would have to somehow distinguish a mistyped scheme from a legitimate bare
+path, which is not decidable.
+
+**The rename is enforced, not absorbed.** A `Settings.renamed` table drives a
+`checkRenamed` that fails startup with `error.RenamedSetting` naming the replacement. The
+alternative — accepting the old name as an alias — was rejected because the failure it
+prevents is precisely this project's least favourite kind: a stale `.env` would otherwise
+resolve the *default* StevenBlack URL while the file on disk plainly stated something else.
+That is the same class of silent failure as listening on 5354 after a typo'd port, and
+worse, because the value being ignored is a blocklist. The mutation check made it concrete
+— with the guard disabled, the test's failure output shows `blocklist_source` holding the
+default URL while `VORTEX_BLOCKLIST_URL` sat in the map.
+
+`checkRenamed` runs from `fromEnviron`, not `load`, so it lives inside the pure `Io`-free
+surface the existing tests already cover.
+
+### The seam, and the two files that had no tests at all
+
+`constructBlockList(gpa, http_client, url)` split into:
+
+- **`build(gpa, body)`** — the line loop, pure over a byte slice. No `Io`, no HTTP, no
+  filesystem.
+- **`load(gpa, io, http_client, source)`** — acquires bytes into `file_body`, then calls
+  `build(gpa, self.file_body.written())`.
+
+This is the same move as C2, C3, P2.1's dotenv parser, P1.1, P3.1 and P3.2 — **separate
+deciding from doing, and the test needs no `Io`** — and it closes a gap listed separately
+on the board: [domain_blocklist.zig](../src/blocklist/domain_blocklist.zig) and
+[suffix_blocklist.zig](../src/blocklist/suffix_blocklist.zig) were two of the three logic
+files carrying **no `test` blocks at all**. They now have nine between them, over literals.
+
+`build` borrows rather than copies — the set's keys are slices *into* `body`, which is why
+the raw body is retained for the process lifetime (P4.5 covers that ownership model). That
+contract is what lets a test hand it a string literal: static storage outlives everything.
+
+Four of the new assertions were mutation-checked, per the 2026-09-05 lesson that a fixture
+must be built to *discriminate* rather than to look realistic:
+
+| Mutation | Caught by |
+|---|---|
+| `localhost` skip removed from `parseDomain` | grammar test — `expected .pass, found .block` |
+| `file://` prefix not stripped | `Source.parse` test — `slice len 17 vs 24` |
+| `checkRenamed` loop emptied | rename test — resolved the default URL instead |
+| comment skip removed from `parseSuffixDomain` | key count — `expected 3, found 4` |
+
+The `localhost` case needed care to fail for the *right* reason: the fixture puts
+`127.0.0.1 kept.example.com` directly beneath `127.0.0.1 localhost`, so the test proves the
+name is what's rejected and not the address in front of it.
+
+The suffix list's documented footgun is now a **checked property** rather than three
+paragraphs of prose in `.env`, the README and `Settings`: a test asserts that
+`*.example.com` is retained verbatim as a key and blocks nothing, because `decide`'s
+parent-label walk never produces a label beginning with `*`. If a future change starts
+stripping the prefix, that test fails — correctly, since the three warnings would then all
+need to come out with it.
+
+### Two things worth not re-discovering
+
+- **`Writer.Allocating.initOwnedSlice` is not the zero-copy shortcut it looks like.** It
+  installs the slice as `buffer` but leaves `writer.end` at 0, so `written()` comes back
+  **empty** — a blocklist that loads clean and blocks nothing, silently. The file read uses
+  `readFileAlloc` + `writeAll` instead, costing one transient duplicate of the body
+  (~3.5 MB for a full StevenBlack list) in exchange for code that cannot fail that way.
+- **A multiline string literal cannot contain a tab.** `error: string literal contains
+  invalid byte: '\t'`. The tab-separated hosts case lives in an escaped literal alongside
+  the CRLF case for that reason, not by preference.
+
+### Fixtures
+
+[testdata/blocklist.hosts](../testdata/blocklist.hosts) and
+[testdata/suffix.txt](../testdata/suffix.txt), every name under an RFC 2606 / RFC 6761
+reserved domain so none can ever collide with a real lookup. The unit tests parse literals,
+not these — the fixtures exist to be *run against*, by hand today and by P2.5's harness
+next.
+
+### Verified end to end
+
+Against the fixtures, with `dig`: an exact-list name → NXDOMAIN with the SOA in AUTHORITY;
+a *subdomain* of a suffix-list zone → NXDOMAIN with the SOA, exercising the parent-label
+walk; an unblocked name → NOERROR, forwarded upstream. `file://` with an absolute path
+resolves the same list. All three failure paths abort startup naming the offending value:
+a missing file, and each stale `_URL` variable. One run on the untouched defaults confirms
+the URL path is unchanged.
+
+---
+
 ## Landed 2026-09-08 — housekeeping sweep
 
 The whole Housekeeping backlog, closed in one pass. Individually these are chores; together

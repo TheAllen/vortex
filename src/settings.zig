@@ -19,9 +19,10 @@
 //! lives for the whole process. `Settings` therefore owns nothing and has no
 //! `deinit` — but it must not outlive the map it was loaded from.
 //!
-//! Not yet covered here (see next_steps.md P2.1): timeouts, negative-cache TTL,
-//! and fail-open-vs-closed. Each is one field plus one line in `fromEnviron`
-//! once the code it configures can accept a runtime value.
+//! Not yet covered here (see next_steps.md P2.1): CLI flags, multiple upstreams,
+//! timeouts, negative-cache TTL, and fail-open-vs-closed. Each is one field plus
+//! one line in `fromEnviron` once the code it configures can accept a runtime
+//! value.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -47,6 +48,39 @@ const log = if (builtin.is_test) struct {
     fn debug(comptime _: []const u8, _: anytype) void {}
 } else std.log.scoped(.settings);
 
+/// Where a blocklist's bytes come from: over the network, or off the disk.
+///
+/// Resolved from the variable's scheme rather than from a second variable, so
+/// there is still exactly one setting per list and no "both set" case to define
+/// a precedence rule for.
+pub const Source = union(enum) {
+    url: []const u8,
+    path: []const u8,
+
+    const file_scheme = "file://";
+
+    /// `http://` or `https://` (case-insensitive) is a URL. `file://` is a path
+    /// with the scheme stripped, so `file:///etc/hosts` is `/etc/hosts`.
+    /// Everything else is a path.
+    ///
+    /// Deliberately total — there is no "invalid source" error. A typo'd
+    /// `htps://example.com/hosts` becomes a path, and then fails at open time
+    /// with that exact string in the message, which names the offending value
+    /// just as loudly as a dedicated parse error would while keeping every
+    /// unadorned relative path working.
+    pub fn parse(raw: []const u8) Source {
+        if (std.ascii.startsWithIgnoreCase(raw, "http://") or
+            std.ascii.startsWithIgnoreCase(raw, "https://"))
+        {
+            return .{ .url = raw };
+        }
+        if (std.ascii.startsWithIgnoreCase(raw, file_scheme)) {
+            return .{ .path = raw[file_scheme.len..] };
+        }
+        return .{ .path = raw };
+    }
+};
+
 pub const Settings = struct {
     /// Address and port the resolver listens on for client queries.
     listen_host: []const u8,
@@ -63,14 +97,15 @@ pub const Settings = struct {
     upstream_bind_port: u16,
 
     /// Exact-match blocklist (hosts format) and suffix/wildcard blocklist.
+    /// Either may be a URL or a local file path; see `Source`.
     ///
     /// The suffix list must be **bare domains, one per line** — the format
     /// `SuffixBlockList.parseSuffixDomain` reads and `decide`'s parent-label
     /// walk matches against. A list whose entries carry a `*.` prefix parses
     /// without complaint and then matches nothing at all, which is the worst
     /// possible failure: a blocklist that loads clean and blocks zero domains.
-    blocklist_url: []const u8,
-    suffix_blocklist_url: []const u8,
+    blocklist_source: Source,
+    suffix_blocklist_source: Source,
 
     /// Diagnostic verbosity, and whether records render for a human or a
     /// parser. Applied by `obs_log.configure`; see [obs/log.zig](obs/log.zig).
@@ -96,12 +131,12 @@ pub const Settings = struct {
         .upstream_bind_host = "0.0.0.0",
         .upstream_bind_port = 0,
 
-        .blocklist_url = "https://raw.githubusercontent.com/StevenBlack/hosts/refs/heads/master/hosts",
+        .blocklist_source = .{ .url = "https://raw.githubusercontent.com/StevenBlack/hosts/refs/heads/master/hosts" },
         // `domainswild2`, not `domainswild`: the `2` variant omits the `*.`
         // prefix, which is the only form this codebase can match. Replaced the
         // hagezi light list on 2026-08-10 after that entire GitHub *account*
         // disappeared — not just the file — leaving no successor to point at.
-        .suffix_blocklist_url = "https://small.oisd.nl/domainswild2",
+        .suffix_blocklist_source = .{ .url = "https://small.oisd.nl/domainswild2" },
 
         // Tracks `std.log`'s build-mode default — debug under `Debug`, info
         // under the release modes — so adding this knob changes nothing for
@@ -122,6 +157,13 @@ pub const Settings = struct {
     /// A config file this large is a mistake, not a config file.
     pub const max_env_file_bytes = 64 * 1024;
 
+    /// Ceiling on a blocklist read from disk. Generous on purpose — the full
+    /// StevenBlack `hosts` is ~3.5 MB — but the read has to be bounded, because
+    /// the bytes are retained for the process lifetime (the set's keys are
+    /// slices into them) and an unbounded read of whatever path an operator
+    /// typed is an easy way to lose the machine to a fat-fingered `/dev/zero`.
+    pub const max_blocklist_bytes = 32 * 1024 * 1024;
+
     pub const ParseError = error{
         /// A port variable was set to something that isn't a u16.
         InvalidPort,
@@ -131,6 +173,20 @@ pub const Settings = struct {
         InvalidLogFormat,
         /// `VORTEX_CACHE_MAX_ENTRIES` was set to something that isn't a count.
         InvalidCacheSize,
+        /// A variable that no longer exists under that name is still set. See
+        /// `renamed`.
+        RenamedSetting,
+    };
+
+    /// Variables that were renamed, and what to say when one turns up.
+    ///
+    /// Ignoring a stale name would mean silently resolving the *default* while
+    /// an operator's `.env` sits there plainly stating otherwise — the same
+    /// class of failure as quietly listening on 5354 after a typo'd port, and
+    /// worse here, because the value that gets ignored is a blocklist.
+    const renamed = [_]struct { old: []const u8, new: []const u8 }{
+        .{ .old = "VORTEX_BLOCKLIST_URL", .new = "VORTEX_BLOCKLIST_SOURCE" },
+        .{ .old = "VORTEX_SUFFIX_BLOCKLIST_URL", .new = "VORTEX_SUFFIX_BLOCKLIST_SOURCE" },
     };
 
     /// Reads the environment file into `environ`, then resolves every field.
@@ -146,6 +202,7 @@ pub const Settings = struct {
     /// Pure: resolves fields from an already-populated map. Split out from
     /// `load` so it is testable without an `Io` or a file on disk.
     pub fn fromEnviron(environ: *const Environ.Map) ParseError!Settings {
+        try checkRenamed(environ);
         return .{
             .listen_host = envStr(environ, "VORTEX_LISTEN_HOST", defaults.listen_host),
             .listen_port = try envPort(environ, "VORTEX_LISTEN_PORT", defaults.listen_port),
@@ -156,8 +213,8 @@ pub const Settings = struct {
             .upstream_bind_host = envStr(environ, "VORTEX_UPSTREAM_BIND_HOST", defaults.upstream_bind_host),
             .upstream_bind_port = try envPort(environ, "VORTEX_UPSTREAM_BIND_PORT", defaults.upstream_bind_port),
 
-            .blocklist_url = envStr(environ, "VORTEX_BLOCKLIST_URL", defaults.blocklist_url),
-            .suffix_blocklist_url = envStr(environ, "VORTEX_SUFFIX_BLOCKLIST_URL", defaults.suffix_blocklist_url),
+            .blocklist_source = envSource(environ, "VORTEX_BLOCKLIST_SOURCE", defaults.blocklist_source),
+            .suffix_blocklist_source = envSource(environ, "VORTEX_SUFFIX_BLOCKLIST_SOURCE", defaults.suffix_blocklist_source),
 
             .log_level = try envEnum(
                 obs_log.Level,
@@ -193,6 +250,30 @@ pub const Settings = struct {
             log.err("{s}: '{s}' is not a whole number of entries", .{ key, raw });
             return error.InvalidCacheSize;
         };
+    }
+
+    /// Rejects a variable that is set under a name this build no longer reads.
+    ///
+    /// Runs from `fromEnviron` rather than `load` so it sits inside the pure,
+    /// `Io`-free surface the tests already cover. An explicitly empty value is
+    /// "unset" here, exactly as it is everywhere else in this file — it would
+    /// have configured nothing under the old name either.
+    fn checkRenamed(environ: *const Environ.Map) ParseError!void {
+        for (renamed) |r| {
+            const raw = environ.get(r.old) orelse continue;
+            if (raw.len == 0) continue;
+            log.err(
+                "{s} was renamed to {s}, which also accepts a local file path; rename it and restart",
+                .{ r.old, r.new },
+            );
+            return error.RenamedSetting;
+        }
+    }
+
+    fn envSource(environ: *const Environ.Map, key: []const u8, fallback: Source) Source {
+        const raw = environ.get(key) orelse return fallback;
+        if (raw.len == 0) return fallback;
+        return Source.parse(raw);
     }
 
     fn envStr(environ: *const Environ.Map, key: []const u8, fallback: []const u8) []const u8 {
@@ -497,6 +578,98 @@ test "fromEnviron resolves the logging knobs and rejects bad values" {
     try testing.expectError(error.InvalidLogFormat, Settings.fromEnviron(&map));
 }
 
+test "Source.parse separates a URL from a path" {
+    // Both schemes we actually fetch over, and the value is passed through
+    // whole — a truncated URL would still be a `.url`, so assert the payload.
+    try testing.expectEqualDeep(
+        Source{ .url = "https://example.com/hosts" },
+        Source.parse("https://example.com/hosts"),
+    );
+    try testing.expectEqualDeep(
+        Source{ .url = "http://example.com/hosts" },
+        Source.parse("http://example.com/hosts"),
+    );
+    // A scheme is case-insensitive per RFC 3986 §3.1, and an operator who
+    // pastes one from a document that capitalized it should not silently get a
+    // filesystem read of the string "HTTPS://...".
+    try testing.expectEqualDeep(
+        Source{ .url = "HTTPS://example.com/hosts" },
+        Source.parse("HTTPS://example.com/hosts"),
+    );
+
+    // `file://` is stripped, so the third slash of `file:///abs` is the leading
+    // slash of the absolute path — off by one here means opening `/abs`'s
+    // parent, or nothing at all.
+    try testing.expectEqualDeep(
+        Source{ .path = "/etc/vortex/hosts" },
+        Source.parse("file:///etc/vortex/hosts"),
+    );
+
+    // Bare paths, relative and absolute, need no scheme at all.
+    try testing.expectEqualDeep(
+        Source{ .path = "./testdata/blocklist.hosts" },
+        Source.parse("./testdata/blocklist.hosts"),
+    );
+    try testing.expectEqualDeep(
+        Source{ .path = "/etc/vortex/hosts" },
+        Source.parse("/etc/vortex/hosts"),
+    );
+
+    // A typo'd scheme is a path, not an error — and fails at open time naming
+    // the whole string, which is the point of not adding a parse error here.
+    try testing.expectEqualDeep(
+        Source{ .path = "htps://example.com/hosts" },
+        Source.parse("htps://example.com/hosts"),
+    );
+}
+
+test "fromEnviron resolves both blocklist sources" {
+    var map = Environ.Map.init(testing.allocator);
+    defer map.deinit();
+
+    // Unset means the built-in URLs, unchanged by this feature.
+    const unset = try Settings.fromEnviron(&map);
+    try testing.expectEqualDeep(Settings.defaults.blocklist_source, unset.blocklist_source);
+    try testing.expectEqualDeep(Settings.defaults.suffix_blocklist_source, unset.suffix_blocklist_source);
+
+    // The two lists resolve independently: one off disk, one over the network,
+    // which is a combination the P2.5 harness will actually use.
+    try map.put("VORTEX_BLOCKLIST_SOURCE", "./testdata/blocklist.hosts");
+    try map.put("VORTEX_SUFFIX_BLOCKLIST_SOURCE", "https://example.com/wild");
+    const cfg = try Settings.fromEnviron(&map);
+    try testing.expectEqualDeep(Source{ .path = "./testdata/blocklist.hosts" }, cfg.blocklist_source);
+    try testing.expectEqualDeep(Source{ .url = "https://example.com/wild" }, cfg.suffix_blocklist_source);
+
+    // Empty is "unset", consistent with every other variable here.
+    try map.put("VORTEX_BLOCKLIST_SOURCE", "");
+    try testing.expectEqualDeep(
+        Settings.defaults.blocklist_source,
+        (try Settings.fromEnviron(&map)).blocklist_source,
+    );
+}
+
+test "fromEnviron rejects the pre-rename blocklist variables" {
+    var map = Environ.Map.init(testing.allocator);
+    defer map.deinit();
+
+    // A `.env` written before the rename would otherwise resolve to the default
+    // URL while stating something else on the page — so this is fatal, not a
+    // warning. Each name is checked separately: a loop that returned after the
+    // first would leave the second unguarded.
+    try map.put("VORTEX_BLOCKLIST_URL", "https://example.com/hosts");
+    try testing.expectError(error.RenamedSetting, Settings.fromEnviron(&map));
+
+    try map.put("VORTEX_BLOCKLIST_URL", "");
+    try map.put("VORTEX_SUFFIX_BLOCKLIST_URL", "https://example.com/wild");
+    try testing.expectError(error.RenamedSetting, Settings.fromEnviron(&map));
+
+    // An explicitly empty stale name configured nothing under the old name
+    // either, so it is "unset" rather than a migration failure — and with both
+    // empty the load succeeds.
+    try map.put("VORTEX_SUFFIX_BLOCKLIST_URL", "");
+    _ = try Settings.fromEnviron(&map);
+}
+
 // One line of guard per container. `refAllDecls` is shallow and 0.16.0 has no
 // recursive variant, so a type that is not named here has its methods left
 // unanalysed — see resource_record.zig, where exactly that let a `pub fn` ship
@@ -504,4 +677,5 @@ test "fromEnviron resolves the logging knobs and rejects bad values" {
 test "refAllDecls" {
     testing.refAllDecls(@This());
     testing.refAllDecls(Settings);
+    testing.refAllDecls(Source);
 }

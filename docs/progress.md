@@ -11,6 +11,114 @@ are stated explicitly below so the number can be argued with rather than just qu
 
 ---
 
+## Snapshot — 2026-09-11
+
+> **≈ 58.8% complete** (57.9 → 58.8). Roughly one point for a 424-line feature, which
+> undersells it: **the number is not what changed this pass — the shape of the board is.**
+>
+> Source: 5,895 lines of Zig across 16 files. `zig build test` → **131/131 pass** under both
+> Debug and ReleaseSafe.
+>
+> Moved by P2.1's local-file blocklist source: **Operability ~30% → ~33%** (+0.75) and
+> **Tests + CI ~78% → ~80%** (+0.2). Nothing else moved.
+>
+> **The headline is not the percentage.** P2.5 — the integration harness, and the largest
+> gap on this board for five straight snapshots — went from *blocked* to *buildable*. It is
+> the first time since 08-09 that the biggest open item has had nothing in front of it.
+
+### Breakdown
+
+| Area | Weight | Done | Contribution | Notes |
+|---|---:|---:|---:|---|
+| Core query datapath | 30% | ~98% | 29.4 | Unchanged. Still the 5 s deadline, the 1 s sweep cadence and the QDCOUNT=0 SERVFAIL |
+| Operability | 25% | ~33% | 8.25 | **+3.** P2.1 config is now all but closed — only CLI flags and three consumer-blocked knobs remain. Per-query event log, metrics, graceful shutdown, deployment, blocklist refresh all still unbuilt |
+| Protocol completeness | 20% | ~62% | 12.4 | Unchanged. EDNS0, TCP fallback, multi-upstream |
+| Sinkhole feature set | 15% | ~5% | 0.75 | Unchanged |
+| Tests + CI | 10% | ~80% | 8.0 | **+2.** 113 behavior tests (up from 104), and two of the three zero-coverage logic files closed. Still no integration harness — but nothing blocks one now |
+| **Total** | **100%** | | **≈ 58.8** | |
+
+### Why a small feature earns the pass
+
+The change itself is modest: a `Source` union that reads a value's scheme, a file-read
+branch beside the HTTP one, and a rename guard. Full detail in
+[changelog.md](changelog.md#landed-2026-09-11--p21-local-file-blocklist-source).
+
+**What it actually bought is the removal of a precondition.** Every snapshot since 09-05 has
+named the integration harness the largest gap, and every one has also named the reason it
+could not be built: startup blocked on two HTTP fetches costing ~25 s, and a harness that
+spawns the binary per case cannot pay that per case. That sentence is now gone. Startup
+against [testdata/](../testdata/) is instant and touches no network at all.
+
+This is the inverse of the 09-08 sweep. That pass touched every file and moved half a point
+because it bought *analysis* where testing was needed. This one touches four files and moves
+just under a point because it bought *permission to test the thing that has never been
+tested*. Neither number reflects what changed; in both cases the sentence after the number is
+the finding.
+
+**The credit is deliberately not larger.** The harness is unblocked, not built. `handleQuery`
+and `dispatcherLoop` still have zero runtime coverage, exactly as they did on 09-08, and this
+project has already learned once this month that crediting a guard rail in advance is not the
+same as verifying it — see the CI correction under
+[what moves the number](#-40-finish-header-validation-and-the-test-floor--done-2026-08-09).
+The points here are for the nine tests that exist, not the harness that does not.
+
+### The counting, stated exactly
+
+**131 = 113 behavior tests + 16 `refAllDecls` guards + 1 aggregator + 1 no-op.**
+
+Worth writing out, because the guard count has been recorded as 14 since 09-08 and is
+actually 16 — one per module, as the sweep intended; three are simply named something other
+than `test "refAllDecls"`, and a `grep` for the exact name undercounted them. Nothing is
+wrong with the code; the *record* of it was wrong for three days. That is a small instance of
+this file's own closing question, and it was found by regenerating the table from `wc -l` and
+`grep` instead of hand-editing it, which is the practice the 08-13 snapshot's stale table
+prompted.
+
+Two of the three files carrying logic with no behavior tests are now closed —
+`domain_blocklist.zig` (0 → 4) and `suffix_blocklist.zig` (1 → 5). **`policy.zig` remains,
+still 40 lines, still the chain that decides whether a domain is blocked, still zero
+behavior tests.** It has now survived every pass since 08-08 on that list. `authority.zig`
+and `utility.zig` join it, carrying less.
+
+### The finding: documentation is not verification
+
+The last three passes each delivered a finding of the form *something assumed to be checked
+that was not*. This one continues the run, in a milder form.
+
+The suffix list's `*.`-prefix footgun — a list whose entries carry `*.` parses without
+complaint and then matches **zero domains** — was "handled" in the sense that it is warned
+about in three places: [.env](../.env), the [README](../README.md), and `Settings`'
+doc-comment. It retired a real outage on 08-10 and has been treated as closed ever since.
+But prose in three files does not fail a build. It is now a test asserting that
+`*.example.com` is retained verbatim as a key and blocks nothing — so if a future change
+starts stripping the prefix, the suite fails and points at the three documents that would
+need to change with it.
+
+A second one, caught by reading rather than by running: **`Writer.Allocating.initOwnedSlice`
+is not the zero-copy shortcut it appears to be.** It installs the slice as `buffer` but
+leaves `writer.end` at 0, so `written()` comes back empty. Using it for the file read would
+have produced a blocklist that loads clean and blocks nothing — the identical failure
+signature as the `*.` prefix and the hagezi 404, arrived at by a third independent route.
+**That failure mode has now shown up three times in this project from three unrelated
+causes**, which is enough to call it the characteristic way this codebase breaks, and an
+argument for P2.2 to carry a startup assertion on non-zero blocklist size rather than
+trusting each load path to be right.
+
+### What did not move, and why
+
+The datapath, protocol and sinkhole bands are untouched — correctly, since nothing in this
+pass changed what a client receives. The [localhost cliff](#the-counterweight-the-localhost-cliff)
+is unchanged and unretired: P1.5 and P2.7 are both still open, and localhost binding is
+still load-bearing as a security control.
+
+One thing did get quietly worse in proportion: `settings.zig` is now 681 lines and the
+third-largest file in the project, having grown 183 lines in one pass. Roughly the same
+comment-to-code ratio as before, so this is not yet the `cache.zig` conversation — but
+`Source` is the first thing in that file that is not a scalar knob, and if a second such type
+arrives it should take both with it into its own module.
+
+---
+
 ## Snapshot — 2026-09-08
 
 > **≈ 57.9% complete** (57.4 → 57.9). A deliberately small move for a sweep that
@@ -254,10 +362,13 @@ Two findings came out of it, and the second has not been fixed:
 
 P2.2 therefore stays at the top of the deployability block, above P2.6 and P2.4.
 
-It is also a comment on the test suite: **69 passing tests and zero of them start the
-binary.** P2.5's integration harness would have caught the 404 on the first run — and the
-blocker for that harness is *local file paths as a blocklist source*, which is the same fix
-as the cache file above. One change closes both.
+It is also a comment on the test suite: **131 passing tests and zero of them start the
+binary.** P2.5's integration harness would have caught the 404 on the first run — and its
+blocker was *local file paths as a blocklist source*, which **landed 2026-09-11**. That half
+is done; the cache-file half of P2.2 is not, and the prediction that "one change closes both"
+turned out to be half right. The file-reading machinery a cache file needs now exists
+(`readFileInto`, shared by both lists), so P2.2's remaining work is the write-on-success side
+and a refresh strategy, not the plumbing.
 
 ---
 
@@ -287,9 +398,10 @@ Six items, and together they're the difference between a toy and a tool. **One i
 
 | Item | Why it's on the critical path |
 |---|---|
-| ~~P2.1 config~~ ✅ 08-09 | Was the gate on all of these; listen address is now runtime |
+| ~~P2.1 config~~ ✅ 08-09, local-file source ✅ 09-11 | Was the gate on all of these; listen address is now runtime, and either blocklist can be a path |
 | ~~P1.1 / P1.2 / P1.3 / P1.4 / P4.2~~ ✅ 08-09 | Datapath closed out; P1.5 is the only P1 left |
-| **P2.2 blocklist cache + refresh** | **Still the top of this list.** The 404 that proved it was fixed by swapping in another hard-coded URL, which re-armed the same trap against a different host — one that rate-limits. See [the counterweight that retired](#the-counterweight-that-retired-the-default-config-boots-again) |
+| **P2.5 integration harness** | **New top of this list as of 09-11.** Not in this band originally, but it is now unblocked, it is the largest gap on the board, and both of the last two real bugs were found only by driving sockets. Build it before the rest — everything below ships safer with it in place |
+| **P2.2 blocklist cache + refresh** | The 404 that proved it was fixed by swapping in another hard-coded URL, which re-armed the same trap against a different host — one that rate-limits. Its file-reading half now exists; see [the counterweight that retired](#the-counterweight-that-retired-the-default-config-boots-again) |
 | P1.5 concurrency cap | Gate for leaving localhost |
 | P2.7 rate limiting | Gate for leaving localhost |
 | P2.6 bind + service unit | `0.0.0.0:53`, privileged port, launchd/systemd |
@@ -319,26 +431,29 @@ DNS" — the branch [next_steps.md](next_steps.md) flags at the end of its Sugge
 
 ## Where the code actually is
 
-```
-5,215 lines of Zig, 17 files
+Regenerated from `wc -l` on 2026-09-11. Test counts exclude each file's `refAllDecls`
+guard, so this column is **behavior tests only** and will not sum to the 131 the runner
+reports.
 
-src/dns/cache.zig              1215   key + context, entry, map, TTL policy          32 tests
-src/main.zig                    711   ingress, handleQuery, dispatcher, sweeper, supervisor  3 tests
-src/dns/resource_record.zig     498   RR walk, iterator, rdata types                 10 tests
-src/settings.zig                498   runtime config: .env parse, precedence          5 tests
-src/obs/log.zig                 478   logfmt logFn, escaping writer, level + format   8 tests
-src/dns/header.zig              403   parse, validateQuery, reply builders            9 tests
-src/dns/name_reader.zig         364   name reading, pointer following                17 tests
-src/utils/pending_table.zig     360   proxy-ID table, sweeper, question hashing       7 tests
-src/dns/blocked_response.zig    179   pure NXDOMAIN+SOA assembly                      3 tests
-src/dns/question.zig            110   QName parse, lowercasing                        4 tests
-src/blocklist/allowlist.zig      90   comptime allowlist                              1 test
-src/blocklist/suffix_blocklist.zig 82 parent-label walk                               1 test
-src/blocklist/domain_blocklist.zig 61 exact-match list over HTTP                      0 tests
-src/dns/authority.zig            60   34-byte synthetic SOA                           0 tests
-src/utility.zig                  48   Context                                         0 tests
-src/blocklist/policy.zig         40   allow -> exact -> suffix chain                  0 tests  <- logic, no tests
-src/root.zig                     18   template stub -- delete (Housekeeping)
+```
+5,895 lines of Zig, 16 files
+
+src/dns/cache.zig                1215  key + context, entry, map, TTL policy         31 tests
+src/main.zig                      731  ingress, handleQuery, dispatcher, supervisor   1 test   <- +1 no-op, +1 aggregator
+src/settings.zig                  681  runtime config: .env parse, precedence, Source 8 tests
+src/dns/resource_record.zig       624  RR walk, iterator, rdata types                17 tests
+src/obs/log.zig                   494  logfmt logFn, escaping writer, level + format  8 tests
+src/dns/header.zig                412  parse, validateQuery, reply builders           9 tests
+src/dns/name_reader.zig           378  name reading, pointer following               17 tests
+src/utils/pending_table.zig       370  proxy-ID table, sweeper, question hashing      7 tests
+src/blocklist/domain_blocklist.zig 228 exact-match list, URL or file + shared read    3 tests
+src/dns/blocked_response.zig      187  pure NXDOMAIN+SOA assembly                     3 tests
+src/blocklist/suffix_blocklist.zig 181 parent-label walk, URL or file                 4 tests
+src/dns/question.zig              119  QName parse, lowercasing                       4 tests
+src/blocklist/allowlist.zig        99  comptime allowlist                             1 test
+src/dns/authority.zig              69  34-byte synthetic SOA                          0 tests
+src/utility.zig                    57  Context                                        0 tests
+src/blocklist/policy.zig           50  allow -> exact -> suffix chain                 0 tests  <- logic, no tests
 ```
 
 `cache.zig` arrives as the largest file in the project at 1,215 lines, which deserves the
@@ -356,8 +471,11 @@ hand-edit it.)*
 The distribution has changed shape twice over. `pending_table.zig` was the largest untested
 risk in the project and is now among the best covered — seven tests, mutation-verified,
 including the one that would have caught B1. **`policy.zig` remains the only file carrying
-logic with zero tests**, and it is still 40 lines; `domain_blocklist.zig` and `utility.zig`
-join it on the zero-test list but carry less.
+*logic* with zero behavior tests**, and it is still 50 lines; `authority.zig` and
+`utility.zig` join it on that list but carry less. `domain_blocklist.zig` left it on
+2026-09-11 — not by having tests bolted on, but the way `console.zig` and `cache.zig` did it:
+the line loop was split out as `build(gpa, body)`, pure over a byte slice, and the tests
+followed for free.
 
 `console.zig` left that list the way things should: not by having tests bolted on, but by
 being deleted. Its replacement is the fifth file written pure-first, and it arrived with
@@ -398,16 +516,26 @@ P2.5's harness would look.
 | 2026-08-10 (pm) | ~44.5% | P2.3 phase 2: `VORTEX_LOG_LEVEL` (incl. `off`) and `VORTEX_LOG_FORMAT` (`auto`/`logfmt`/`text`), both fail-loud on a bad value; closed P2.1's deferred `log level` field. Tests → 40/40 (37 real). Also a process finding: `zig build test` **passed while `zig build` failed** — lazy analysis never reached code only `main` calls, so the test step alone does not prove the binary compiles |
 | 2026-08-13 | ~47.1% | P3.1 compression pointer following: [name_reader.zig](../src/dns/name_reader.zig) with a strictly-backwards rule *plus* a 64-jump cap (the cap turned out to be load-bearing, not decorative), the project's first fuzz target, and `DomainName` deleted along with its allocator. Tests → 59/59 (58 real). Shipped with no datapath caller by design |
 | 2026-09-05 (pm) | ~57.4% | **P3.3 TTL-aware response caching** — [cache.zig](../src/dns/cache.zig), keyed on `(qname, qtype, qclass)` with a hand-written hash context, TTLs aged on the way out per RFC 2181 §5.2, RFC 2308 negative caching, OPT excluded throughout. Tests → 101/101 (98 real), 69 → 101. Closes the compression → parsing → caching chain and the largest single feature on the board. Two bugs caught during the build (an overlapping `@memcpy`, a get/age race), and **four vacuous tests found by mutation** — each because the fixture was built to be realistic rather than to discriminate. First module to carry `refAllDecls` |
+| 2026-09-11 | ~58.8% | **P2.1 local-file blocklist source.** `VORTEX_BLOCKLIST_SOURCE` / `VORTEX_SUFFIX_BLOCKLIST_SOURCE` take a URL *or* a path, resolved by scheme through a new `Source` union; the old `_URL` names are a fatal error naming the replacement, not a silent fall back to the default list. Acquisition split from parsing in both blocklists (`load` / `build`), which gave two zero-coverage logic files their first tests. Tests → 131/131, 104 → 113 behavior tests, four mutation-checked. **The point of the pass is a precondition removed, not a feature added:** P2.5's harness has been the largest gap for five snapshots and was blocked on exactly this. Findings: the `*.`-prefix footgun was documented in three files and verified in none (now a test), and `Writer.Allocating.initOwnedSlice` silently yields an empty `written()` — a third independent route to "loads clean, blocks nothing" |
+| 2026-09-08 | ~57.9% | Housekeeping sweep: `parseRdata` fixed + 7 tests, `refAllDecls` guards on all 16 modules, `root.zig` and its module deleted. Tests → 122/122. Bought one new property — `zig build test` now type-checks `main` — and correctly moved the number very little, because compiling is not testing |
 | 2026-09-05 | ~50.2% | P3.2 upstream record parsing: [resource_record.zig](../src/dns/resource_record.zig), a pull-based iterator wired into `dispatcherLoop` as a read-only observer — the name reader's first datapath caller. Tests → 69/69 (66 real), second fuzz target. **Two guards from the plan were not built** (TC=1 and QDCOUNT≠1 skips). The pass's real value was again a *finding*: **`parseRdata` does not compile** and four merged PRs plus CI never noticed, because nothing calls it. Lazy analysis, round two — and this time `zig build` does not catch it either |
 
 *Add a row per review pass. If the number doesn't move, that is itself the finding — the
 coverage count sat still from 2026-07-27 to 2026-08-08 and nobody noticed until it was
 written down.*
 
-*Three passes in a row (08-10, 09-05, 09-05 pm) delivered a finding at least as valuable as
-the feature, and all three were the same shape: **something assumed to be checked that was
-not.** First the default config nobody had booted; then `parseRdata`, which the compiler was
-assumed to be checking; then four cache tests that were assumed to be asserting. The pattern
-is now well enough established to act on rather than note — the question to open the next
-pass with is not "what is left to build" but "what do we believe is verified, and what
+*Four passes in a row (08-10, 09-05, 09-05 pm, 09-11) delivered a finding at least as
+valuable as the feature, and all four were the same shape: **something assumed to be checked
+that was not.** First the default config nobody had booted; then `parseRdata`, which the
+compiler was assumed to be checking; then four cache tests that were assumed to be asserting;
+then the `*.`-prefix footgun, warned about in three documents and verified by none. The
+pattern is now well enough established to act on rather than note — the question to open the
+next pass with is not "what is left to build" but "what do we believe is verified, and what
 actually verifies it?"*
+
+*Asked of the current board, that question has an uncomfortable answer: **the entire
+coroutine layer.** `handleQuery`, `dispatcherLoop`, the ingress loop and `supervise` are
+believed correct on the strength of hand-driven `dig` runs from 08-09, and nothing since has
+re-checked them — while P3.3 added four call sites to two of them. That is the same bet the
+four findings above all lost. It is also precisely what P2.5 verifies, which is the argument
+for building it next rather than after the next feature.*

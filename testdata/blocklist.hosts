@@ -1,0 +1,19 @@
+# Exact-match blocklist fixture, hosts format.
+#
+# Point VORTEX_BLOCKLIST_SOURCE at this file to start Vortex without the ~25s
+# HTTP fetch of the real StevenBlack list. Every name below is under a domain
+# RFC 2606 / RFC 6761 reserve for documentation and testing, so none of them can
+# ever collide with a real lookup.
+#
+# The unit tests in src/blocklist/domain_blocklist.zig parse literals, not this
+# file. It exists to be run against — by hand today, and by the P2.5 integration
+# harness once that lands.
+
+127.0.0.1 localhost
+::1 localhost
+
+0.0.0.0 ads.example.com
+0.0.0.0 tracker.example.com
+0.0.0.0 analytics.example.org
+0.0.0.0 telemetry.example.net
+0.0.0.0 blocked.test
