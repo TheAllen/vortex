@@ -86,6 +86,67 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
 
+    // ── Integration tests ──────────────────────────────────────────────────
+    //
+    // A *second* test artifact, deliberately. Everything in `exe_tests` is a
+    // pure function over bytes; nothing there opens a socket. What these cover
+    // is the layer that unit tests structurally cannot reach — `handleQuery`,
+    // `dispatcherLoop` and the ingress loop are socket plumbing, so the only
+    // way to exercise them is to run the real binary and talk to it over UDP.
+    // See next_steps.md P2.5.
+    //
+    // They therefore need a built `vortex` to spawn and a blocklist pair to
+    // point it at. Both arrive as build options rather than as hardcoded
+    // relative paths, so the tests do not depend on the build runner's cwd and
+    // `addOptionPath` registers the artifact dependency for us — asking for
+    // `test-integration` builds the exe first, automatically.
+    const integration_options = b.addOptions();
+    integration_options.addOptionPath("vortex_exe", exe.getEmittedBin());
+    integration_options.addOptionPath("blocklist_path", b.path("testdata/blocklist.hosts"));
+    integration_options.addOptionPath("suffix_blocklist_path", b.path("testdata/suffix.txt"));
+
+    // A case costs a process spawn and, for the two timeout cases, six seconds
+    // of waiting — so running one at a time is worth an option. It is also what
+    // makes these assertions checkable by mutation: break a rule in `src/`,
+    // rerun the single case that should notice, and confirm it does. That is
+    // the discipline the cache work established after mutation testing found
+    // four assertions that could not fail; see next_steps.md P2.5.
+    //
+    //     zig build test-integration -Dtest-filter="TC=1"
+    //
+    // Zig's filter is a *compile-time* property of the test artifact, not a
+    // runtime flag, which is why it arrives as a build option rather than after
+    // a `--`.
+    const test_filter = b.option(
+        []const u8,
+        "test-filter",
+        "Run only integration cases whose name contains this substring",
+    );
+
+    const integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = if (test_filter) |f| &.{f} else &.{},
+    });
+    integration_tests.root_module.addOptions("build_options", integration_options);
+
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+
+    // Each case binds real ports and spawns a real process, so a cached "it
+    // passed last time" is not evidence the current tree passes. Force the run.
+    run_integration_tests.has_side_effects = true;
+
+    const integration_step = b.step("test-integration", "Run the integration harness (spawns the binary)");
+    integration_step.dependOn(&run_integration_tests.step);
+
+    // `zig build test` runs both. The harness is the only coverage the
+    // coroutine layer has; leaving it off the default test step is how it
+    // would quietly stop being run.
+    test_step.dependOn(&run_integration_tests.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

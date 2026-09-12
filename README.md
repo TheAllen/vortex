@@ -154,8 +154,9 @@ actually move it.
 QDCOUNT), QName case normalization, cacheable SOA on blocked answers, replies
 verified against the question that provoked them, SERVFAIL on upstream timeout,
 and TC=1 rather than silent corruption when a reply overflows the receive buffer.
-`zig build test` runs 122 tests, 120 asserting real behavior, under both Debug and
-ReleaseSafe.
+Every one of those is now asserted end to end against the running binary, not just
+against the pure function behind it. `zig build test` runs **143 tests** — 131 unit
+tests plus 12 integration cases — under both Debug and ReleaseSafe.
 
 **Responses are cached, with honest TTLs.** The compression → parsing → caching
 chain is complete: pointer following (P3.1), the record walk (P3.2), and a
@@ -178,17 +179,19 @@ shutdown, metrics, and blocklist refresh with an on-disk cache — today a faile
 fetch at startup is fatal. [`docs/next_steps.md`](docs/next_steps.md) is the
 full prioritized board.
 
-The largest *testing* gap is a different shape: every one of the 122 tests is over
-a pure function, so `handleQuery`, `dispatcherLoop` and the ingress loop have no
-runtime coverage of any kind — and caching just made both of them more complex.
-That needs an integration harness (P2.5), which needs a local-file blocklist
-source first so startup does not cost 25s per case.
+The testing gap that used to sit here is closed. The 131 unit tests are all over
+pure functions, which left `handleQuery`, `dispatcherLoop` and the ingress loop
+with no runtime coverage at all — the two functions where this project's last two
+real bugs lived. As of 2026-09-12 [`tests/`](tests/) spawns the real binary
+against a scratch config and a fake upstream and drives it over UDP: 12 cases,
+every one confirmed to fail when the behavior it covers is deliberately broken.
 
-They are at least *compiled* now: as of 2026-09-08 every module carries a
-`std.testing.refAllDecls` guard, and the one on `main.zig` reaches the whole
-coroutine layer. That retired a real caveat — `zig build test` used to report
-zero errors on code that could not build — but compiling is not testing, and
-these are the two functions where this project's last two real bugs lived.
+`zig build test` runs both suites (143 tests); `zig build test-integration` runs
+just the harness, and `-Dtest-filter=<substr>` narrows it to a single case.
+
+What is *not* covered there is concurrency — every case is one query at a time —
+which is the same gap P1.5 names above, and the harness is where a cap on
+in-flight handlers would get asserted once one exists.
 
 ## Documentation
 

@@ -9,6 +9,154 @@ Newest first. Open work lives in [next_steps.md](next_steps.md).
 
 ---
 
+## Landed 2026-09-12 — P2.5 integration harness
+
+The coroutine layer has automated coverage for the first time. `handleQuery`, `dispatcherLoop`
+and the ingress loop are exercised end to end by spawning the real binary, driving it with
+crafted UDP, and asserting on what comes back — the eight manual `dig` runs from the P2.5
+table, written down and made repeatable, plus four more.
+
+`zig build test` → **143/143 pass** (131 → 143): the existing 131 unit tests plus **12
+integration cases**. `zig fmt --check` clean, and CI needed no edit — `zig build test`
+depends on the new step, so the harness runs on both the Debug and ReleaseSafe jobs.
+
+### Three files, and why `tests/` imports nothing from `src/`
+
+| File | Role |
+|---|---|
+| [tests/wire.zig](../tests/wire.zig) | A second, independent DNS encoder/decoder |
+| [tests/harness.zig](../tests/harness.zig) | Spawns a Vortex, owns both ends of its fake upstream |
+| [tests/integration.zig](../tests/integration.zig) | The 12 cases |
+
+`wire.zig` deliberately shares no code with `src/dns`. A harness that built its
+expectations with `Header.writeResponseFlags` would agree with a *byte-swapped*
+`Header.writeResponseFlags`, and the golden-bytes discipline from C2 exists precisely
+because that class of bug survives any test that recomputes its expectation from the
+constants the code uses. Two independent encoders agreeing is evidence; one encoder
+checked against itself is not.
+
+It is also allowed to be dumb: one question, uncompressed names, A records. When a case
+needs more, it grows — it does not reach into `src/dns`.
+
+### One Vortex per case
+
+Each case spawns its own child. That is affordable only because P2.1 landed: startup
+against the `testdata/` fixtures is milliseconds rather than the ~25 s two HTTP fetches
+used to cost. What it buys is that nothing leaks between cases — not a cache entry, not a
+pending-table slot, not a port — so no case depends on the order the runner picks.
+
+The cache is **off** unless the case is about the cache (`VORTEX_CACHE_MAX_ENTRIES=0`).
+Otherwise "did this query reach the upstream?" quietly becomes a question about what ran
+before it.
+
+**Hermeticity.** The child's environment contains exactly one variable, `VORTEX_ENV_FILE`,
+pointing at a scratch file the harness writes into a temp dir. It does not inherit the
+developer's environment and never reads the repo's own `.env`, so a `VORTEX_*` export in a
+shell cannot change what these tests exercise. Config goes through the file rather than the
+environment so the dotenv path in `Settings.load` is covered too — the path an operator
+actually uses, and one that had no end-to-end coverage before.
+
+**Readiness is probed through the datapath**, not by matching the `listening=` log line. A
+log line says a socket is bound; a reply says the blocklists finished loading and the
+ingress loop is running, which is the condition every case actually depends on. The probe
+asks for a name the fixtures *block*, so it is answered locally and the fake upstream never
+sees it — a probe that had to be forwarded would leave pending-table entries for the case to
+trip over. It also gets its own socket, so a late probe reply cannot be mistaken for the
+reply a case is asserting on.
+
+**One acknowledged race.** Vortex binds its own listen port and reports the resolved port
+nowhere a test can read, so the harness picks one by binding port 0 and releasing it. The
+fake upstream has no such problem — it stays bound, and `Socket.address` carries what the OS
+chose. Closing the gap properly means having Vortex report its bound port; until then, a
+lost race shows up as a clean "did not start", never as a wrong answer.
+
+### The 12 cases
+
+Everything in the P2.5 table except the supervisor backoff, which `backoffSeconds` already
+covers as a pure function and which cannot be observed from outside the process:
+
+| Case | Asserts |
+|---|---|
+| Normal forward | question echoed verbatim upstream, proxy ID ≠ client ID, client ID restored, payload untouched |
+| Exact block | NXDOMAIN, NSCOUNT=1, 34-byte SOA at `0xC00C`, original casing echoed, nothing forwarded |
+| Suffix block | a name three labels below the fixture entry is blocked |
+| Neither list | forwarded rather than blocked |
+| `opcode=IQUERY` | 12-byte NOTIMP, opcode echoed, all four counts zero |
+| QDCOUNT=2 | 12-byte FORMERR |
+| QR=1 | **no reply at all**, and nothing forwarded |
+| 5000-byte query | 12-byte FORMERR, smaller than the query, not forwarded |
+| 5000-byte upstream reply | TC=1 on the relayed prefix |
+| Silent upstream | SERVFAIL, and not before the 5 s deadline |
+| Right ID, wrong question | forgery not relayed **and** the client still gets SERVFAIL |
+| Repeated query | served from cache, no second upstream trip, this client's ID, TTL aged |
+
+Two of those are the reason the harness exists. The TC case and the wrong-question case each
+found a real bug during the manual runs that the entire unit suite passed straight through.
+
+The QR=1 case is worth calling out as a shape: a unit test can assert `validateQuery` returns
+`.is_response`, but only a live socket can prove **nothing was put on the wire** — which is
+the property that matters, because answering a response is what makes a resolver a reflector.
+
+### Mutation-checked, all 12
+
+Following the rule the cache work established after mutation testing found four assertions
+that could not fail: every case was confirmed to fail when the behavior it covers is broken.
+
+| Mutation | Caught by |
+|---|---|
+| Drop the QR=1 check (C3) | QR=1 |
+| Do not restore the client ID | Normal forward |
+| Do not set TC on an overflowed reply | 5000-byte upstream reply |
+| Write NSCOUNT=0 on a blocked reply (C2) | Exact block |
+| `peek` → `complete` before verifying | Right ID, wrong question |
+| Make the question-hash check never fire | Right ID, wrong question |
+| Disable the response cache | Repeated query |
+| Accept a truncated ingress datagram | 5000-byte query |
+| Stop lowercasing the parsed qname (C1) | Exact block |
+| Never sweep expired queries | Silent upstream |
+| Skip the suffix blocklist | Suffix block |
+| Block everything | Neither list |
+
+`-Dtest-filter` was added to [build.zig](../build.zig) for exactly this loop — one case runs
+in ~0.4 s against the suite's 13 s. Zig's filter is a compile-time property of the test
+artifact, not a runtime flag, which is why it is a build option rather than an argument
+after `--`.
+
+**One mutation was thrown away rather than counted.** Deleting the question-hash check
+outright failed to *compile* (`unused local constant`) — a green-looking "caught" that
+proves nothing about the assertion. It was rewritten as a check that compiles and never
+fires, and only then did the case catch it. A mutation that does not build is not a
+mutation.
+
+### The bug the mutation run found was in the harness
+
+The first attempt did not report failures — it **hung**, five-minute timeouts on every
+deliberately-broken build. The cause was `reportChildLog` draining the child's stderr while
+the child was still alive: reading a pipe whose write end is open blocks until EOF, and a
+server that never exits never produces one.
+
+The obvious fix fails the other way. `Child.kill` closes **and nulls** `child.stderr` as part
+of its cleanup, so draining after the kill finds nothing to read. Neither order works alone;
+`stopChild` now does all three steps — detach the file from the child, kill, then read the
+detached handle to the EOF the child's death produced.
+
+Worth recording because of the failure mode, not the fix: **a diagnostic path that deadlocks
+is worse than no diagnostics at all**, since the symptom reads as a slow test rather than a
+broken one. It also says something about the harness's own risk profile — this layer has no
+harness of its own, and the only thing that exercised its failure path was deliberately
+breaking the code under test.
+
+### What this does not cover
+
+* **Concurrency.** Every case is one query at a time. Nothing here exercises many in-flight
+  handlers, which is exactly what P1.5 is about — the harness is the natural place to assert
+  a concurrency cap once there is one to assert on.
+* **The supervisor.** A loop that returns immediately cannot be provoked from outside the
+  process.
+* **Blocklist refresh, graceful shutdown, EDNS0, TCP** — none of which exist yet.
+
+---
+
 ## Landed 2026-09-11 — P2.1 local-file blocklist source
 
 Either blocklist can now be a filesystem path instead of a URL. Small feature, and it was

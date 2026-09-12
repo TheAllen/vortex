@@ -652,8 +652,11 @@ pub fn main(init: std.process.Init) !void {
 
 // Aggregate every module's tests into `zig build test`. A plain `@import` alias
 // (as at the top of this file) does NOT pull an imported file's `test` blocks into
-// the build — only an explicit `_ = @import(...)` reference does. Without this block
-// `zig build test` silently runs only root.zig's stub test. See next_steps.md P2.5.
+// the build — only an explicit `_ = @import(...)` reference does. A file missing from
+// this list keeps every one of its tests, and simply never runs them.
+//
+// Note what this does *not* reach: the integration cases in `tests/`, which are a
+// separate artifact with its own root and are pulled in by `build.zig`, not from here.
 test {
     _ = @import("dns/authority.zig");
     _ = @import("dns/blocked_response.zig");
@@ -683,9 +686,12 @@ test {
 // where `backoffSeconds` returned the wrong integer type and the suite reported
 // 0 errors while `zig build` could not produce a binary at all.
 //
-// This does not make the coroutine layer *tested* — that still needs the P2.5
-// integration harness. It makes it *compiled*, which is a strictly weaker claim
-// and was previously not true either.
+// This makes the coroutine layer *compiled*, which is strictly weaker than
+// tested and was previously not true either. What tests it is the integration
+// harness in [tests/](../tests/), which landed 2026-09-12 and drives this file's
+// three loops over real sockets — the two are complements, not substitutes: the
+// guard catches code that cannot build, the harness catches code that builds and
+// is wrong.
 test "refAllDecls: reaching main type-checks the whole coroutine layer" {
     std.testing.refAllDecls(@This());
 }
