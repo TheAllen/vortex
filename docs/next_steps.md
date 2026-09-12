@@ -1,18 +1,25 @@
 # Next Steps — Road to Production-Ready
 
-Reviewed **2026-09-11** against the current source (Zig 0.16.0, `zig build test` →
-**131/131 pass**, of which 129 are real behavior tests). **No open P0s, and no open P1 bugs** —
-all three P0s are pinned by regression tests that fail under mutation.
+Reviewed **2026-09-12** against the current source (Zig 0.16.0, `zig build test` →
+**143/143 pass** — 131 unit tests, of which 129 are real behavior tests, plus **12
+integration cases**). **No open P0s, and no open P1 bugs** — all three P0s are pinned by
+regression tests that fail under mutation.
 
 **P3.3 response caching landed 2026-09-05**, closing the compression → parsing → caching
 chain. The P3 band is now the EDNS0/TCP remainder rather than the main event.
 
-**The local-file blocklist source landed 2026-09-11**, closing P2.1's last blocking item.
-Either list may now be a path instead of a URL, so startup against the checked-in fixtures
-is instant rather than ~25 s and touches no network. **P2.5's hard prerequisite is
-therefore gone** — the integration harness is the next thing to build, and it is now the
-cheapest large win on this board. The same pass split acquisition from parsing in both
-blocklists, which gave the two files their first tests; see
+**The integration harness landed 2026-09-12**, closing P2.5 and with it the largest gap on
+this board. `handleQuery`, `dispatcherLoop` and the ingress loop now have automated
+coverage: [tests/](../tests/) spawns the real binary against a scratch config, drives it
+with crafted UDP from a fake upstream it owns both ends of, and asserts on the replies. All
+12 cases are mutation-checked. **The "everything ever proven about this layer was proven by
+hand with `dig`" caveat is retired** — see
+[changelog.md](changelog.md#landed-2026-09-12--p25-integration-harness).
+
+**The local-file blocklist source landed 2026-09-11**, which is what made that affordable:
+either list may be a path instead of a URL, so a case costs milliseconds of startup rather
+than ~25 s of HTTP. The same pass split acquisition from parsing in both blocklists, which
+gave the two files their first tests; see
 [changelog.md](changelog.md#landed-2026-09-11--p21-local-file-blocklist-source).
 
 **The housekeeping sweep landed 2026-09-08** and closed the whole Housekeeping backlog:
@@ -31,12 +38,11 @@ as facts rather than chores:
 the three closed P0s in detail, and the shipped P3.1 and P3.2 plans. This file is the board:
 open work only.
 
-The single largest remaining gap is that `handleQuery`, `dispatcherLoop` and the ingress loop
-have **no automated coverage at all**, and cannot get any by extracting another pure
-function, because what is untested is the socket plumbing itself. That needs an integration
-harness (**P2.5**). As of 2026-09-11 nothing blocks it: the local-file blocklist source it
-was waiting on has landed, so a case now costs milliseconds of startup instead of 25
-seconds.
+The single largest remaining gap is now **deployability**, not coverage. What is left is
+almost entirely P2: blocklist resilience (P2.2), bounded concurrency (P1.5), the per-query
+event (P2.3), and the deployment surface (P2.6). The harness that closed the coverage gap is
+also where P1.5 gets asserted once there is a cap to assert on — it is the only thing in the
+tree that can create load.
 
 ## What exists today
 
@@ -78,8 +84,13 @@ seconds.
 - NXDOMAIN synthesis for blocked names, assembled in one pure function
   ([blocked_response.zig](../src/dns/blocked_response.zig)) from `Header.writeResponseFlags`
   plus a cacheable SOA ([authority.zig](../src/dns/authority.zig))
+- An integration harness ([tests/](../tests/)) that spawns the real binary against a scratch
+  config and a fake upstream, covering the ingress loop, `handleQuery` and `dispatcherLoop`
+  end to end over UDP. `zig build test-integration` runs it alone;
+  `-Dtest-filter=<substr>` narrows to one case
 - CI ([.github/workflows/ci.yml](../.github/workflows/ci.yml)) — `zig fmt --check`, build,
-  test, plus a ReleaseSafe job
+  test, plus a ReleaseSafe job. `zig build test` covers both suites, so the harness runs in
+  both jobs
 
 ---
 
@@ -149,7 +160,12 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
    `dispatcherLoop`.
 4. **Graceful shutdown.** No signal handling; the only exit is a crash or Ctrl-C mid-write.
    Catch SIGINT/SIGTERM, `group.cancel`, flush the log, run the deferred deinits.
-5. **Test coverage.** `zig build test` → **131/131, of which 129 are real**: 32 `cache`,
+5. **Test coverage — the harness landed 2026-09-12; what is left is listed below.**
+   `zig build test` → **143/143**: the 131-test unit suite plus **12 integration cases**
+   ([tests/](../tests/), see
+   [changelog.md](changelog.md#landed-2026-09-12--p25-integration-harness)).
+
+   The unit suite is **131/131, of which 129 are real**: 32 `cache`,
    17 `resource_record` (10 walk tests including a fuzz target, plus **7 new `parseRdata`
    tests** from 09-08), 17 `name_reader` (including a fuzz target), 9 `Header`, 8 `obs/log`,
    **8 `settings`** (3 new on 09-11 for `Source.parse` and the rename guard),
@@ -224,42 +240,29 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
      executable, and the ReleaseSafe pair still catches what Debug lets through.
 
    Still missing:
-   - **An integration harness for the coroutine-bound code — the largest gap, and now
-     unblocked.** The 131 tests are almost entirely over pure functions. `handleQuery`,
-     `dispatcherLoop` and the ingress loop have **no runtime coverage of any kind**;
-     since the 09-08 sweep they are at least *compiled* by `zig build test` via the
-     `refAllDecls` guard on `main`, which is a strictly weaker claim. Everything ever
-     proven about their behavior was proven by hand with `dig` and throwaway Python.
+   - ~~**An integration harness for the coroutine-bound code — the largest gap.**~~
+     **Done 2026-09-12.** [tests/](../tests/) spawns the binary against a scratch config and
+     a fake upstream and asserts on the replies. All eight scenarios from the table that used
+     to live here are cases, plus four more (suffix block, the not-blocked counterpart,
+     QDCOUNT≠1, and a cache hit); the one row that did not survive is the supervisor backoff,
+     which cannot be provoked from outside the process and which `backoffSeconds` already
+     covers as a pure function. Every case is mutation-checked. Full detail, including the
+     deadlock the mutation run found *in the harness*, is in
+     [changelog.md](changelog.md#landed-2026-09-12--p25-integration-harness).
 
-     That is a different shape of gap from the rest of this list: it cannot be closed by
-     extracting another pure function, because what is untested *is* the socket plumbing.
-     It needs a harness that spawns the binary against a scratch config, drives it with
-     crafted UDP, and asserts on the replies.
-
-     The manual runs that would become its first cases, and what each one caught:
-
-     | Scenario | Asserts | Caught |
-     |---|---|---|
-     | Normal forward | reply relayed, ID restored | — |
-     | Blocked name | NXDOMAIN + 34-byte SOA, `0xC00C` resolves | — |
-     | `+opcode=IQUERY` | NOTIMP, `QUERY: 0` | — |
-     | 5000-byte query | 12-byte FORMERR, no coroutine spawned | — |
-     | Upstream returns 5000 bytes | TC=1 set on the relayed prefix | the silent-corruption bug |
-     | Upstream never answers | SERVFAIL at ~5.4s, not silence | — |
-     | Upstream echoes right ID, wrong question | reply dropped **and** client still gets SERVFAIL | the peek-vs-complete DoS |
-     | Supervised loop returns immediately | backoff `0→1→2→4→8→16→30`, not a spin | — |
-
-     Two of those found real bugs that every unit test passed straight through, which is the
-     argument for building it.
-
-     **P2.1 is what makes this feasible** — pointing the binary at a fake upstream on a
-     scratch port is now a config file, not a recompile.
-
-     ~~**But there is a hard prerequisite:** startup blocks on fetching two blocklists over
-     HTTP, which took ~25s in every manual run.~~ **Cleared 2026-09-11.** Both
-     `VORTEX_BLOCKLIST_SOURCE` and `VORTEX_SUFFIX_BLOCKLIST_SOURCE` take a local path, and
-     [testdata/](../testdata/) holds a fixture pair sized for exactly this. A case now
-     costs milliseconds of startup. **Nothing is left blocking this item — build it next.**
+     **What the harness still does not cover**, and these are the live items:
+     - **Concurrency.** Every case is one query at a time. Nothing exercises many in-flight
+       handlers — which is P1.5's whole subject, and the harness is where a concurrency cap
+       gets asserted once there is one. It is currently the only thing in the tree that can
+       generate load at all.
+     - **The supervisor.** A loop that returns immediately cannot be provoked from outside.
+       Closing this needs a fault-injection hook in the binary, which is a real design
+       decision (a test-only code path in a resolver) and not obviously worth it.
+     - **Vortex does not report its bound listen port.** The harness therefore picks one by
+       binding port 0 and releasing it, which is a race it cannot close from the outside. The
+       fake upstream has no such problem — it stays bound and reads `Socket.address`. Having
+       the binary log or write its resolved port would remove the last non-determinism in
+       startup, and is worth doing alongside P2.6.
    - ~~`parseDomain`/`parseSuffixDomain` parsing tests.~~ **Done 2026-09-11**, as a
      by-product of splitting `build` (pure, over a byte slice) out of `load` in both
      blocklists. [policy.zig](../src/blocklist/policy.zig) and
@@ -435,14 +438,18 @@ real sinkhole (the Pi-hole / AdGuard Home / Unbound-`local-zone` feature class).
   **"`zig build test` does not type-check `main`" is no longer true.** Verified by
   reintroducing the exact 2026-08-09 `backoffSeconds` regression (`i64` → `u64`), which now
   fails `zig build test` at `main.zig:489`, inside `supervise`. Note this makes that layer
-  *compiled*, not *tested* — a strictly weaker claim, and P2.5 is still what closes the rest.
+  *compiled*, not *tested* — a strictly weaker claim. P2.5's harness, landed 2026-09-12,
+  is what closed the rest.
 - ~~Delete or repurpose the remaining template leftovers~~ **Done 2026-09-08.** `src/root.zig`
   is deleted and the `addModule("vortex")` that rooted it is gone from
   [build.zig](../build.zig) along with the boilerplate walls around it. Nothing imported that
   module, its only test asserted `add(3, 7) == 10`, and it was the first module a reader met
   — so it read as the project's public surface while being template residue. It also cost a
   second test artifact: `zig build test` ran two binaries, one of which existed to run that
-  one stub. **`zig build test` is now a single artifact, 122 tests, 120 of them real.**
+  one stub. **`zig build test` was a single artifact from then until 2026-09-12, 122 tests,
+  120 of them real.** It runs two again now — the second is the integration harness, which
+  needs its own root because it must *not* link `main`, and which earns the artifact the
+  `root.zig` stub never did.
 - ~~`Question.question_str_slice`~~ Already gone from
   [question.zig](../src/dns/question.zig); only this entry still referenced it. Removed
   2026-09-08.
@@ -497,13 +504,13 @@ C3 removed the reflector and P1.2 stopped OOM from being fatal, but nothing yet 
 the number of in-flight handlers a flood can create.
 
 > ⚠️ **This section is stale** and is kept verbatim by request; only this note is maintained.
-> As of 2026-09-11: items 1 and 2 are done (P4.2 landed 08-09, both test suites landed 08-09,
+> As of 2026-09-12: items 1 and 2 are done (P4.2 landed 08-09, both test suites landed 08-09,
 > CI exists), P2.1/P2.3 both shipped, and the P3 track it offers as a *branch* has now been
-> walked end to end — compression 08-13, record parsing 08-30, caching 09-05. The real order
-> is **P2.5's harness (now unblocked, and the largest win on the board), P2.2, P1.5, P2.3's
-> per-query event, then P4.1** — P2.1's local-file blocklist source came off that list on
-> 09-11. Rewriting this section against it is a separate pass, and the case for doing so
-> keeps getting stronger: what is left is almost entirely the deployability block.
+> walked end to end — compression 08-13, record parsing 08-30, caching 09-05. **P2.5's harness
+> landed 09-12 and came off this list**, as P2.1's local-file blocklist source did on 09-11.
+> The real order is now **P2.2, P1.5, P2.3's per-query event, then P4.1**. Rewriting this
+> section against it is a separate pass, and the case for doing so is now as strong as it
+> gets: every item it names is done, and what is left is entirely the deployability block.
 
 For the view from above — how far along the whole project is, which of these bands is worth
 the most per unit of effort, and why "no open P0s" does **not** mean "safe to deploy" — see

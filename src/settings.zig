@@ -632,8 +632,9 @@ test "fromEnviron resolves both blocklist sources" {
     try testing.expectEqualDeep(Settings.defaults.blocklist_source, unset.blocklist_source);
     try testing.expectEqualDeep(Settings.defaults.suffix_blocklist_source, unset.suffix_blocklist_source);
 
-    // The two lists resolve independently: one off disk, one over the network,
-    // which is a combination the P2.5 harness will actually use.
+    // The two lists resolve independently: one off disk, one over the network.
+    // The integration harness leans on the disk half of this for both lists —
+    // see tests/harness.zig.
     try map.put("VORTEX_BLOCKLIST_SOURCE", "./testdata/blocklist.hosts");
     try map.put("VORTEX_SUFFIX_BLOCKLIST_SOURCE", "https://example.com/wild");
     const cfg = try Settings.fromEnviron(&map);

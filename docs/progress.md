@@ -11,6 +11,78 @@ are stated explicitly below so the number can be argued with rather than just qu
 
 ---
 
+## Snapshot — 2026-09-12
+
+> **≈ 60.0% complete** (58.8 → 60.0). One area moved, and it is the one that had been named
+> the largest gap for six straight snapshots.
+>
+> Source: 5,902 lines of Zig across 16 files in `src/` (+7, all comment), plus **1,130 lines
+> across 3 new files in `tests/`**.
+> `zig build test` → **143/143 pass** under both Debug and ReleaseSafe — the 131-test unit
+> suite plus **12 integration cases**.
+>
+> Moved by P2.5's integration harness: **Tests + CI ~80% → ~92%** (+1.2). Nothing else moved,
+> because nothing else changed: not one line of `src/` behavior was edited this pass.
+>
+> **What changed is what the suite is evidence *of*.** Every previous snapshot could say the
+> datapath was tested and mean "the pure functions under it are tested." `handleQuery`,
+> `dispatcherLoop` and the ingress loop had no runtime coverage of any kind, and both of this
+> project's last two real bugs lived there and were found by hand. That sentence is now gone.
+
+### Breakdown
+
+| Area | Weight | Done | Contribution | Notes |
+|---|---:|---:|---:|---|
+| Core query datapath | 30% | ~98% | 29.4 | Unchanged, and deliberately: the code did not change. What changed is confidence in it, which this column does not measure |
+| Operability | 25% | ~33% | 8.25 | Unchanged. Per-query event log, metrics, graceful shutdown, deployment, blocklist refresh all still unbuilt |
+| Protocol completeness | 20% | ~62% | 12.4 | Unchanged. EDNS0, TCP fallback, multi-upstream |
+| Sinkhole feature set | 15% | ~5% | 0.75 | Unchanged |
+| Tests + CI | 10% | ~92% | 9.2 | **+12.** The coroutine layer has coverage for the first time: 12 end-to-end cases, all mutation-checked. Not 100% — concurrency and the supervisor are still unreachable |
+| **Total** | **100%** | | **≈ 60.0** | |
+
+### Why +12 on one area and nothing anywhere else
+
+The harness adds no capability. It cannot make Vortex answer a query it could not answer
+yesterday. Scoring it anywhere but Tests + CI would be double-counting work that already
+scored when the datapath was built.
+
+**What it buys is that the other four columns can now be trusted.** Six snapshots running,
+this file has recorded a variant of *"131 passing tests and zero of them start the binary."*
+Both of the last two real bugs — the silent-corruption bug on an oversized upstream reply,
+and the peek-vs-complete DoS where rejecting a forgery killed the live query — were found by
+driving sockets by hand, and every unit test passed straight through both. Those two runs are
+now cases 9 and 11.
+
+The remaining 8% is specific, not a rounding allowance:
+
+- **Concurrency is untested.** Every case is one query at a time. This is the same gap P1.5
+  names, and the harness is where a cap gets asserted once one exists — it is now the only
+  thing in the tree that can generate load.
+- **The supervisor is unreachable from outside.** A loop that returns immediately cannot be
+  provoked across a process boundary. Closing it means a fault-injection path in the binary,
+  which is a real design decision rather than a chore.
+- **Vortex does not report its bound listen port**, so the harness picks one by binding port 0
+  and releasing it. That race cannot be closed from the outside; having the binary report its
+  resolved port would remove the last non-determinism in startup, and belongs with P2.6.
+
+### The finding worth keeping
+
+The mutation run — 12 mutations, one per case, each confirming the case fails when the rule
+is broken — did not find a bug in `src/`. All 12 were caught. **It found a deadlock in the
+harness itself**: the diagnostic path drained the child's stderr while the child was still
+alive, and reading a pipe whose write end is open blocks until EOF, which a server that never
+exits never produces. Every deliberately-broken build hung for the full timeout instead of
+reporting a failure.
+
+Two things follow. First, **a diagnostic path that deadlocks is worse than no diagnostics**,
+because the symptom reads as a slow test rather than a broken one. Second, and more
+uncomfortable: the harness is now load-bearing test infrastructure with **no harness of its
+own**, and the only thing that exercised its failure path was deliberately breaking the code
+under test. Mutation testing earned its keep twice this pass — once as intended, and once by
+catching the tool.
+
+---
+
 ## Snapshot — 2026-09-11
 
 > **≈ 58.8% complete** (57.9 → 58.8). Roughly one point for a 424-line feature, which
@@ -362,10 +434,11 @@ Two findings came out of it, and the second has not been fixed:
 
 P2.2 therefore stays at the top of the deployability block, above P2.6 and P2.4.
 
-It is also a comment on the test suite: **131 passing tests and zero of them start the
-binary.** P2.5's integration harness would have caught the 404 on the first run — and its
-blocker was *local file paths as a blocklist source*, which **landed 2026-09-11**. That half
-is done; the cache-file half of P2.2 is not, and the prediction that "one change closes both"
+It was also a comment on the test suite: **131 passing tests and zero of them start the
+binary.** That is no longer true as of 2026-09-12 — the harness starts the binary 12 times
+per run, and would have caught the 404 on the first one. Its blocker, *local file paths as a
+blocklist source*, landed 2026-09-11. Both of those halves are done; the cache-file half of
+P2.2 is not, and the prediction that "one change closes both"
 turned out to be half right. The file-reading machinery a cache file needs now exists
 (`readFileInto`, shared by both lists), so P2.2's remaining work is the write-on-success side
 and a refresh strategy, not the plumbing.
@@ -400,7 +473,7 @@ Six items, and together they're the difference between a toy and a tool. **One i
 |---|---|
 | ~~P2.1 config~~ ✅ 08-09, local-file source ✅ 09-11 | Was the gate on all of these; listen address is now runtime, and either blocklist can be a path |
 | ~~P1.1 / P1.2 / P1.3 / P1.4 / P4.2~~ ✅ 08-09 | Datapath closed out; P1.5 is the only P1 left |
-| **P2.5 integration harness** | **New top of this list as of 09-11.** Not in this band originally, but it is now unblocked, it is the largest gap on the board, and both of the last two real bugs were found only by driving sockets. Build it before the rest — everything below ships safer with it in place |
+| ~~**P2.5 integration harness**~~ ✅ 09-12 | Topped this list for one pass and came off it. 12 end-to-end cases, all mutation-checked. It was here because both of the last two real bugs were found only by driving sockets; everything below now ships with it in place, which was the point |
 | **P2.2 blocklist cache + refresh** | The 404 that proved it was fixed by swapping in another hard-coded URL, which re-armed the same trap against a different host — one that rate-limits. Its file-reading half now exists; see [the counterweight that retired](#the-counterweight-that-retired-the-default-config-boots-again) |
 | P1.5 concurrency cap | Gate for leaving localhost |
 | P2.7 rate limiting | Gate for leaving localhost |
@@ -431,16 +504,16 @@ DNS" — the branch [next_steps.md](next_steps.md) flags at the end of its Sugge
 
 ## Where the code actually is
 
-Regenerated from `wc -l` on 2026-09-11. Test counts exclude each file's `refAllDecls`
-guard, so this column is **behavior tests only** and will not sum to the 131 the runner
+Regenerated from `wc -l` on 2026-09-12. Test counts exclude each file's `refAllDecls`
+guard, so this column is **behavior tests only** and will not sum to the 131 the unit runner
 reports.
 
 ```
-5,895 lines of Zig, 16 files
+src/ — 5,902 lines of Zig, 16 files
 
 src/dns/cache.zig                1215  key + context, entry, map, TTL policy         31 tests
-src/main.zig                      731  ingress, handleQuery, dispatcher, supervisor   1 test   <- +1 no-op, +1 aggregator
-src/settings.zig                  681  runtime config: .env parse, precedence, Source 8 tests
+src/main.zig                      737  ingress, handleQuery, dispatcher, supervisor   1 test   <- +1 no-op, +1 aggregator
+src/settings.zig                  682  runtime config: .env parse, precedence, Source 8 tests
 src/dns/resource_record.zig       624  RR walk, iterator, rdata types                17 tests
 src/obs/log.zig                   494  logfmt logFn, escaping writer, level + format  8 tests
 src/dns/header.zig                412  parse, validateQuery, reply builders           9 tests
@@ -454,7 +527,19 @@ src/blocklist/allowlist.zig        99  comptime allowlist                       
 src/dns/authority.zig              69  34-byte synthetic SOA                          0 tests
 src/utility.zig                    57  Context                                        0 tests
 src/blocklist/policy.zig           50  allow -> exact -> suffix chain                 0 tests  <- logic, no tests
+
+tests/ — 1,130 lines of Zig, 3 files                                            <- new 09-12
+
+tests/integration.zig             455  the 12 end-to-end cases                       12 tests
+tests/harness.zig                 395  child process, fake upstream, scratch config   0 tests
+tests/wire.zig                    280  independent DNS encode/decode for assertions   0 tests
 ```
+
+`tests/` is a second artifact with its own root, and it must be: it deliberately does **not**
+link `main`. `wire.zig` shares no code with `src/dns` for the same reason the golden-bytes
+tests spell their expectations out as literals — an assertion built with the encoder it is
+checking would agree with a byte-swapped encoder. `harness.zig` carries no tests of its own,
+which is noted in the snapshot above as a real risk rather than an oversight.
 
 `cache.zig` arrives as the largest file in the project at 1,215 lines, which deserves the
 same raised eyebrow `obs/log.zig` got at 478. Roughly half is comment and a further third is
@@ -516,6 +601,7 @@ P2.5's harness would look.
 | 2026-08-10 (pm) | ~44.5% | P2.3 phase 2: `VORTEX_LOG_LEVEL` (incl. `off`) and `VORTEX_LOG_FORMAT` (`auto`/`logfmt`/`text`), both fail-loud on a bad value; closed P2.1's deferred `log level` field. Tests → 40/40 (37 real). Also a process finding: `zig build test` **passed while `zig build` failed** — lazy analysis never reached code only `main` calls, so the test step alone does not prove the binary compiles |
 | 2026-08-13 | ~47.1% | P3.1 compression pointer following: [name_reader.zig](../src/dns/name_reader.zig) with a strictly-backwards rule *plus* a 64-jump cap (the cap turned out to be load-bearing, not decorative), the project's first fuzz target, and `DomainName` deleted along with its allocator. Tests → 59/59 (58 real). Shipped with no datapath caller by design |
 | 2026-09-05 (pm) | ~57.4% | **P3.3 TTL-aware response caching** — [cache.zig](../src/dns/cache.zig), keyed on `(qname, qtype, qclass)` with a hand-written hash context, TTLs aged on the way out per RFC 2181 §5.2, RFC 2308 negative caching, OPT excluded throughout. Tests → 101/101 (98 real), 69 → 101. Closes the compression → parsing → caching chain and the largest single feature on the board. Two bugs caught during the build (an overlapping `@memcpy`, a get/age race), and **four vacuous tests found by mutation** — each because the fixture was built to be realistic rather than to discriminate. First module to carry `refAllDecls` |
+| 2026-09-12 | ~60.0% | **P2.5 integration harness.** [tests/](../tests/) spawns the real binary against a scratch `.env` and a fake upstream it owns both ends of, and drives it over UDP: 12 cases covering forwarding, exact and suffix blocking, all three ingress rejections, both oversize paths, the upstream timeout, a forged reply, and a cache hit. `zig build test` → 143/143; `-Dtest-filter` narrows to one case in ~0.4 s. **No `src/` behavior changed** — the pass adds evidence, not capability, which is why only Tests + CI moved. All 12 cases mutation-checked, and the one mutation that failed to *compile* was rewritten rather than counted. Findings: the mutation run caught no bug in `src/` and one deadlock in the harness's own diagnostic path — `Child.kill` closes and nulls `child.stderr`, so a drain must detach the pipe *before* the kill and read it *after* |
 | 2026-09-11 | ~58.8% | **P2.1 local-file blocklist source.** `VORTEX_BLOCKLIST_SOURCE` / `VORTEX_SUFFIX_BLOCKLIST_SOURCE` take a URL *or* a path, resolved by scheme through a new `Source` union; the old `_URL` names are a fatal error naming the replacement, not a silent fall back to the default list. Acquisition split from parsing in both blocklists (`load` / `build`), which gave two zero-coverage logic files their first tests. Tests → 131/131, 104 → 113 behavior tests, four mutation-checked. **The point of the pass is a precondition removed, not a feature added:** P2.5's harness has been the largest gap for five snapshots and was blocked on exactly this. Findings: the `*.`-prefix footgun was documented in three files and verified in none (now a test), and `Writer.Allocating.initOwnedSlice` silently yields an empty `written()` — a third independent route to "loads clean, blocks nothing" |
 | 2026-09-08 | ~57.9% | Housekeeping sweep: `parseRdata` fixed + 7 tests, `refAllDecls` guards on all 16 modules, `root.zig` and its module deleted. Tests → 122/122. Bought one new property — `zig build test` now type-checks `main` — and correctly moved the number very little, because compiling is not testing |
 | 2026-09-05 | ~50.2% | P3.2 upstream record parsing: [resource_record.zig](../src/dns/resource_record.zig), a pull-based iterator wired into `dispatcherLoop` as a read-only observer — the name reader's first datapath caller. Tests → 69/69 (66 real), second fuzz target. **Two guards from the plan were not built** (TC=1 and QDCOUNT≠1 skips). The pass's real value was again a *finding*: **`parseRdata` does not compile** and four merged PRs plus CI never noticed, because nothing calls it. Lazy analysis, round two — and this time `zig build` does not catch it either |
