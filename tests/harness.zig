@@ -63,6 +63,45 @@ pub const Options = struct {
     /// make a second identical query skip the upstream and quietly invalidate
     /// the assertion.
     cache_max_entries: usize = 0,
+
+    /// Blocklist sources. Default to the checked-in fixtures; a P2.2 case
+    /// overrides one to point at a scratch file it rewrites mid-test, or at a
+    /// URL nothing is listening on.
+    blocklist_source: ?[]const u8 = null,
+    suffix_blocklist_source: ?[]const u8 = null,
+
+    /// `VORTEX_BLOCKLIST_ON_FAILURE`. Null leaves it unset, so the case
+    /// exercises the shipped default rather than a value the harness chose.
+    on_failure: ?[]const u8 = null,
+
+    /// Seconds between blocklist refreshes. 0 — the harness default, not the
+    /// binary's — because a case that is not about refresh should not have a
+    /// coroutine rebuilding lists underneath it.
+    refresh_secs: usize = 0,
+
+    /// On-disk blocklist cache directory. Empty disables it, which is the
+    /// default here: a case that fell back to a cache left by a *previous* case
+    /// would pass for the wrong reason. Cases about the cache set it to a path
+    /// inside their own scratch directory.
+    cache_dir: []const u8 = "",
+
+    /// How `start` decides the child is up. See `Readiness`.
+    readiness: Readiness = .blocked_probe,
+};
+
+/// How to tell that a child is ready to serve.
+///
+/// The default probe asks for a name the fixtures block and waits for the
+/// locally synthesized answer. That is the strongest signal available — it
+/// proves the blocklists loaded *and* the ingress loop is running — but it
+/// assumes a loaded blocklist, which is exactly what a fail-open case does not
+/// have. Such a case forwards everything instead, so it needs the other probe.
+pub const Readiness = enum {
+    /// Query a blocked name; ready when the synthesized reply comes back.
+    blocked_probe,
+    /// Query any name; ready when it shows up at the fake upstream. For a child
+    /// running with an empty blocklist, where nothing is answered locally.
+    forwarded_probe,
 };
 
 pub const Instance = struct {
@@ -117,7 +156,7 @@ pub const Instance = struct {
         const env_path = try writeEnvFile(io, gpa, &tmp, .{
             .listen_port = listen_port,
             .upstream_port = upstream.address.getPort(),
-            .cache_max_entries = opts.cache_max_entries,
+            .opts = opts,
         });
         defer gpa.free(env_path);
 
@@ -145,7 +184,7 @@ pub const Instance = struct {
             .tmp = tmp,
         };
 
-        try instance.waitUntilReady();
+        try instance.waitUntilReady(opts.readiness);
         return instance;
     }
 
@@ -194,6 +233,21 @@ pub const Instance = struct {
             .{got.data.len},
         );
         return error.UnexpectedUpstreamQuery;
+    }
+
+    /// Answers and discards everything already queued at the fake upstream.
+    ///
+    /// Used to clear readiness-probe traffic before a case starts asserting.
+    /// Each datagram is answered rather than dropped so nothing is left in the
+    /// child's pending table to be swept — and swept entries produce SERVFAILs
+    /// that would arrive at the client socket mid-case.
+    pub fn drainUpstream(self: *Instance) void {
+        var buf: [wire.max_message]u8 = undefined;
+        while (self.recvUpstream(&buf, 50)) |stale| {
+            var reply_buf: [wire.max_message]u8 = undefined;
+            const reply = wire.reply(&reply_buf, stale.data, .{}) catch continue;
+            self.upstream.send(self.io, &stale.from, reply) catch {};
+        } else |_| {}
     }
 
     /// Asserts that Vortex sends the client nothing within `timeout_ms`.
@@ -280,7 +334,7 @@ pub const Instance = struct {
     /// synthesized locally and the fake upstream never sees it. A probe that
     /// had to be forwarded would leave entries in the pending table for the
     /// case to trip over.
-    fn waitUntilReady(self: *Instance) !void {
+    fn waitUntilReady(self: *Instance, readiness: Readiness) !void {
         // Its own socket, so that a late probe reply — one that arrives after
         // readiness was already established — lands here and is discarded with
         // the socket, rather than sitting in the case's client socket waiting
@@ -290,7 +344,11 @@ pub const Instance = struct {
         defer probe.close(self.io);
 
         var out: [wire.max_message]u8 = undefined;
-        const msg = wire.query(&out, 0x0BEE, ready_probe_name, .{});
+        const name = switch (readiness) {
+            .blocked_probe => ready_probe_name,
+            .forwarded_probe => forwarded_probe_name,
+        };
+        const msg = wire.query(&out, 0x0BEE, name, .{});
 
         var in: [wire.max_message]u8 = undefined;
         var waited_ms: u64 = 0;
@@ -302,15 +360,46 @@ pub const Instance = struct {
             // receive.
             probe.send(self.io, &self.listen_addr, msg) catch {};
 
-            const got = probe.receiveTimeout(self.io, &in, durationTimeout(probe_interval_ms)) catch |err| switch (err) {
-                error.Timeout => continue,
-                // Nothing is bound on that port yet and the kernel bounced the
-                // datagram with an ICMP port-unreachable. Expected on the first
-                // round or two; a child that never comes up times out below.
-                error.PortUnreachable => continue,
-                else => return err,
-            };
-            if (got.data.len >= 12 and wire.id(got.data) == 0x0BEE) return;
+            switch (readiness) {
+                .blocked_probe => {
+                    const got = probe.receiveTimeout(self.io, &in, durationTimeout(probe_interval_ms)) catch |err| switch (err) {
+                        error.Timeout => continue,
+                        // Nothing is bound on that port yet and the kernel bounced the
+                        // datagram with an ICMP port-unreachable. Expected on the first
+                        // round or two; a child that never comes up times out below.
+                        error.PortUnreachable => continue,
+                        else => return err,
+                    };
+                    if (got.data.len >= 12 and wire.id(got.data) == 0x0BEE) return;
+                },
+                .forwarded_probe => {
+                    // Ready when the probe reaches the fake upstream — which is
+                    // the only signal available to a child whose blocklist is
+                    // empty, since it answers nothing locally.
+                    const got = self.upstream.receiveTimeout(self.io, &in, durationTimeout(probe_interval_ms)) catch |err| switch (err) {
+                        error.Timeout => continue,
+                        error.PortUnreachable => continue,
+                        else => return err,
+                    };
+
+                    // Answered rather than dropped, so the probe does not leave
+                    // an entry in the pending table for the case to trip over
+                    // when it sweeps five seconds later.
+                    var reply_buf: [wire.max_message]u8 = undefined;
+                    const reply = wire.reply(&reply_buf, got.data, .{}) catch return;
+                    self.upstream.send(self.io, &got.from, reply) catch {};
+
+                    // The probe is resent every round, and every round's copy
+                    // that was sent *before* the child came up may still be in
+                    // flight behind this one. Left queued, the case's first
+                    // `recvUpstream` would hand back a probe instead of the
+                    // query it just sent, and it would then answer the wrong
+                    // question — a failure that looks like a lost reply and is
+                    // maddening to read. So drain the backlog before returning.
+                    self.drainUpstream();
+                    return;
+                },
+            }
         }
 
         std.debug.print(
@@ -322,14 +411,161 @@ pub const Instance = struct {
     }
 };
 
+/// Spawns a Vortex that is expected to fail at startup, and reports how it went.
+///
+/// The counterpart to `Instance.start`, for the one case that is about *not*
+/// coming up: fail-closed. `start` would sit in its readiness loop for ten
+/// seconds and then report a timeout, which is a much weaker assertion than
+/// "exited, with this status, saying this".
+///
+/// The caller owns `stderr`.
+pub fn runUntilExit(io: Io, gpa: std.mem.Allocator, opts: Options) !ExitResult {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A child that is meant to die during blocklist loading never binds either
+    // port, but the config still has to name them — and naming a port nothing
+    // reserved keeps this from stealing one a live case is using.
+    const env_path = try writeEnvFile(io, gpa, &tmp, .{
+        .listen_port = try reserveEphemeralPort(io),
+        .upstream_port = try reserveEphemeralPort(io),
+        .opts = opts,
+    });
+    defer gpa.free(env_path);
+
+    var environ: std.process.Environ.Map = .init(gpa);
+    defer environ.deinit();
+    try environ.put("VORTEX_ENV_FILE", env_path);
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{build_options.vortex_exe},
+        .environ_map = &environ,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .pipe,
+    });
+    errdefer child.kill(io);
+
+    // Drained before the wait, not after. The child's stderr is a pipe, and
+    // waiting on a process that is still writing into a pipe nobody is reading
+    // deadlocks once the buffer fills — the same trap `stopChild` documents,
+    // arrived at from the other direction. This drain also *is* the exit
+    // signal: the read hits EOF when the child's last stderr handle closes.
+    var stderr: std.ArrayList(u8) = .empty;
+    errdefer stderr.deinit(gpa);
+    if (child.stderr) |file| {
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            const n = file.readStreaming(io, &.{&chunk}) catch break;
+            if (n == 0) break;
+            try stderr.appendSlice(gpa, chunk[0..n]);
+        }
+    }
+
+    return .{
+        .term = try waitBounded(io, &child),
+        .stderr = try stderr.toOwnedSlice(gpa),
+    };
+}
+
+/// Longest `runUntilExit` waits for a child that is supposed to be dying.
+///
+/// Generous against the real figure — a fail-closed child gives up after three
+/// connection-refused attempts, about three seconds — because this is a "something
+/// is wrong" bound, not a timing assertion.
+const exit_timeout_ms = 15_000;
+
+/// `Child.wait`, but it cannot hang forever.
+///
+/// A plain `wait` on a child that never exits blocks the test process until the
+/// build runner's own timeout, and the symptom is a slow suite rather than a
+/// failure — which is exactly the trap documented on `stopChild`, met from the
+/// other side. It matters most during a mutation run: a mutation that breaks
+/// fail-closed makes the child *keep running*, and a case that hangs instead of
+/// failing cannot confirm anything about the rule it was written for.
+///
+/// So the wait races a timer. If the timer wins, the child is killed — which
+/// unblocks the wait — and the resulting `.signal` term is reported honestly,
+/// where `ExitResult.failed` reads it as "did not exit on its own".
+fn waitBounded(io: Io, child: *std.process.Child) !std.process.Child.Term {
+    const Outcome = union(enum) {
+        waited: std.process.Child.WaitError!std.process.Child.Term,
+        expired: void,
+    };
+
+    // Captured before the wait task starts, because `Child.wait` nulls this
+    // field when it reaps. The timeout path below needs the pid and must not
+    // read it out of `child` while another task is writing it.
+    const pid = child.id orelse return error.ChildAlreadyReaped;
+
+    var buffer: [2]Outcome = undefined;
+    var select: Io.Select(Outcome) = .init(io, &buffer);
+
+    // Concurrent, not async: `wait` blocks in a syscall, so it needs a unit of
+    // concurrency of its own or the timer below never gets to run.
+    try select.concurrent(.waited, std.process.Child.wait, .{ child, io });
+    select.async(.expired, sleepIgnoringCancel, .{ io, exit_timeout_ms });
+
+    switch (try select.await()) {
+        .waited => |result| {
+            select.cancelDiscard();
+            return result;
+        },
+        .expired => {
+            // Signalled by pid rather than through `Child.kill`, which would
+            // reap the process itself and race the `wait` already in flight on
+            // it — two reapers, one of which finds the child gone. This way the
+            // wait task stays the only reaper: the signal simply unblocks it,
+            // and it reports the `.signal` term on its own.
+            std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+
+            const reaped = try select.await();
+            select.cancelDiscard();
+            return switch (reaped) {
+                .waited => |result| result,
+                .expired => unreachable, // the timer already fired
+            };
+        },
+    }
+}
+
+fn sleepIgnoringCancel(io: Io, ms: u64) void {
+    io.sleep(Io.Duration.fromMilliseconds(@intCast(ms)), Io.Clock.boot) catch {};
+}
+
+pub const ExitResult = struct {
+    term: std.process.Child.Term,
+    stderr: []u8,
+
+    pub fn deinit(self: *ExitResult, gpa: std.mem.Allocator) void {
+        gpa.free(self.stderr);
+        self.* = undefined;
+    }
+
+    /// True when the child exited on its own with a failure status — which is
+    /// what "refused to start" looks like from out here, as distinct from a
+    /// crash (a signal) or a clean exit.
+    pub fn failed(self: ExitResult) bool {
+        return switch (self.term) {
+            .exited => |code| code != 0,
+            else => false,
+        };
+    }
+};
+
 /// Blocked by `testdata/blocklist.hosts`, so the reply is synthesized and no
 /// upstream round trip is involved. Under `.test`, which RFC 6761 reserves.
 const ready_probe_name = "blocked.test";
 
+/// Deliberately *not* on either fixture list, so it is forwarded even by a
+/// child whose blocklist loaded normally — the probe means the same thing
+/// whether or not the case is a fail-open one.
+const forwarded_probe_name = "ready-probe.example.com";
+
 const EnvFields = struct {
     listen_port: u16,
     upstream_port: u16,
-    cache_max_entries: usize,
+    opts: Options,
 };
 
 /// Writes the scratch `.env` and returns its absolute path, caller-owned.
@@ -358,15 +594,25 @@ fn writeEnvFile(io: Io, gpa: std.mem.Allocator, tmp: *testing.TmpDir, fields: En
         \\VORTEX_LOG_LEVEL={s}
         \\VORTEX_LOG_FORMAT=logfmt
         \\VORTEX_CACHE_MAX_ENTRIES={d}
+        \\VORTEX_CACHE_DIR={s}
+        \\VORTEX_BLOCKLIST_REFRESH_SECS={d}
         \\
     , .{
         fields.listen_port,
         fields.upstream_port,
-        build_options.blocklist_path,
-        build_options.suffix_blocklist_path,
+        fields.opts.blocklist_source orelse build_options.blocklist_path,
+        fields.opts.suffix_blocklist_source orelse build_options.suffix_blocklist_path,
         child_log_level,
-        fields.cache_max_entries,
+        fields.opts.cache_max_entries,
+        fields.opts.cache_dir,
+        fields.opts.refresh_secs,
     });
+
+    // Appended only when the case asks for it, so the unset case exercises the
+    // binary's own default rather than one the harness picked for it.
+    if (fields.opts.on_failure) |policy| {
+        try body.print(gpa, "VORTEX_BLOCKLIST_ON_FAILURE={s}\n", .{policy});
+    }
 
     try tmp.dir.writeFile(io, .{ .sub_path = "vortex.env", .data = body.items });
     return tmp.dir.realPathFileAlloc(io, "vortex.env", gpa);

@@ -1,20 +1,24 @@
 ///
 const std = @import("std");
 
+const backoff = @import("utils/backoff.zig");
 const blocked_response = @import("dns/blocked_response.zig");
 const cache_mod = @import("dns/cache.zig");
 const Cache = cache_mod.Cache;
 const CacheKey = cache_mod.CacheKey;
 const Context = @import("utility.zig").Context;
+const Refresher = @import("utility.zig").Refresher;
 const DomainBlockList = @import("blocklist/domain_blocklist.zig").DomainBlockList;
 const Header = @import("dns/header.zig").Header;
 const pending_table_mod = @import("utils/pending_table.zig");
 const PendingTable = pending_table_mod.PendingTable;
 const PendingQuery = pending_table_mod.PendingQuery;
 const Policy = @import("blocklist/policy.zig").Policy;
+const Snapshot = @import("blocklist/policy.zig").Snapshot;
 const obs_log = @import("obs/log.zig");
 const ResourceRecordIter = @import("dns/resource_record.zig").ResourceRecordIter;
-const Settings = @import("settings.zig").Settings;
+const settings_mod = @import("settings.zig");
+const Settings = settings_mod.Settings;
 const SuffixBlockList = @import("blocklist/suffix_blocklist.zig").SuffixBlockList;
 const Question = @import("dns/question.zig").Question;
 
@@ -114,7 +118,7 @@ fn handleQuery(
     // as `question` is in scope — through the policy decision and the send below.
     const domain: []const u8 = question.qname.slice();
 
-    switch (ctx.policy.decide(domain)) {
+    switch (try ctx.policy.decide(io, domain)) {
         .allow => {
             query_log.debug("verdict=allow qname={s}", .{domain});
         },
@@ -408,6 +412,185 @@ fn sweeperLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
     }
 }
 
+// ── Blocklist generations ─────────────────────────────────────────────────
+
+/// Builds one blocklist generation from the configured sources.
+///
+/// Shared by startup and `refresherLoop`, so both get the same retries, the same
+/// on-disk cache fallback and the same failure policy. The two paths differ only
+/// in what they do with the result: startup installs it as the first generation,
+/// a refresh swaps it in for the previous one.
+///
+/// Both lists are resolved concurrently, which halves the wait when both are
+/// URLs — the common case, and the slow one at ~25 s for the real lists.
+///
+/// **Fail-open lives here**, and only for `error.BlocklistUnavailable`. Every
+/// other failure is still fatal: a missing local path, a malformed URL, or an
+/// allocation failure are all configuration or environment errors that a policy
+/// about *network* resilience has no business swallowing.
+fn buildSnapshot(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    http_client: *std.http.Client,
+    cfg: Settings,
+) !*Snapshot {
+    const snapshot = try Snapshot.create(gpa);
+    errdefer snapshot.destroy();
+
+    // An empty setting means "no on-disk cache", which `acquire` expresses as a
+    // null rather than as an empty path it would then try to create.
+    const cache_dir: ?[]const u8 = if (cfg.cache_dir.len == 0) null else cfg.cache_dir;
+
+    var f_domain = io.async(DomainBlockList.load, .{
+        &snapshot.domain_blocklist,
+        gpa,
+        io,
+        http_client,
+        cfg.blocklist_source,
+        cache_dir,
+    });
+    var f_suffix = io.async(SuffixBlockList.load, .{
+        &snapshot.suffix_blocklist,
+        gpa,
+        io,
+        http_client,
+        cfg.suffix_blocklist_source,
+        cache_dir,
+    });
+
+    // Await both futures before propagating either error: a dropped future
+    // would leave its coroutine running while the deferred deinits tear down
+    // the resources it is still using.
+    const r_domain = f_domain.await(io);
+    const r_suffix = f_suffix.await(io);
+    try applyFailurePolicy(r_domain, cfg.blocklist_on_failure, "blocklist");
+    try applyFailurePolicy(r_suffix, cfg.blocklist_on_failure, "suffix blocklist");
+
+    return snapshot;
+}
+
+/// Resolves one list's load result against the operator's failure policy.
+///
+/// A tolerated failure leaves that list's set empty, which the chain already
+/// handles — an empty set simply blocks nothing.
+fn applyFailurePolicy(
+    result: anytype,
+    policy: settings_mod.FailurePolicy,
+    what: []const u8,
+) !void {
+    _ = result catch |err| switch (err) {
+        error.BlocklistUnavailable => switch (policy) {
+            .closed => {
+                std.log.err("{s} unavailable and VORTEX_BLOCKLIST_ON_FAILURE=closed; refusing to start", .{what});
+                return err;
+            },
+            .open => {
+                std.log.err("{s} unavailable; continuing without it (VORTEX_BLOCKLIST_ON_FAILURE=open)", .{what});
+                return;
+            },
+        },
+        else => return err,
+    };
+}
+
+/// Ceiling on the retry interval while running without a usable blocklist.
+///
+/// Five minutes rather than the configured interval, because the degraded state
+/// is one where the resolver is filtering nothing — waiting a day to try again
+/// would turn a transient outage at the list host into a day of unfiltered DNS.
+const degraded_refresh_cap_s: i64 = 5 * 60;
+
+/// Rebuilds both blocklists on a timer and swaps the result in.
+///
+/// Written to `LoopFn` so it goes through `supervise` like the other two loops,
+/// which is what gives it crash-loop protection for free.
+///
+/// **Why a whole new generation rather than an update in place.** Readers are
+/// live: a mutation of the running sets would be visible half-applied to a query
+/// arriving mid-refresh, and the sets' keys are slices into a body this would be
+/// reallocating underneath them. Building off to the side and swapping a pointer
+/// makes the change atomic from a reader's point of view; see `Policy` for why
+/// the swap needs a lock and not just an atomic store.
+fn refresherLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
+    // Guarded at the spawn site — the loop is only started when refresh is
+    // configured. Parking rather than returning covers the case where that
+    // guard is ever dropped: a supervised loop that returns gets restarted, so
+    // returning here would spin and log forever.
+    const refresh = ctx.refresh orelse return parkForever(io);
+    const cfg = refresh.cfg;
+
+    var consecutive_failures: u32 = 0;
+
+    while (true) {
+        const live = try ctx.policy.entryCounts(io);
+        const degraded = consecutive_failures > 0 or (live.domain + live.suffix) == 0;
+        const configured: i64 = @intCast(cfg.blocklist_refresh_secs);
+
+        // `+ 1` so the first degraded retry waits a second rather than firing
+        // instantly: a fail-open startup has `consecutive_failures == 0` and an
+        // empty list, and an immediate retry there would hammer a host that has
+        // just failed. Never longer than the configured interval, so a short
+        // interval is not silently overridden by the degraded ceiling.
+        const delay_s = if (degraded)
+            @min(backoff.seconds(consecutive_failures + 1, degraded_refresh_cap_s), configured)
+        else
+            configured;
+
+        try io.sleep(std.Io.Duration.fromSeconds(delay_s), std.Io.Clock.boot);
+
+        const before = try ctx.policy.entryCounts(io);
+        const started = std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds;
+
+        const fresh = buildSnapshot(ctx.gpa, io, refresh.http_client, cfg.*) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            consecutive_failures +|= 1;
+            std.log.err("blocklist refresh failed: {s}; keeping {d} entries", .{
+                @errorName(err),
+                before.domain + before.suffix,
+            });
+            continue;
+        };
+
+        // The rule, and the reasoning behind it, live on `Snapshot.wouldDisarm`.
+        const after = fresh.counts();
+        if (Snapshot.wouldDisarm(before, after)) {
+            fresh.destroy();
+            consecutive_failures +|= 1;
+            std.log.err(
+                "blocklist refresh would empty a list ({d}/{d} -> {d}/{d} entries); keeping the current one",
+                .{ before.domain, before.suffix, after.domain, after.suffix },
+            );
+            continue;
+        }
+
+        try ctx.policy.install(io, fresh);
+        consecutive_failures = 0;
+
+        const elapsed_ms = @divTrunc(
+            std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds - started,
+            std.time.ns_per_ms,
+        );
+        std.log.info("blocklist refreshed: {d}/{d} -> {d}/{d} entries in {d}ms", .{
+            before.domain,
+            before.suffix,
+            after.domain,
+            after.suffix,
+            elapsed_ms,
+        });
+    }
+}
+
+/// Blocks until cancelled, without spinning.
+///
+/// For a supervised loop that has nothing to do: returning would be read as a
+/// crash and restarted, so the only way to "stop" while staying under the
+/// supervisor is to wait forever and honour cancellation.
+fn parkForever(io: std.Io) std.Io.Cancelable!void {
+    while (true) {
+        try io.sleep(std.Io.Duration.fromSeconds(3600), std.Io.Clock.boot);
+    }
+}
+
 /// Every background loop has this shape, which is what lets one supervisor
 /// cover all of them.
 const LoopFn = *const fn (std.Io, *const Context) std.Io.Cancelable!void;
@@ -435,13 +618,11 @@ const healthy_run_ns = 60 * std.time.ns_per_s;
 /// `restart_backoff_cap_s`; the very first restart is immediate, so a one-off
 /// blip recovers with no added latency.
 ///
-/// Pure, so the schedule is testable without spawning anything.
-/// Returns `i64` because that is what `std.Io.Duration.fromSeconds` takes;
-/// keeping the type match here avoids a cast at the call site.
+/// The schedule itself lives in [utils/backoff.zig](utils/backoff.zig), shared
+/// with the blocklist fetch retry, which wants the same rule and a different
+/// ceiling.
 fn backoffSeconds(consecutive_restarts: u32) i64 {
-    if (consecutive_restarts == 0) return 0;
-    const shift: u6 = @intCast(@min(consecutive_restarts - 1, 5));
-    return @min(@as(i64, 1) << shift, restart_backoff_cap_s);
+    return backoff.seconds(consecutive_restarts, restart_backoff_cap_s);
 }
 
 /// Runs `loop` forever, restarting it if it ever returns for any reason other
@@ -516,37 +697,27 @@ pub fn main(init: std.process.Init) !void {
 
     const upstream_addr = try initIpAddress(cfg.upstream_host, cfg.upstream_port);
 
-    var policy = Policy.init(gpa);
-    defer policy.deinit(gpa);
-
     var http_client: std.http.Client = .{
         .io = io,
         .allocator = gpa,
     };
     defer http_client.deinit();
 
-    var f_domain = io.async(DomainBlockList.load, .{
-        &policy.domain_blocklist,
-        gpa,
-        io,
-        &http_client,
-        cfg.blocklist_source,
-    });
-    var f_suffix = io.async(SuffixBlockList.load, .{
-        &policy.suffix_blocklist,
-        gpa,
-        io,
-        &http_client,
-        cfg.suffix_blocklist_source,
-    });
+    const initial = try buildSnapshot(gpa, io, &http_client, cfg);
 
-    // Await both futures before propagating either error: a dropped future
-    // would leave its coroutine running while the deferred deinits tear down
-    // the resources it is still using.
-    const r_domain = f_domain.await(io);
-    const r_suffix = f_suffix.await(io);
-    try r_domain;
-    try r_suffix;
+    var policy = Policy.init(initial);
+    defer policy.deinit();
+
+    if (initial.count() == 0) {
+        // Only reachable under `.open`: `.closed` would have propagated out of
+        // `buildSnapshot`. Logged at `.err` rather than `.warn` because the
+        // resolver is running in a state where it filters nothing, and the
+        // refresher will retry on the degraded interval until that changes.
+        std.log.err(
+            "running with an EMPTY blocklist: no list could be fetched or restored from cache",
+            .{},
+        );
+    }
 
     var seed: u64 = undefined;
     io.random(std.mem.asBytes(&seed));
@@ -573,6 +744,15 @@ pub fn main(init: std.process.Init) !void {
     if (cache_ptr == null) std.log.info("response cache disabled (VORTEX_CACHE_MAX_ENTRIES=0)", .{});
 
     // process-wide bundle of shared, long-lived resources that every coroutine in the proxy needs.
+    // Null disables the refresher entirely, and the loop below is then never
+    // spawned — "no refresh" costs one absent coroutine rather than one that
+    // wakes up forever to decide it has nothing to do.
+    const refresher: ?Refresher = if (cfg.blocklist_refresh_secs == 0)
+        null
+    else
+        .{ .http_client = &http_client, .cfg = &cfg };
+    if (refresher == null) std.log.info("blocklist refresh disabled (VORTEX_BLOCKLIST_REFRESH_SECS=0)", .{});
+
     const ctx = Context.init(
         &client_socket,
         &upstream_socket,
@@ -582,6 +762,7 @@ pub fn main(init: std.process.Init) !void {
         cache_ptr,
         gpa,
         question_seed,
+        if (refresher) |*r| r else null,
     );
 
     // Tasks live in the group, not in discarded futures, so completions
@@ -592,6 +773,7 @@ pub fn main(init: std.process.Init) !void {
 
     group.async(io, supervise, .{ io, &ctx, "dispatcher", dispatcherLoop });
     group.async(io, supervise, .{ io, &ctx, "sweeper", sweeperLoop });
+    if (ctx.refresh != null) group.async(io, supervise, .{ io, &ctx, "refresher", refresherLoop });
 
     std.log.info("listening={s}:{d} upstream={s}:{d}", .{
         cfg.listen_host,
@@ -665,6 +847,8 @@ test {
     _ = @import("dns/name_reader.zig");
     _ = @import("dns/question.zig");
     _ = @import("dns/resource_record.zig");
+    _ = @import("utils/backoff.zig");
+    _ = @import("blocklist/acquire.zig");
     _ = @import("blocklist/allowlist.zig");
     _ = @import("blocklist/domain_blocklist.zig");
     _ = @import("blocklist/suffix_blocklist.zig");
@@ -702,36 +886,17 @@ test "initialize sockets" {
     std.debug.assert(test_socket.getPort() == 5454);
 }
 
-test "backoffSeconds doubles, caps, and lets the first restart be immediate" {
+test "backoffSeconds binds the supervisor's ceiling" {
     const testing = std.testing;
 
-    // First restart is free: a single spurious return should recover with no
-    // added latency, since one blip is not a crash loop.
+    // The schedule itself is tested in utils/backoff.zig. What is this
+    // function's own is the pair it binds: the first restart is immediate, and
+    // the delay saturates at *this* cap rather than the fetch retry's.
     try testing.expectEqual(@as(i64, 0), backoffSeconds(0));
-
-    // Then double from one second.
     try testing.expectEqual(@as(i64, 1), backoffSeconds(1));
-    try testing.expectEqual(@as(i64, 2), backoffSeconds(2));
-    try testing.expectEqual(@as(i64, 4), backoffSeconds(3));
-    try testing.expectEqual(@as(i64, 8), backoffSeconds(4));
-    try testing.expectEqual(@as(i64, 16), backoffSeconds(5));
 
-    // 1<<5 is 32, which the cap clamps to 30 — the doubling must not overshoot
-    // the documented ceiling on its way there.
+    // 1<<5 is 32, which `restart_backoff_cap_s` clamps to 30 — so this
+    // assertion fails if the wrapper is ever pointed at a different ceiling.
     try testing.expectEqual(@as(i64, restart_backoff_cap_s), backoffSeconds(6));
-
-    // And it stays clamped no matter how long the crash loop runs. This is the
-    // property that matters: an unbounded shift would overflow the u6 and panic,
-    // turning a recoverable crash loop into a hard crash.
-    try testing.expectEqual(@as(i64, restart_backoff_cap_s), backoffSeconds(7));
-    try testing.expectEqual(@as(i64, restart_backoff_cap_s), backoffSeconds(1000));
     try testing.expectEqual(@as(i64, restart_backoff_cap_s), backoffSeconds(std.math.maxInt(u32)));
-
-    // Never decreases, so a longer crash loop is never retried more eagerly.
-    var prev: i64 = 0;
-    for (0..64) |i| {
-        const cur = backoffSeconds(@intCast(i));
-        try testing.expect(cur >= prev);
-        prev = cur;
-    }
 }

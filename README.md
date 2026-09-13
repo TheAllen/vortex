@@ -84,10 +84,14 @@ zig build run
 
 If you change the suffix list, it must be a **bare-domain** list —
 `domainswild2`, not `domainswild`. The parser does not strip a leading `*.`, so
-a `*.`-prefixed list loads without any error and then matches nothing. Both
-lists are resolved at startup and a failure is currently fatal (P2.2) — a named
-file that doesn't exist included, because an operator who named a blocklist
-asked for that blocklist.
+a `*.`-prefixed list loads without any error and then matches nothing.
+
+Both lists are resolved at startup, and a *URL* that fails is retried and then
+served from the on-disk cache; only when that is missing too does
+`VORTEX_BLOCKLIST_ON_FAILURE` decide between starting unfiltered and refusing to
+start. A named **file** that doesn't exist is fatal regardless, because an
+operator who named a blocklist asked for that blocklist and a missing path is
+not a transient network condition.
 
 These two were called `VORTEX_BLOCKLIST_URL` / `VORTEX_SUFFIX_BLOCKLIST_URL`
 before they learned to take a path. Setting a stale name is a startup error
@@ -133,19 +137,31 @@ Filtering is a three-stage chain — **allowlist → exact blocklist → suffix
 blocklist** — with a three-valued verdict (`allow` / `block` / `pass`) so an
 allowlist entry can override a block.
 
-**Why the blocklists need no mutex:** they are write-once, read-many with a clean
-phase boundary. The lists are fully built before any coroutine spawns, and the
-only later access is a pure read. `PendingTable` and the response cache *do* need
-one — both are mutated for the whole process lifetime by inserts, removes, and a
-sweeper's iterate-and-remove. That is not a formality: `std.process.Init` hands
-us a `std.Io.Threaded` whose async limit defaults to `cpu_count - 1`, so handlers
-run on a real thread pool and two can be inside the same map at the same instant.
-This changes the day blocklist refresh (P2.2) lands: build a fresh set off to the
-side and swap the pointer rather than mutating under live readers.
+**Why shared state needs locks here:** `std.process.Init` hands us a
+`std.Io.Threaded` whose async limit defaults to `cpu_count - 1`, so handlers run
+on a real thread pool and two can be inside the same structure at the same
+instant. `PendingTable` and the response cache are mutated for the whole process
+lifetime by inserts, removes, and a sweeper's iterate-and-remove, so both take a
+mutex.
+
+The blocklists used to be the exception — write-once, read-many, fully built
+before any coroutine spawned, so a pure read needed no synchronization at all.
+**Periodic refresh (P2.2) ended that.** They are now an immutable `Snapshot` held
+behind an `Io.RwLock`: a refresh builds a whole new generation off to the side
+and swaps the pointer, rather than mutating sets whose keys are slices into a
+body it would be reallocating underneath live readers.
+
+The lock is there for the *freeing*, not the swapping. An atomic pointer swap is
+easy; knowing when the last reader of the old generation has finished with it is
+not, and the alternatives are leaking ~4 MB per refresh or freeing after a grace
+period and calling a timing argument a proof. Taking the lock exclusively waits
+for readers to drain, after which the replaced generation is reachable from
+nothing and can be freed outright. Readers pay one uncontended compare-exchange
+per query.
 
 ## Where it actually stands
 
-Roughly **57%** of the way to "production-ready home sinkhole," with the caveat
+Roughly **62%** of the way to "production-ready home sinkhole," with the caveat
 that the expensive-to-reverse architectural decisions are the ones already made.
 [`docs/progress.md`](docs/progress.md) has the weighted breakdown and what would
 actually move it.
@@ -155,8 +171,8 @@ QDCOUNT), QName case normalization, cacheable SOA on blocked answers, replies
 verified against the question that provoked them, SERVFAIL on upstream timeout,
 and TC=1 rather than silent corruption when a reply overflows the receive buffer.
 Every one of those is now asserted end to end against the running binary, not just
-against the pure function behind it. `zig build test` runs **143 tests** — 131 unit
-tests plus 12 integration cases — under both Debug and ReleaseSafe.
+against the pure function behind it. `zig build test` runs **162 tests** — 146 unit
+tests plus 16 integration cases — under both Debug and ReleaseSafe.
 
 **Responses are cached, with honest TTLs.** The compression → parsing → caching
 chain is complete: pointer following (P3.1), the record walk (P3.2), and a
@@ -174,19 +190,26 @@ reuses that field for flags rather than a duration.
 > convenience. Since configuration became runtime, removing that guard rail is a
 > one-line edit rather than a recompile, so this matters more than it used to.
 
-The gap is everything around the datapath: EDNS0, TCP fallback, graceful
-shutdown, metrics, and blocklist refresh with an on-disk cache — today a failed
-fetch at startup is fatal. [`docs/next_steps.md`](docs/next_steps.md) is the
-full prioritized board.
+**The blocklists survive their sources.** A failed fetch is retried, then falls
+back to an on-disk copy written on the last success; if even that is missing,
+`VORTEX_BLOCKLIST_ON_FAILURE` decides between starting unfiltered and refusing to
+start, defaulting to the former, loudly. Both lists are rebuilt on a timer —
+daily by default — and a refresh that would empty a list which currently has
+entries is refused rather than installed, because that is what a 200 OK serving
+an error page looks like by the time it reaches the parser.
 
-The testing gap that used to sit here is closed. The 131 unit tests are all over
+The gap is everything around the datapath: EDNS0, TCP fallback, graceful
+shutdown, and metrics. [`docs/next_steps.md`](docs/next_steps.md) is the full
+prioritized board.
+
+The testing gap that used to sit here is closed. The 146 unit tests are all over
 pure functions, which left `handleQuery`, `dispatcherLoop` and the ingress loop
 with no runtime coverage at all — the two functions where this project's last two
 real bugs lived. As of 2026-09-12 [`tests/`](tests/) spawns the real binary
-against a scratch config and a fake upstream and drives it over UDP: 12 cases,
+against a scratch config and a fake upstream and drives it over UDP: 16 cases,
 every one confirmed to fail when the behavior it covers is deliberately broken.
 
-`zig build test` runs both suites (143 tests); `zig build test-integration` runs
+`zig build test` runs both suites (162 tests); `zig build test-integration` runs
 just the harness, and `-Dtest-filter=<substr>` narrows it to a single case.
 
 What is *not* covered there is concurrency — every case is one query at a time —

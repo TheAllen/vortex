@@ -124,6 +124,20 @@ Findings from a one-off review of `src/` for memory bugs, ordered by severity.
 > from its own `file_body` the same way
 > (`domain_blocklist.zig:49`, `suffix_blocklist.zig:44`). Each body is freed only
 > in its own `deinit` (`domain_blocklist.zig:58`, `suffix_blocklist.zig:58`).
+>
+> **The half this finding predicted arrived on 2026-09-13, and is handled.** The
+> *"Refreshing the blocklist at runtime … would dangle every key"* clause below
+> is no longer hypothetical: P2.2 rebuilds both lists on a timer. The coupling is
+> now **documented and enforced by construction** rather than removed — the two
+> lists and their two bodies are one `Snapshot` (`blocklist/policy.zig`) created
+> and destroyed as a unit, so a body can no longer be freed while its set is
+> readable, and an `Io.RwLock` guarantees no reader still holds a generation when
+> it is freed. That is the parenthetical in **Fix** below, taken deliberately.
+>
+> What P4.5 still wants is the *other* half: owned keys so the ~3.5 MB body can
+> be freed after building. Refresh made that more attractive, not less — two
+> generations are briefly resident during a swap, so the body is now a peak
+> memory cost as well as a steady one.
 
 - **Where:** `src/blocklist/domain_blocklist.zig:26` *(2026-07-12; now :49)*
 - **What:** The map keys are slices pointing directly into `file_body`'s

@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const acquire = @import("acquire.zig");
 const Settings = @import("../settings.zig").Settings;
 const Source = @import("../settings.zig").Source;
 const Verdict = @import("policy.zig").Verdict;
@@ -50,35 +51,36 @@ pub const DomainBlockList = struct {
         }
     }
 
+    /// Filename this list takes inside the on-disk cache directory.
+    pub const cache_name = "blocklist.hosts";
+
     /// Acquires the list into `self.file_body`, then builds the set from it.
     ///
     /// `source` comes from `Settings.blocklist_source` and must outlive this
     /// call. A `.path` source is read from disk and never touches the network,
     /// which is what makes a startup against a fixture instant rather than the
     /// ~25 s an HTTP fetch of the real lists costs.
+    ///
+    /// Every decision about *how hard to try* — retries, the on-disk cache, what
+    /// is worth retrying — lives in [acquire.zig](acquire.zig). This function's
+    /// share is the grammar, which is what `build` covers.
     pub fn load(
         self: *DomainBlockList,
         gpa: std.mem.Allocator,
         io: std.Io,
         http_client: *std.http.Client,
         source: Source,
-    ) !void {
-        switch (source) {
-            .url => |url| {
-                const res = try http_client.fetch(.{
-                    .location = .{ .url = url },
-                    .method = .GET,
-                    .response_writer = &self.file_body.writer,
-                });
-                if (res.status != .ok) {
-                    log.err("failed to fetch blocklist '{s}': HTTP {d}", .{ url, @intFromEnum(res.status) });
-                    return error.BlocklistFetchFailed;
-                }
-            },
-            .path => |path| try readFileInto(&self.file_body, io, gpa, path, "blocklist"),
-        }
+        cache_dir: ?[]const u8,
+    ) !acquire.Outcome {
+        const outcome = try acquire.acquire(gpa, io, http_client, .{
+            .source = source,
+            .cache_dir = cache_dir,
+            .cache_name = cache_name,
+            .what = "blocklist",
+        }, &self.file_body);
 
         try self.build(gpa, self.file_body.written());
+        return outcome;
     }
 
     pub fn decide(self: *const DomainBlockList, domain: []const u8) Verdict {

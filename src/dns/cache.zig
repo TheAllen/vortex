@@ -308,9 +308,12 @@ const max_load = std.hash_map.default_max_load_percentage;
 ///
 /// Same shape as `PendingTable` — and deliberately so, because it is the same
 /// situation: mutated for the whole process lifetime by handler inserts and
-/// sweeper evictions. The README's "blocklists need no mutex" argument does
-/// **not** reach here; that one rests on a clean phase boundary (built before
-/// any coroutine spawns, read-only after), which a cache never has.
+/// sweeper evictions. The blocklists used to be the counter-example, resting on
+/// a clean phase boundary (built before any coroutine spawns, read-only after)
+/// that a cache never has. P2.2's periodic refresh ended that: they now take an
+/// `Io.RwLock` too, though for a different reason — see
+/// [blocklist/policy.zig](../blocklist/policy.zig), where the lock exists to
+/// make *freeing* a replaced generation safe rather than to serialize writes.
 ///
 /// The lock is not optional on a technicality: `std.process.Init` hands us a
 /// `std.Io.Threaded` whose `async_limit` defaults to `cpu_count - 1`, so

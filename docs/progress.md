@@ -11,6 +11,86 @@ are stated explicitly below so the number can be argued with rather than just qu
 
 ---
 
+## Snapshot — 2026-09-13
+
+> **≈ 62.4% complete** (60.0 → 62.4). One area moved, and for once it is the one weighted
+> heaviest among the unfinished: Operability.
+>
+> Source: 7,024 lines of Zig across 18 files in `src/` (+1,122, two new files), plus 1,603
+> lines in `tests/` (+473).
+> `zig build test` → **162/162 pass** under both Debug and ReleaseSafe — a 146-test unit
+> suite plus **16 integration cases**.
+>
+> Moved by P2.2's blocklist resilience: **Operability ~33% → ~42%** (+2.25) and
+> **Tests + CI ~92% → ~93%** (+0.1).
+>
+> **The sentence this retires is the one that mattered most.** Every snapshot since this file
+> began has carried some form of *"a failed blocklist fetch is fatal — no blocklist means no
+> DNS at all."* A resolver whose availability depends on a third party's CDN being up at the
+> moment you restart is not deployable, whatever else is true about it.
+
+### Breakdown
+
+| Area | Weight | Done | Contribution | Notes |
+|---|---:|---:|---:|---|
+| Core query datapath | 30% | ~98% | 29.4 | Unchanged. The datapath gained a lock on the policy read and nothing else |
+| Operability | 25% | ~42% | 10.5 | **+9.** P2.2 closed: retry, on-disk cache, fail-open policy, periodic refresh. Per-query event log, metrics, graceful shutdown and deployment still unbuilt |
+| Protocol completeness | 20% | ~62% | 12.4 | Unchanged. EDNS0, TCP fallback, multi-upstream |
+| Sinkhole feature set | 15% | ~5% | 0.75 | Unchanged |
+| Tests + CI | 10% | ~93% | 9.3 | **+1.** 126 behavior tests (up from 113) and 4 more integration cases. The named gaps are the same three, and one of them got sharper — see below |
+| **Total** | **100%** | | **≈ 62.4** | |
+
+### Why this is worth 9 points of Operability
+
+Because it is the difference between a program that works and a service that keeps working.
+The other operability items are about *observing* Vortex or *deploying* it; this one is about
+whether it is running at all tomorrow, which is a precondition for the rest mattering.
+
+The previous mechanism had a specific and repeating failure. From the 09-05 snapshot: the 404
+that first exposed it was "fixed" by swapping in another hard-coded URL, which re-armed the
+same trap against a different host — one that rate-limits. That is now handled three ways
+over: 429 is explicitly retryable, the cache survives the host being gone entirely, and the
+fail-open default means even a total loss degrades filtering rather than DNS.
+
+**The refresh half is the part that changes the shape of the code**, not just its resilience.
+The blocklists were the last piece of shared state with no synchronization, and the README's
+argument for that — write-once, read-many, clean phase boundary — was correct right up until
+lists started being replaced at runtime. They are now immutable generations swapped behind an
+`Io.RwLock`, which is the same move the cache and pending table already made, arrived at for
+a different reason.
+
+### The finding worth keeping
+
+**Two of the four new integration cases passed before the feature worked.** Both polled with
+no pause between rounds, so all forty rounds elapsed in well under a second — before the
+child's one-second refresh timer had fired even once. They asserted the correct thing, at the
+wrong time, and reported success.
+
+This is the 09-05 lesson again in a new costume. That pass found four cache assertions that
+could not fail because the *fixture* was built to be realistic rather than discriminating;
+this one found two that could not fail because the *timing* was. The rule generalizes:
+**a test must be constructed so that it fails when the rule is broken, and "it never waited
+long enough to see" is a way of not being constructed that way.** Confirm it by breaking the
+rule — which is what the mutation discipline is for, and what caught these.
+
+A third, smaller finding with the same root: the empty-list guard was written on the *total*
+entry count across both lists. An integration case caught that the two lists come from
+different hosts, so one serving an error page while the other is healthy is the ordinary
+failure — and a rule on the sum passes happily while half the filtering is silently wiped
+out. The guard is per-list now.
+
+### What did not move, and why
+
+**Tests + CI gained one point, not more.** The three gaps named on 09-12 are all still open,
+and P2.2 made the first of them *sharper*: the `Io.RwLock` exists to make freeing a replaced
+generation safe while readers are running, and no case runs two queries at once. The property
+the lock is for is precisely what the suite cannot see. It was verified by hand — 130 live
+swaps under six concurrent query streams in ReleaseSafe — which is the kind of evidence P2.5
+was built to stop depending on. Closing it is P1.5's work, since a concurrency cap needs load
+generation in the harness anyway.
+
+---
+
 ## Snapshot — 2026-09-12
 
 > **≈ 60.0% complete** (58.8 → 60.0). One area moved, and it is the one that had been named
@@ -467,15 +547,17 @@ Worth keeping as a reminder that a guard rail credited in advance is not a guard
 verified.
 
 ### → ~55%: make it deployable — the highest-value block on the board
-Six items, and together they're the difference between a toy and a tool. **One is now done:**
+Six items, and together they're the difference between a toy and a tool. **Four are now
+done** — P2.1, the P1.1–P1.4/P4.2 datapath group, P2.5 and P2.2 — which leaves the three that
+are all about surviving contact with a real network:
 
 | Item | Why it's on the critical path |
 |---|---|
 | ~~P2.1 config~~ ✅ 08-09, local-file source ✅ 09-11 | Was the gate on all of these; listen address is now runtime, and either blocklist can be a path |
 | ~~P1.1 / P1.2 / P1.3 / P1.4 / P4.2~~ ✅ 08-09 | Datapath closed out; P1.5 is the only P1 left |
 | ~~**P2.5 integration harness**~~ ✅ 09-12 | Topped this list for one pass and came off it. 12 end-to-end cases, all mutation-checked. It was here because both of the last two real bugs were found only by driving sockets; everything below now ships with it in place, which was the point |
-| **P2.2 blocklist cache + refresh** | The 404 that proved it was fixed by swapping in another hard-coded URL, which re-armed the same trap against a different host — one that rate-limits. Its file-reading half now exists; see [the counterweight that retired](#the-counterweight-that-retired-the-default-config-boots-again) |
-| P1.5 concurrency cap | Gate for leaving localhost |
+| ~~**P2.2 blocklist cache + refresh**~~ ✅ 09-13 | Topped this list for one pass and came off it, like the harness before it. The 404 that proved it was fixed by swapping in another hard-coded URL, which re-armed the same trap against a different host — one that rate-limits; that class is now closed by retry + cache + a fail policy, not by picking a better URL |
+| **P1.5 concurrency cap** | Now the top of this list. Gate for leaving localhost |
 | P2.7 rate limiting | Gate for leaving localhost |
 | P2.6 bind + service unit | `0.0.0.0:53`, privileged port, launchd/systemd |
 | P2.4 graceful shutdown | Currently the only exit is a crash or Ctrl-C mid-write |

@@ -9,6 +9,168 @@ Newest first. Open work lives in [next_steps.md](next_steps.md).
 
 ---
 
+## Landed 2026-09-13 — P2.2 blocklist resilience
+
+A failed blocklist fetch used to be fatal: `error.BlocklistFetchFailed` propagated out of
+`main`, so **no blocklist meant no DNS at all**, and a bad minute at GitHub or a tripped
+rate limit at oisd.nl took the whole network's resolver down. The lists were also fetched
+exactly once, so a process that stayed up for months served the list it fetched on the day
+it started.
+
+Four mechanisms, in the order a failure meets them: **retry**, **an on-disk cache**, a
+**configurable fail-open/fail-closed** decision, and **periodic refresh**.
+
+`zig build test` → **162/162 pass** (143 → 162): 146 unit tests plus **16 integration cases**.
+
+### The shape: generations, not mutation
+
+Refresh is the reason the rest of this is structured the way it is. The blocklists were
+write-once and read-many with a clean phase boundary — built before any coroutine spawned,
+never touched again — which is why the README could argue they needed no mutex. Refresh ends
+that, and mutating them in place was never an option: each set's keys are slices *into* that
+list's `file_body`, so an update would be reallocating the bytes underneath live readers.
+
+So a refresh builds a whole new [`Snapshot`](../src/blocklist/policy.zig) — both lists and
+both bodies, owned and freed as one unit — and swaps a pointer.
+
+**The lock is for the freeing, not the swapping.** An atomic pointer swap is the easy half;
+knowing when the last reader that loaded the *old* pointer has finished with it is the hard
+one, and without an answer the only options are leaking a generation per refresh (~4 MB, on a
+process meant to run for months) or freeing after a grace period and calling a timing
+argument a proof. An `Io.RwLock` answers it: readers hold it shared across `decide`, and
+`install` takes it exclusively, which waits for every existing reader to drain. Past the
+swap the old generation is reachable from nothing and no reader still holds it, so the free
+after the unlock races with nothing. Readers pay one uncontended compare-exchange.
+
+The allowlist stays outside the snapshot and is checked *before* the lock is taken — it is a
+comptime `StaticStringMap` with no state and nothing to swap, so the allow path stays
+lock-free.
+
+### Retry, and what is worth retrying
+
+[acquire.zig](../src/blocklist/acquire.zig) is new, and both lists route through it. Three
+attempts on the schedule now shared with the supervisor
+([utils/backoff.zig](../src/utils/backoff.zig), where `backoffSeconds` moved and grew a
+`cap_s` parameter): immediate, +1s, +2s.
+
+Only the transient failures are retried at all. Connection errors, 5xx and **429** retry;
+404 and 403 do not, because a list that moved or now needs auth is a configuration problem a
+retry cannot fix and a cache can. 429 is on that list for a specific reason recorded in
+[progress.md](progress.md): oisd.nl rate-limits per IP, and a handful of quick restarts used
+to be enough to leave Vortex unable to start.
+
+The URL is parsed once *before* the loop, so a typo fails immediately and by name instead of
+being retried three times on its way to a fallback.
+
+### The cache file, and why it records its source
+
+Written on every success through `createFileAtomic` + `replace`, so a process killed
+mid-write leaves the previous copy intact rather than a truncated list — which would load
+clean and block a random prefix of what it should.
+
+The first line is a provenance header:
+
+```
+# vortex-cache v1 source=https://raw.githubusercontent.com/… fetched=1789277090
+```
+
+It is a `#` comment because **both list grammars already skip those**, so the header costs
+nothing on the read path and the cache file stays a valid blocklist — one an operator can
+point `VORTEX_BLOCKLIST_SOURCE` straight at.
+
+Recording the source is what makes a changed URL safe. Without it, an operator who switches
+providers and then restarts while the new URL is down gets handed the *old provider's* list
+by a cache keyed only on filename, while the config plainly says otherwise. A mismatch is
+treated as a miss and logged.
+
+There is deliberately **no maximum age**. The alternative to a month-old blocklist is no
+blocklist; the age is logged so an operator can judge it.
+
+### Fail-open, loudly
+
+When nothing works — no fetch, no usable cache — `VORTEX_BLOCKLIST_ON_FAILURE` decides.
+Neither answer is safe, which is why it is a setting rather than a default somebody picked:
+`closed` means a transient outage takes DNS down, `open` means the resolver silently blocks
+nothing.
+
+`open` is the default, because a resolver that will not start is a worse outage than one that
+is not yet filtering. It is not quiet about it: startup logs at `.err`, and the refresher
+drops to a **5-minute** retry ceiling instead of the configured daily interval until a list
+arrives.
+
+**A missing local file stays fatal regardless of this setting.** An operator who named a path
+asked for that path; a missing one is a configuration error, not a transient network
+condition, and no amount of retrying or caching makes it right.
+
+### The guard that matters most
+
+A refresh that would **empty a list which currently has entries** is refused rather than
+installed. That is what a 200 OK serving an error page, or a truncated download, looks like
+by the time it reaches the parser: a body that parses perfectly into a list with no entries.
+Installing it disarms every block while the process goes on looking healthy.
+
+**The rule is per list, not on the total** — and it was written on the total first. The
+integration case caught it: the two lists come from two different hosts, so one serving an
+error page while the other is fine is the ordinary case, and a rule on the sum passes happily
+while one of the two lists is wiped out. `Snapshot.wouldDisarm` is pure, so the rule is
+checkable without a refresh, a socket or a clock.
+
+An already-empty list may be replaced by another empty one — that is a fail-open startup
+waiting for its first real list, and refusing it would mean never recovering.
+
+### Configuration
+
+| Variable | Default | Effect |
+|---|---|---|
+| `VORTEX_CACHE_DIR` | `.vortex-cache` | On-disk list copies. **Empty disables it** |
+| `VORTEX_BLOCKLIST_ON_FAILURE` | `open` | `open` starts unfiltered and loud; `closed` refuses to start |
+| `VORTEX_BLOCKLIST_REFRESH_SECS` | `86400` | 0 disables refresh |
+
+`VORTEX_CACHE_DIR` needed a new helper. Every other string setting treats an explicitly
+empty value as "unset" and falls back to the default — which is right for a host or a port,
+where an empty value says nothing, and wrong here, where an empty *directory* says
+"nowhere". Without `envStrAllowEmpty` the setting would have had no off switch at all.
+
+### Tests
+
+19 new: 15 unit and 4 integration.
+
+The pure ones carry the rules that are easiest to get quietly wrong — the cache header
+round-trip against **literal bytes**, `retryableStatus`'s truth table (429 retryable, its
+numeric neighbours not, which pins the rule to that status rather than a range), and
+`wouldDisarm`. `policy.zig` had no tests at all before this pass and now has the chain's
+first: that an allowlist entry overrides a name which really is on both blocklists, asserted
+against the snapshot underneath so the test proves what the override is overriding.
+
+The four integration cases are fail-open, fail-closed, a refresh swapping the live list, and
+the empty-list refusal. They need no HTTP server: acquisition is the same code for a `.path`
+source as for a URL, and a path can be rewritten mid-test from three lines of setup, which
+keeps every case network-free.
+
+**Two of them were false passes first**, and both failures were in the test rather than the
+code. The refresh cases polled with no pause between rounds, so all forty rounds elapsed in
+under a second — well before the child's one-second timer had fired once. A case that never
+waits for the behavior it is testing passes for the same reason it would if the feature did
+not exist.
+
+### The harness could hang, and that was worse than failing
+
+Mutating fail-closed so the child starts anyway made the case **hang for the full build
+timeout** instead of failing: `runUntilExit` called `Child.wait` on a child that now never
+exits. This is the same lesson [the 09-12 harness](#landed-2026-09-12--p25-integration-harness)
+recorded from the other direction — *a diagnostic path that deadlocks is worse than no
+diagnostics, because the symptom reads as a slow test rather than a broken one* — and it
+matters most during a mutation run, which is precisely when the code under test is supposed
+to misbehave. A case that hangs under mutation cannot confirm anything about the rule it was
+written for.
+
+`waitBounded` races the wait against a timer with `Io.Select`. The timeout branch signals the
+pid directly rather than calling `Child.kill`, which would reap the process itself and race
+the `wait` already in flight on it — two reapers, one of which finds the child gone. The
+wait task stays the only reaper; the signal just unblocks it.
+
+---
+
 ## Landed 2026-09-12 — P2.5 integration harness
 
 The coroutine layer has automated coverage for the first time. `handleQuery`, `dispatcherLoop`
