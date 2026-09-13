@@ -4,6 +4,25 @@ const DomainBlockList = @import("blocklist/domain_blocklist.zig").DomainBlockLis
 const PendingTable = @import("utils/pending_table.zig").PendingTable;
 const Policy = @import("blocklist/policy.zig").Policy;
 const Cache = @import("dns/cache.zig").Cache;
+const Settings = @import("settings.zig").Settings;
+
+/// Everything `refresherLoop` needs that the datapath does not.
+///
+/// Bundled behind one pointer rather than spread across five `Context` fields:
+/// only one loop reads any of it, and `LoopFn` is a fixed signature, so the
+/// alternative is widening the struct every coroutine shares for the benefit of
+/// the one that refreshes lists.
+///
+/// Both members outlive the loop — the client sits on `main`'s frame with a
+/// deferred `deinit`, and `Settings` borrows the process environment map, which
+/// is never torn down.
+pub const Refresher = struct {
+    /// `std.http.Client.fetch` documents itself as threadsafe, which is what
+    /// lets the refresher share the client startup already built rather than
+    /// standing up a second one.
+    http_client: *std.http.Client,
+    cfg: *const Settings,
+};
 
 pub const Context = struct {
     client_socket: *const std.Io.net.Socket = undefined,
@@ -24,6 +43,11 @@ pub const Context = struct {
     /// a colliding question cannot be precomputed offline against a fixed seed.
     question_seed: u64 = 0,
 
+    /// What `refresherLoop` needs, or null when periodic refresh is disabled
+    /// (`VORTEX_BLOCKLIST_REFRESH_SECS=0`). Null is also the state every other
+    /// coroutine sees it in — nothing on the datapath reads this.
+    refresh: ?*const Refresher = null,
+
     pub fn init(
         client_socket: *const std.Io.net.Socket,
         upstream_socket: *const std.Io.net.Socket,
@@ -33,6 +57,7 @@ pub const Context = struct {
         cache: ?*Cache,
         gpa: std.mem.Allocator,
         question_seed: u64,
+        refresh: ?*const Refresher,
     ) Context {
         return .{
             .client_socket = client_socket,
@@ -43,6 +68,7 @@ pub const Context = struct {
             .cache = cache,
             .gpa = gpa,
             .question_seed = question_seed,
+            .refresh = refresh,
         };
     }
 };
@@ -54,4 +80,5 @@ pub const Context = struct {
 test "refAllDecls" {
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(Context);
+    std.testing.refAllDecls(Refresher);
 }

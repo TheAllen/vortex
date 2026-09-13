@@ -7,6 +7,11 @@ zig-out/
 # built-in defaults — so nothing here is required to build or run.
 .env
 
+# On-disk blocklist cache (VORTEX_CACHE_DIR). Written on every successful fetch
+# and read back when one fails, so it is real state — but it is a copy of
+# someone else's list, it is megabytes, and it is rebuilt on the next run.
+.vortex-cache/
+
 # Editor / tooling local state
 .claude/settings.local.json
 .vscode/

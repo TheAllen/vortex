@@ -1,9 +1,17 @@
 # Next Steps — Road to Production-Ready
 
-Reviewed **2026-09-12** against the current source (Zig 0.16.0, `zig build test` →
-**143/143 pass** — 131 unit tests, of which 129 are real behavior tests, plus **12
+Reviewed **2026-09-13** against the current source (Zig 0.16.0, `zig build test` →
+**162/162 pass** — 146 unit tests, of which 126 are real behavior tests, plus **16
 integration cases**). **No open P0s, and no open P1 bugs** — all three P0s are pinned by
 regression tests that fail under mutation.
+
+**P2.2 blocklist resilience landed 2026-09-13**, and with it the last of the two
+deployability blockers that were not about load. A failed fetch is retried, falls back to an
+on-disk copy, and — if even that is missing — resolves against a configurable
+fail-open/fail-closed policy instead of killing the process. Both lists are rebuilt on a
+timer and swapped in as whole generations behind an `Io.RwLock`. **"No blocklist means no DNS
+at all" is retired**, as is "the list is whatever was fetched the day the process started" —
+see [changelog.md](changelog.md#landed-2026-09-13--p22-blocklist-resilience).
 
 **P3.3 response caching landed 2026-09-05**, closing the compression → parsing → caching
 chain. The P3 band is now the EDNS0/TCP remainder rather than the main event.
@@ -12,7 +20,7 @@ chain. The P3 band is now the EDNS0/TCP remainder rather than the main event.
 this board. `handleQuery`, `dispatcherLoop` and the ingress loop now have automated
 coverage: [tests/](../tests/) spawns the real binary against a scratch config, drives it
 with crafted UDP from a fake upstream it owns both ends of, and asserts on the replies. All
-12 cases are mutation-checked. **The "everything ever proven about this layer was proven by
+16 cases are mutation-checked (12 then, 4 added by P2.2). **The "everything ever proven about this layer was proven by
 hand with `dig`" caveat is retired** — see
 [changelog.md](changelog.md#landed-2026-09-12--p25-integration-harness).
 
@@ -39,10 +47,11 @@ the three closed P0s in detail, and the shipped P3.1 and P3.2 plans. This file i
 open work only.
 
 The single largest remaining gap is now **deployability**, not coverage. What is left is
-almost entirely P2: blocklist resilience (P2.2), bounded concurrency (P1.5), the per-query
-event (P2.3), and the deployment surface (P2.6). The harness that closed the coverage gap is
-also where P1.5 gets asserted once there is a cap to assert on — it is the only thing in the
-tree that can create load.
+almost entirely P2: bounded concurrency (P1.5), the per-query event (P2.3), and the
+deployment surface (P2.6). **P1.5 is now the top of the board** — it is the one thing
+standing between Vortex and a bind off localhost that is not also rate limiting. The harness
+is where its cap gets asserted once there is one: it is still the only thing in the tree that
+can create load.
 
 ## What exists today
 
@@ -74,12 +83,18 @@ tree that can create load.
   Serves a copy with the client's transaction ID restored and every TTL aged by the entry's
   age; RFC 2308 negative caching; swept every 30 s. `VORTEX_CACHE_MAX_ENTRIES=0` disables it
 - A `Policy` filter chain — allowlist → exact blocklist → suffix blocklist — with a
-  three-valued `Verdict` (`allow`/`block`/`pass`) ([policy.zig](../src/blocklist/policy.zig))
+  three-valued `Verdict` (`allow`/`block`/`pass`) ([policy.zig](../src/blocklist/policy.zig)),
+  over an immutable `Snapshot` held behind an `Io.RwLock` so a refresh can replace both lists
+  as one generation while queries are in flight. The allowlist is checked before the lock is
+  taken, so the allow path stays lock-free
   - Exact-match blocklist ([domain_blocklist.zig](../src/blocklist/domain_blocklist.zig))
   - Suffix/wildcard blocklist walking parent labels ([suffix_blocklist.zig](../src/blocklist/suffix_blocklist.zig))
   - Both resolve from a URL **or** a local file path, chosen by the value's scheme
     (`Settings.Source`), with acquisition split from parsing so the line grammar of each
     is tested over literals
+  - Acquisition is retried, cached on disk and fail-open by default
+    ([acquire.zig](../src/blocklist/acquire.zig)); both lists are rebuilt on a timer by
+    `refresherLoop`, and a refresh that would empty a populated list is refused
   - Comptime allowlist that overrides a block, validated lowercase at build time ([allowlist.zig](../src/blocklist/allowlist.zig))
 - NXDOMAIN synthesis for blocked names, assembled in one pure function
   ([blocked_response.zig](../src/dns/blocked_response.zig)) from `Header.writeResponseFlags`
@@ -125,30 +140,44 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
    [settings.zig](../src/settings.zig) resolves a runtime `Settings` struct at startup from
    **defaults < `.env` file < process environment**.
    - **Done:** listen host+port, upstream host+port, upstream bind host+port, both blocklist
-     sources, log level and log format, and `VORTEX_CACHE_MAX_ENTRIES` (0 disables the cache). All `VORTEX_`-prefixed; `VORTEX_ENV_FILE` picks a
+     sources, log level and log format, `VORTEX_CACHE_MAX_ENTRIES` (0 disables the cache),
+     and P2.2's three — `VORTEX_BLOCKLIST_ON_FAILURE`, `VORTEX_CACHE_DIR` (empty disables
+     the on-disk list cache) and `VORTEX_BLOCKLIST_REFRESH_SECS` (0 disables refresh). All
+     `VORTEX_`-prefixed; `VORTEX_ENV_FILE` picks a
      different file. A missing default `.env` is fine; a file named explicitly that isn't
      there is fatal, as is a malformed port — silently listening on 5354 because someone
      typed `535e` is the config bug that costs an hour.
+
+     `VORTEX_CACHE_DIR` is the one string setting where an explicitly empty value means the
+     empty string rather than "unset" (`envStrAllowEmpty`). An empty host or port says
+     nothing; an empty *directory* says "nowhere", and without the distinction the setting
+     would have had no off switch.
    - ~~**Local file paths as a blocklist source alongside URLs**~~ **Done 2026-09-11.**
      `VORTEX_BLOCKLIST_SOURCE` / `VORTEX_SUFFIX_BLOCKLIST_SOURCE` take a URL or a path,
      decided by the value's scheme. This was P2.5's hard prerequisite; P2.5 is now
      unblocked. The old `_URL` names are a fatal error naming the replacement rather than a
      silent fall back to the default list.
    - **Still to do:** `std.process.args` for CLI flags (highest precedence, above process
-     env), multiple upstreams (P4.3), and the three remaining knobs whose
+     env), multiple upstreams (P4.3), and the two remaining knobs whose
      *consumers* can't take a runtime value yet — **timeouts** (the 5 s deadline and 1 s sweep
-     cadence, now unblocked), **negative-cache TTL** (needs `Authority`'s comptime fields
-     un-`comptime`d, see Housekeeping), and **fail-open vs fail-closed** (needs P2.2). Each
-     is one struct field plus one line in `fromEnviron` once its consumer is ready.
-2. **Blocklist resilience.** Both lists are resolved concurrently at startup; a non-OK
-   status or network error returns `error.BlocklistFetchFailed`, which `main` propagates —
-   so the server **fails closed: no blocklist means no DNS at all**. That's the opposite of
-   the old silent fail-open, and arguably worse for a resolver (a transient GitHub blip takes
-   your whole network's DNS down). Needed: a deliberate, configurable fail-open-vs-closed
-   policy, a local cache file written on success and loaded on fetch failure, retry with
-   backoff, and **periodic refresh**. Refresh then requires the read-mostly swap strategy
-   from [README.md](../README.md) — build a fresh set off to the side and atomically swap the
-   pointer; don't mutate the live set under the readers in `handleQuery`.
+     cadence, now unblocked) and **negative-cache TTL** (needs `Authority`'s comptime fields
+     un-`comptime`d, see Housekeeping). Each is one struct field plus one line in
+     `fromEnviron` once its consumer is ready. *(Fail-open vs fail-closed was the third; P2.2
+     built the consumer and it shipped 2026-09-13.)*
+2. ~~**Blocklist resilience.**~~ **Done 2026-09-13.** A failed fetch is retried (three
+   attempts, only the transient statuses), then falls back to an on-disk copy written on the
+   last success and stamped with the source it came from; if even that is missing,
+   `VORTEX_BLOCKLIST_ON_FAILURE` decides between starting unfiltered-and-loud and refusing to
+   start. Both lists are rebuilt on a timer by `refresherLoop` and installed as a whole
+   `Snapshot` behind an `Io.RwLock`, and a refresh that would empty a list which currently
+   has entries is refused. See
+   [changelog.md](changelog.md#landed-2026-09-13--p22-blocklist-resilience).
+
+   **Two things this left open**, both small and both deliberately out of that pass:
+   - **SIGHUP-triggered refresh.** Needs the signal handling P2.4 will add; the refresh
+     mechanism itself is already a function call away.
+   - **Retry counts, the degraded interval and the attempt schedule are constants**, not
+     settings. They are one `Settings` field each if an operator ever needs them; nobody has.
 3. **Structured logging + metrics — phase 1 landed 2026-08-10.** Every `std.log` call now
    renders as a logfmt record with escaping that no call site can bypass, and level/format
    are runtime knobs ([obs/log.zig](../src/obs/log.zig); see
@@ -161,26 +190,26 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
 4. **Graceful shutdown.** No signal handling; the only exit is a crash or Ctrl-C mid-write.
    Catch SIGINT/SIGTERM, `group.cancel`, flush the log, run the deferred deinits.
 5. **Test coverage — the harness landed 2026-09-12; what is left is listed below.**
-   `zig build test` → **143/143**: the 131-test unit suite plus **12 integration cases**
+   `zig build test` → **162/162**: the 146-test unit suite plus **16 integration cases**
    ([tests/](../tests/), see
    [changelog.md](changelog.md#landed-2026-09-12--p25-integration-harness)).
 
-   The unit suite is **131/131, of which 129 are real**: 32 `cache`,
-   17 `resource_record` (10 walk tests including a fuzz target, plus **7 new `parseRdata`
-   tests** from 09-08), 17 `name_reader` (including a fuzz target), 9 `Header`, 8 `obs/log`,
-   **8 `settings`** (3 new on 09-11 for `Source.parse` and the rename guard),
-   7 `PendingTable`, **4 `DomainBlockList`** and **4 `SuffixBlockList`** (all new on 09-11
-   bar one), 4 `parseQuestion`, 3 `blocked_response` golden-bytes,
-   `backoffSeconds`, allowlist hit/miss, and **16 `refAllDecls`
-   guards** — one per module, which assert nothing at runtime and everything at compile time.
+   The unit suite is **146/146, of which 144 are real**: 31 `cache`,
+   17 `resource_record` (10 walk tests including a fuzz target, plus 7 `parseRdata`
+   tests from 09-08), 17 `name_reader` (including a fuzz target), 9 `Header`, 8 `obs/log`,
+   8 `settings`, 7 `PendingTable`, **6 `Policy`** and **5 `acquire`** (all new on 09-13),
+   4 `parseQuestion`, 3 `DomainBlockList`, 4 `SuffixBlockList`, 3 `blocked_response`
+   golden-bytes, **2 `backoff`**, `backoffSeconds`'s ceiling, allowlist hit/miss, and
+   **18 `refAllDecls` guards** — one per module, which assert nothing at runtime and
+   everything at compile time.
    Only 2 now assert nothing about Vortex: `main.zig`'s "initialize sockets" and the
    `test { _ = @import(…) }` aggregator, which the runner counts as a passing test.
    (`root.zig`'s `add(3, 7)` stub was the third; it is deleted.)
 
    Counted exactly, so the headline number is not mistaken for behavior coverage:
-   **131 = 113 behavior tests + 16 guards + 1 aggregator + 1 no-op.** The guard count was
-   recorded as 14 from 09-08 until 09-11; it has been 16 — one per module — since the sweep,
-   and three of them are simply named something other than `test "refAllDecls"`.
+   **146 = 126 behavior tests + 18 guards + 1 aggregator + 1 no-op.** The guard count tracks
+   the module count exactly; it went 16 → 18 on 09-13 with `acquire.zig` and
+   `utils/backoff.zig`.
 
    **A third testing lesson, learned the hard way on 2026-09-05.** Mutation-testing the
    cache found **four assertions that could not fail**, each because the fixture was built
@@ -255,6 +284,13 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
        handlers — which is P1.5's whole subject, and the harness is where a concurrency cap
        gets asserted once there is one. It is currently the only thing in the tree that can
        generate load at all.
+
+       P2.2 made this gap sharper rather than smaller. The `Io.RwLock` in `Policy` exists to
+       make freeing a replaced blocklist generation safe *while readers are running*, and no
+       case runs two queries at once — so the property the lock is for is the one thing the
+       suite cannot observe. It was checked by hand (130 live swaps under six concurrent
+       query streams, ReleaseSafe, no errors), which is exactly the kind of evidence P2.5
+       existed to stop relying on.
      - **The supervisor.** A loop that returns immediately cannot be provoked from outside.
        Closing this needs a fault-injection hook in the binary, which is a real design
        decision (a test-only code path in a resolver) and not obviously worth it.
@@ -265,9 +301,10 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
        startup, and is worth doing alongside P2.6.
    - ~~`parseDomain`/`parseSuffixDomain` parsing tests.~~ **Done 2026-09-11**, as a
      by-product of splitting `build` (pure, over a byte slice) out of `load` in both
-     blocklists. [policy.zig](../src/blocklist/policy.zig) and
-     [utility.zig](../src/utility.zig) are now the only files carrying logic with **no
-     `test` blocks at all**.
+     blocklists. ~~[policy.zig](../src/blocklist/policy.zig) and~~
+     [utility.zig](../src/utility.zig) is now the only file carrying logic with **no
+     `test` blocks at all** — and it carries very little. `policy.zig` got its first six on
+     2026-09-13.
 6. **Deployment surface.** `127.0.0.1:5354` is dev-only. Real use means `0.0.0.0:53`
    (privileged port → capability / launchd / systemd unit), an IPv6 listener, and a
    service definition. Pick the target platform and add the unit files.
@@ -504,13 +541,16 @@ C3 removed the reflector and P1.2 stopped OOM from being fatal, but nothing yet 
 the number of in-flight handlers a flood can create.
 
 > ⚠️ **This section is stale** and is kept verbatim by request; only this note is maintained.
-> As of 2026-09-12: items 1 and 2 are done (P4.2 landed 08-09, both test suites landed 08-09,
+> As of 2026-09-13: items 1 and 2 are done (P4.2 landed 08-09, both test suites landed 08-09,
 > CI exists), P2.1/P2.3 both shipped, and the P3 track it offers as a *branch* has now been
 > walked end to end — compression 08-13, record parsing 08-30, caching 09-05. **P2.5's harness
-> landed 09-12 and came off this list**, as P2.1's local-file blocklist source did on 09-11.
-> The real order is now **P2.2, P1.5, P2.3's per-query event, then P4.1**. Rewriting this
-> section against it is a separate pass, and the case for doing so is now as strong as it
-> gets: every item it names is done, and what is left is entirely the deployability block.
+> landed 09-12 and came off this list**, as P2.1's local-file blocklist source did on 09-11
+> and **P2.2's cache + refresh did on 09-13**.
+> The real order is now **P1.5, P2.3's per-query event, then P4.1** — with P2.6 and P2.7
+> alongside P1.5 if the goal is a bind off localhost, since none of the three is sufficient
+> on its own. Rewriting this section against that is a separate pass, and the case for doing
+> so keeps strengthening: every item it names is done, what is left is entirely the
+> deployability block, and the list is now down to three.
 
 For the view from above — how far along the whole project is, which of these bands is worth
 the most per unit of effort, and why "no open P0s" does **not** mean "safe to deploy" — see

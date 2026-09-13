@@ -453,3 +453,229 @@ test "a repeated query is served from cache without a second upstream round trip
     // a client that re-cached it would hold it past the authoritative expiry.
     try testing.expect(try wire.firstAnswerTtl(hit, q_end) <= 300);
 }
+
+// ── Blocklist resilience (P2.2) ───────────────────────────────────────────
+//
+// These cases are about *acquiring* the lists rather than about answering
+// queries, so they assert on whether a name is blocked or forwarded — the only
+// evidence of which list generation is live that is visible from outside the
+// process.
+//
+// Note what they deliberately do not need: an HTTP server. The retry, cache and
+// fail-policy code is the same for a `.path` source as for a URL, and a path
+// can be rewritten mid-test from three lines of setup. What is left uncovered
+// out here is HTTP status handling, which `acquire.retryableStatus` and the
+// cache-header tests cover as pure functions.
+
+/// A URL with nothing behind it. Port 1 is `tcpmux`, which nothing serves, so a
+/// connection is refused immediately rather than hanging until a timeout.
+const dead_url = "http://127.0.0.1:1/hosts";
+
+test "P2.2 fail-open: an unreachable list source still starts, blocking nothing" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{
+        .blocklist_source = dead_url,
+        .suffix_blocklist_source = dead_url,
+        // The default, stated explicitly: this case is about what the default
+        // does, so a change to it should fail here rather than skip past.
+        .on_failure = "open",
+        .readiness = .forwarded_probe,
+    });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    // `blocked.test` is on the fixture list, so under a *loaded* blocklist this
+    // is answered locally with NXDOMAIN and never reaches the upstream. Running
+    // fail-open it must be forwarded instead — which is what makes this case
+    // discriminating rather than just "the process started".
+    var query_buf: [wire.max_message]u8 = undefined;
+    const query = wire.query(&query_buf, 0x0F01, "blocked.test", .{});
+    try vortex.sendQuery(query);
+
+    var upstream_buf: [wire.max_message]u8 = undefined;
+    const forwarded = try vortex.recvUpstream(&upstream_buf, harness.default_timeout_ms);
+
+    var reply_buf: [wire.max_message]u8 = undefined;
+    const reply = try wire.reply(&reply_buf, forwarded.data, .{ .addresses = &.{.{ 192, 0, 2, 7 }} });
+    try vortex.sendUpstreamReply(&forwarded.from, reply);
+
+    var client_buf: [wire.max_message]u8 = undefined;
+    const answer = try vortex.recvClient(&client_buf, harness.default_timeout_ms);
+
+    // NOERROR with a real answer, not the NXDOMAIN a loaded blocklist gives.
+    try testing.expectEqual(@as(u16, 0x0F01), wire.id(answer));
+    try testing.expectEqual(@as(u4, wire.RCode.no_error), wire.rcode(answer));
+}
+
+test "P2.2 fail-closed: an unreachable list source refuses to start" {
+    var result = try harness.runUntilExit(testing.io, testing.allocator, .{
+        .blocklist_source = dead_url,
+        .suffix_blocklist_source = dead_url,
+        .on_failure = "closed",
+    });
+    defer result.deinit(testing.allocator);
+
+    // Exited by itself with a failure status — not killed, not a clean exit.
+    try testing.expect(result.failed());
+
+    // And said why. A resolver that dies silently at boot is the case an
+    // operator spends an hour on; the exit status alone does not rule it out.
+    try testing.expect(std.mem.indexOf(u8, result.stderr, "refusing to start") != null);
+}
+
+test "P2.2 refresh swaps the live list without a restart" {
+    const gpa = testing.allocator;
+
+    // The list this case rewrites underneath the running child. Its own scratch
+    // file, not the shared fixture, so a failure here cannot corrupt every
+    // other case in the suite.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "hosts", .data = "0.0.0.0 alpha.test\n" });
+    const hosts_path = try tmp.dir.realPathFileAlloc(testing.io, "hosts", gpa);
+    defer gpa.free(hosts_path);
+
+    var vortex = try Instance.start(testing.io, gpa, .{
+        .blocklist_source = hosts_path,
+        .refresh_secs = 1,
+        .readiness = .forwarded_probe,
+    });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    // Before: alpha is on the list, beta is not.
+    try expectBlocked(&vortex, "alpha.test", 0x0A01);
+    try expectForwarded(&vortex, "beta.test", 0x0B01);
+
+    // Swap the file the child is refreshing from. Written whole rather than
+    // appended, so the generation that lands is unambiguous.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "hosts", .data = "0.0.0.0 beta.test\n" });
+
+    // Both directions, and both are necessary: `beta` blocking proves the new
+    // generation is live, and `alpha` no longer blocking proves the old one was
+    // *replaced* rather than merged into it. A swap that leaked the previous
+    // list would pass the first assertion and fail the second.
+    try waitUntilBlocked(&vortex, "beta.test");
+    try expectForwarded(&vortex, "alpha.test", 0x0A02);
+}
+
+test "P2.2 refresh refuses to install an empty list" {
+    const gpa = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "hosts", .data = "0.0.0.0 keeper.test\n" });
+    const hosts_path = try tmp.dir.realPathFileAlloc(testing.io, "hosts", gpa);
+    defer gpa.free(hosts_path);
+
+    var vortex = try Instance.start(testing.io, gpa, .{
+        .blocklist_source = hosts_path,
+        .refresh_secs = 1,
+        .readiness = .forwarded_probe,
+    });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    try expectBlocked(&vortex, "keeper.test", 0x0C01);
+
+    // What a 200 OK serving an error page, or a truncated download, looks like
+    // by the time it reaches the parser: a body with no entries in it.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "hosts", .data = "# everything went away\n" });
+
+    // Several refresh intervals have to actually elapse, or this case passes
+    // without the child having attempted a single refresh — the assertion would
+    // hold for the trivial reason that nothing happened. Three seconds against
+    // the one-second interval configured above.
+    var round: usize = 0;
+    while (round < 3) : (round += 1) {
+        try sleepMs(1_100);
+
+        // The list must still be the old one: installing the empty generation
+        // would silently disarm every block while leaving the process looking
+        // perfectly healthy, which is the worst available outcome and the whole
+        // reason for the guard.
+        try expectBlocked(&vortex, "keeper.test", @intCast(0x0C10 + round));
+    }
+}
+
+// ── Helpers for the resilience cases ──────────────────────────────────────
+
+/// Waits `ms` on the same clock Vortex schedules its own timers against.
+fn sleepMs(ms: u64) !void {
+    try testing.io.sleep(std.Io.Duration.fromMilliseconds(@intCast(ms)), std.Io.Clock.boot);
+}
+
+/// Asserts `name` is answered locally with NXDOMAIN and never forwarded.
+fn expectBlocked(vortex: *Instance, name: []const u8, id: u16) !void {
+    var query_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&query_buf, id, name, .{}));
+
+    var buf: [wire.max_message]u8 = undefined;
+    const answer = try vortex.recvClient(&buf, harness.default_timeout_ms);
+    try testing.expectEqual(id, wire.id(answer));
+    try testing.expectEqual(@as(u4, wire.RCode.name_error), wire.rcode(answer));
+}
+
+/// Asserts `name` reaches the fake upstream, and answers it so the query does
+/// not linger in the pending table.
+fn expectForwarded(vortex: *Instance, name: []const u8, id: u16) !void {
+    var query_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&query_buf, id, name, .{}));
+
+    var upstream_buf: [wire.max_message]u8 = undefined;
+    const forwarded = try vortex.recvUpstream(&upstream_buf, harness.default_timeout_ms);
+
+    var reply_buf: [wire.max_message]u8 = undefined;
+    const reply = try wire.reply(&reply_buf, forwarded.data, .{});
+    try vortex.sendUpstreamReply(&forwarded.from, reply);
+
+    var client_buf: [wire.max_message]u8 = undefined;
+    _ = try vortex.recvClient(&client_buf, harness.default_timeout_ms);
+}
+
+/// Polls until `name` comes back NXDOMAIN, or gives up.
+///
+/// A poll rather than one timed wait because the refresh happens on the child's
+/// own schedule: the case knows a swap is coming, not exactly when. Each round
+/// answers from the upstream if the query is still being forwarded, so the
+/// polling itself leaves no pending entries behind.
+///
+/// **The pause is the point.** Without it a round costs a couple of
+/// milliseconds, so forty of them elapse in well under a second and the loop
+/// gives up before the child's one-second timer has fired even once — a
+/// "refresh never landed" failure that says nothing about refresh. The budget
+/// below is `rounds × pause`, and it has to comfortably exceed the refresh
+/// interval the case configured.
+fn waitUntilBlocked(vortex: *Instance, name: []const u8) !void {
+    const deadline_rounds = 40;
+    const round_pause_ms = 250; // 10s total against a 1s refresh interval
+
+    var round: usize = 0;
+    while (round < deadline_rounds) : (round += 1) {
+        if (round > 0) try sleepMs(round_pause_ms);
+        var query_buf: [wire.max_message]u8 = undefined;
+        try vortex.sendQuery(wire.query(&query_buf, @intCast(0xD000 + round), name, .{}));
+
+        // Whichever arrives first tells us which generation is live.
+        var upstream_buf: [wire.max_message]u8 = undefined;
+        if (vortex.recvUpstream(&upstream_buf, 200)) |forwarded| {
+            // Still the old list. Answer it, then try again.
+            var reply_buf: [wire.max_message]u8 = undefined;
+            const reply = try wire.reply(&reply_buf, forwarded.data, .{});
+            try vortex.sendUpstreamReply(&forwarded.from, reply);
+
+            var client_buf: [wire.max_message]u8 = undefined;
+            _ = vortex.recvClient(&client_buf, harness.default_timeout_ms) catch {};
+            continue;
+        } else |err| switch (err) {
+            error.Timeout => {},
+            else => return err,
+        }
+
+        var client_buf: [wire.max_message]u8 = undefined;
+        const answer = vortex.recvClient(&client_buf, 200) catch continue;
+        if (wire.rcode(answer) == wire.RCode.name_error) return;
+    }
+
+    std.debug.print("'{s}' was never blocked after {d} rounds\n", .{ name, deadline_rounds });
+    return error.RefreshNeverLanded;
+}

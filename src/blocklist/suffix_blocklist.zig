@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const acquire = @import("acquire.zig");
 const Source = @import("../settings.zig").Source;
 const Verdict = @import("policy.zig").Verdict;
 const readFileInto = @import("domain_blocklist.zig").readFileInto;
@@ -41,34 +42,32 @@ pub const SuffixBlockList = struct {
         }
     }
 
+    /// Filename this list takes inside the on-disk cache directory.
+    pub const cache_name = "suffix.txt";
+
     /// Acquires the list into `self.file_body`, then builds the set from it.
     ///
     /// `source` comes from `Settings.suffix_blocklist_source` and must outlive
     /// this call. A `.path` source is read from disk and never touches the
-    /// network.
+    /// network. Retries and the on-disk cache live in
+    /// [acquire.zig](acquire.zig), shared with the exact list.
     pub fn load(
         self: *SuffixBlockList,
         gpa: std.mem.Allocator,
         io: std.Io,
         http_client: *std.http.Client,
         source: Source,
-    ) !void {
-        switch (source) {
-            .url => |url| {
-                const res = try http_client.fetch(.{
-                    .location = .{ .url = url },
-                    .method = .GET,
-                    .response_writer = &self.file_body.writer,
-                });
-                if (res.status != .ok) {
-                    log.err("failed to fetch suffix blocklist '{s}': HTTP {d}", .{ url, @intFromEnum(res.status) });
-                    return error.BlocklistFetchFailed;
-                }
-            },
-            .path => |path| try readFileInto(&self.file_body, io, gpa, path, "suffix blocklist"),
-        }
+        cache_dir: ?[]const u8,
+    ) !acquire.Outcome {
+        const outcome = try acquire.acquire(gpa, io, http_client, .{
+            .source = source,
+            .cache_dir = cache_dir,
+            .cache_name = cache_name,
+            .what = "suffix blocklist",
+        }, &self.file_body);
 
         try self.build(gpa, self.file_body.written());
+        return outcome;
     }
 
     pub fn decide(self: *const SuffixBlockList, domain: []const u8) Verdict {

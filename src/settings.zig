@@ -20,9 +20,10 @@
 //! `deinit` — but it must not outlive the map it was loaded from.
 //!
 //! Not yet covered here (see next_steps.md P2.1): CLI flags, multiple upstreams,
-//! timeouts, negative-cache TTL, and fail-open-vs-closed. Each is one field plus
-//! one line in `fromEnviron` once the code it configures can accept a runtime
-//! value.
+//! timeouts, and negative-cache TTL. Each is one field plus one line in
+//! `fromEnviron` once the code it configures can accept a runtime value.
+//! Fail-open-vs-closed used to be on that list; P2.2 built the consumer, and it
+//! is `blocklist_on_failure` below.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -81,6 +82,30 @@ pub const Source = union(enum) {
     }
 };
 
+/// What to do when a blocklist cannot be obtained at all — neither fetched nor
+/// recovered from the on-disk cache.
+///
+/// Neither answer is safe, which is why this is a setting rather than a default
+/// somebody picked. Fail-closed means a transient outage at the list host takes
+/// the whole network's DNS down. Fail-open means the resolver keeps working and
+/// silently blocks nothing, which is the failure this project has already
+/// rejected once — so `open` is loud: it logs at `.err`, and the refresher
+/// retries on a much shorter interval until it has a list.
+///
+/// `open` is the default because a resolver that will not start is a worse
+/// outage than a resolver that is not yet filtering, and because the on-disk
+/// cache makes reaching this state at all uncommon.
+pub const FailurePolicy = enum {
+    /// Start (or keep running) with an empty blocklist.
+    open,
+    /// Refuse to start.
+    closed,
+
+    pub fn parse(raw: []const u8) ?FailurePolicy {
+        return std.meta.stringToEnum(FailurePolicy, raw);
+    }
+};
+
 pub const Settings = struct {
     /// Address and port the resolver listens on for client queries.
     listen_host: []const u8,
@@ -106,6 +131,26 @@ pub const Settings = struct {
     /// possible failure: a blocklist that loads clean and blocks zero domains.
     blocklist_source: Source,
     suffix_blocklist_source: Source,
+
+    /// What to do when a list cannot be obtained at all; see `FailurePolicy`.
+    blocklist_on_failure: FailurePolicy,
+
+    /// Directory holding the on-disk copy of each fetched list, written on
+    /// success and read when a fetch fails. Empty disables the cache, which
+    /// gives back the pre-P2.2 behavior of depending on the network every run.
+    ///
+    /// Relative paths resolve against the working directory, like the `.env`
+    /// file does — a service unit should set this to an absolute path under its
+    /// own state directory.
+    cache_dir: []const u8,
+
+    /// How often to rebuild both lists from their sources, in seconds. 0
+    /// disables refresh, which is what a `.path`-sourced development run wants.
+    ///
+    /// A list fetched at boot on a machine that stays up for months is a list
+    /// that is months stale; this is the knob that stops that being the only
+    /// mode. See `refresherLoop` in main.zig.
+    blocklist_refresh_secs: usize,
 
     /// Diagnostic verbosity, and whether records render for a human or a
     /// parser. Applied by `obs_log.configure`; see [obs/log.zig](obs/log.zig).
@@ -137,6 +182,14 @@ pub const Settings = struct {
         // hagezi light list on 2026-08-10 after that entire GitHub *account*
         // disappeared — not just the file — leaving no successor to point at.
         .suffix_blocklist_source = .{ .url = "https://small.oisd.nl/domainswild2" },
+
+        .blocklist_on_failure = .open,
+        .cache_dir = ".vortex-cache",
+
+        // Daily. These lists change on the order of days, and the upstream
+        // hosts are shared infrastructure — a shorter interval spends their
+        // bandwidth to learn nothing.
+        .blocklist_refresh_secs = 24 * 60 * 60,
 
         // Tracks `std.log`'s build-mode default — debug under `Debug`, info
         // under the release modes — so adding this knob changes nothing for
@@ -171,8 +224,11 @@ pub const Settings = struct {
         InvalidLogLevel,
         /// `VORTEX_LOG_FORMAT` was set to something that isn't a format.
         InvalidLogFormat,
-        /// `VORTEX_CACHE_MAX_ENTRIES` was set to something that isn't a count.
+        /// `VORTEX_CACHE_MAX_ENTRIES` or `VORTEX_BLOCKLIST_REFRESH_SECS` was set
+        /// to something that isn't a count.
         InvalidCacheSize,
+        /// `VORTEX_BLOCKLIST_ON_FAILURE` was set to something that isn't a policy.
+        InvalidFailurePolicy,
         /// A variable that no longer exists under that name is still set. See
         /// `renamed`.
         RenamedSetting,
@@ -215,6 +271,21 @@ pub const Settings = struct {
 
             .blocklist_source = envSource(environ, "VORTEX_BLOCKLIST_SOURCE", defaults.blocklist_source),
             .suffix_blocklist_source = envSource(environ, "VORTEX_SUFFIX_BLOCKLIST_SOURCE", defaults.suffix_blocklist_source),
+
+            .blocklist_on_failure = try envEnum(
+                FailurePolicy,
+                environ,
+                "VORTEX_BLOCKLIST_ON_FAILURE",
+                defaults.blocklist_on_failure,
+                error.InvalidFailurePolicy,
+                "open or closed",
+            ),
+            .cache_dir = envStrAllowEmpty(environ, "VORTEX_CACHE_DIR", defaults.cache_dir),
+            .blocklist_refresh_secs = try envCount(
+                environ,
+                "VORTEX_BLOCKLIST_REFRESH_SECS",
+                defaults.blocklist_refresh_secs,
+            ),
 
             .log_level = try envEnum(
                 obs_log.Level,
@@ -274,6 +345,18 @@ pub const Settings = struct {
         const raw = environ.get(key) orelse return fallback;
         if (raw.len == 0) return fallback;
         return Source.parse(raw);
+    }
+
+    /// `envStr`, except that an explicitly empty value means the empty string
+    /// rather than "unset".
+    ///
+    /// Only `VORTEX_CACHE_DIR` uses this, and it is the one variable where the
+    /// distinction is meaningful: an empty *host* or *port* says nothing, but an
+    /// empty *directory* says "nowhere", which is how the on-disk cache is
+    /// turned off. Without this the setting would have no off switch at all —
+    /// `VORTEX_CACHE_DIR=` would silently resolve back to the default path.
+    fn envStrAllowEmpty(environ: *const Environ.Map, key: []const u8, fallback: []const u8) []const u8 {
+        return environ.get(key) orelse fallback;
     }
 
     fn envStr(environ: *const Environ.Map, key: []const u8, fallback: []const u8) []const u8 {
