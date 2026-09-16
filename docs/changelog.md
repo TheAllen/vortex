@@ -9,6 +9,63 @@ Newest first. Open work lives in [next_steps.md](next_steps.md).
 
 ---
 
+## Landed 2026-09-15 — the cache reclaims expired entries on read
+
+`Cache.get` now removes and frees an entry it finds expired, instead of reporting a miss and
+leaving it for the sweeper.
+
+The old behavior was deliberate and its comment gave two reasons, both of which were false:
+
+> *An expired entry reports a miss and is left for the sweeper: reclaiming it here would turn
+> every lookup into a writer and serialize the read path for no gain.*
+
+**"Turn every lookup into a writer"** — `get` already takes the cache's `Io.Mutex`, which has
+no shared mode. Every lookup was already a writer and the read path was already fully
+serialized, so reclaiming inside that critical section costs a hash remove and a free and
+changes nothing about concurrency. The sentence describes an `RwLock` the cache does not
+have. (`Policy` acquired one on 09-13, which is probably where the intuition came from.)
+
+**"For no gain"** — the gain is a *slot*, not memory. `put` does not evict at capacity; it
+undoes the insert and declines to cache. So a dead entry held a live one out until the next
+sweep, and the sweeper runs every 30 ticks of the 1 s loop. With 300-second TTLs a cache
+sitting at `max_entries` produces expired entries continuously, so the failure mode was a
+resolver that had quietly stopped accepting new answers while full of ones it could not
+serve — for up to 30 seconds at a time.
+
+The cost lands only on the path where a hit turns out to be stale, not on an ordinary miss
+and not on a live hit.
+
+### What the sweeper is now for
+
+It is the backstop rather than the primary reclaimer. Anything still expired at sweep time is
+a **cold** key — one that expired and was never asked for again — and nothing else would ever
+collect those, so the sweep still has to exist. The split is about what each side may cost:
+`get` reclaims exactly one entry under a lock it already holds, while the sweep walks the
+whole map and allocates, which is why it stays on a timer.
+
+### One thing that looked like a trap and was not
+
+Removing on `get` means the following `put` for that key no longer finds an existing entry,
+so it takes the capacity branch instead of replacing in place. That is still fine: the
+removal dropped the count by one, so the insert lands at exactly `max_entries` and the
+`count() > max_entries` test does not fire. The only behavioural difference is a narrow
+window where another insert takes the freed slot first — which is fairer than a dead entry
+reserving it.
+
+### Tests
+
+`zig build test` → **163/163** (162 → 163). The test that pinned the old behaviour was
+inverted rather than deleted, since its `map.count()` assertion is exactly what distinguishes
+"reclaimed" from "skipped" — the miss alone looks identical either way. A second case builds
+a one-entry cache, lets its only entry expire, and checks that a *different* key can then be
+cached, which is the capacity argument above stated as a property.
+
+Both are mutation-checked, and the pair covers the two ways to get this wrong: reverting to a
+plain `return null` fails both assertions, and removing the key without freeing its bytes
+trips the testing allocator's leak check in both.
+
+---
+
 ## Landed 2026-09-13 — P2.2 blocklist resilience
 
 A failed blocklist fetch used to be fatal: `error.BlocklistFetchFailed` propagated out of

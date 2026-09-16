@@ -1,7 +1,7 @@
 # Next Steps — Road to Production-Ready
 
-Reviewed **2026-09-13** against the current source (Zig 0.16.0, `zig build test` →
-**162/162 pass** — 146 unit tests, of which 126 are real behavior tests, plus **16
+Reviewed **2026-09-15** against the current source (Zig 0.16.0, `zig build test` →
+**163/163 pass** — 147 unit tests, of which 127 are real behavior tests, plus **16
 integration cases**). **No open P0s, and no open P1 bugs** — all three P0s are pinned by
 regression tests that fail under mutation.
 
@@ -81,7 +81,9 @@ can create load.
   `(qname, qtype, qclass)`, checked in `handleQuery` **after** the policy verdict so a
   refreshed blocklist is never shadowed by a stale entry, and filled in `dispatcherLoop`.
   Serves a copy with the client's transaction ID restored and every TTL aged by the entry's
-  age; RFC 2308 negative caching; swept every 30 s. `VORTEX_CACHE_MAX_ENTRIES=0` disables it
+  age; RFC 2308 negative caching. An expired entry is reclaimed by the `get` that finds it,
+  with the 30 s sweep as the backstop for keys nobody asks for again.
+  `VORTEX_CACHE_MAX_ENTRIES=0` disables it
 - A `Policy` filter chain — allowlist → exact blocklist → suffix blocklist — with a
   three-valued `Verdict` (`allow`/`block`/`pass`) ([policy.zig](../src/blocklist/policy.zig)),
   over an immutable `Snapshot` held behind an `Io.RwLock` so a refresh can replace both lists
@@ -190,11 +192,11 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
 4. **Graceful shutdown.** No signal handling; the only exit is a crash or Ctrl-C mid-write.
    Catch SIGINT/SIGTERM, `group.cancel`, flush the log, run the deferred deinits.
 5. **Test coverage — the harness landed 2026-09-12; what is left is listed below.**
-   `zig build test` → **162/162**: the 146-test unit suite plus **16 integration cases**
+   `zig build test` → **163/163**: the 147-test unit suite plus **16 integration cases**
    ([tests/](../tests/), see
    [changelog.md](changelog.md#landed-2026-09-12--p25-integration-harness)).
 
-   The unit suite is **146/146, of which 144 are real**: 31 `cache`,
+   The unit suite is **147/147, of which 145 are real**: 32 `cache`,
    17 `resource_record` (10 walk tests including a fuzz target, plus 7 `parseRdata`
    tests from 09-08), 17 `name_reader` (including a fuzz target), 9 `Header`, 8 `obs/log`,
    8 `settings`, 7 `PendingTable`, **6 `Policy`** and **5 `acquire`** (all new on 09-13),
@@ -207,7 +209,7 @@ cap. Distinct from per-client rate limiting (P2.7): this protects the process it
    (`root.zig`'s `add(3, 7)` stub was the third; it is deleted.)
 
    Counted exactly, so the headline number is not mistaken for behavior coverage:
-   **146 = 126 behavior tests + 18 guards + 1 aggregator + 1 no-op.** The guard count tracks
+   **147 = 127 behavior tests + 18 guards + 1 aggregator + 1 no-op.** The guard count tracks
    the module count exactly; it went 16 → 18 on 09-13 with `acquire.zig` and
    `utils/backoff.zig`.
 

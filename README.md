@@ -171,7 +171,7 @@ QDCOUNT), QName case normalization, cacheable SOA on blocked answers, replies
 verified against the question that provoked them, SERVFAIL on upstream timeout,
 and TC=1 rather than silent corruption when a reply overflows the receive buffer.
 Every one of those is now asserted end to end against the running binary, not just
-against the pure function behind it. `zig build test` runs **162 tests** — 146 unit
+against the pure function behind it. `zig build test` runs **163 tests** — 147 unit
 tests plus 16 integration cases — under both Debug and ReleaseSafe.
 
 **Responses are cached, with honest TTLs.** The compression → parsing → caching
@@ -202,14 +202,14 @@ The gap is everything around the datapath: EDNS0, TCP fallback, graceful
 shutdown, and metrics. [`docs/next_steps.md`](docs/next_steps.md) is the full
 prioritized board.
 
-The testing gap that used to sit here is closed. The 146 unit tests are all over
+The testing gap that used to sit here is closed. The 147 unit tests are all over
 pure functions, which left `handleQuery`, `dispatcherLoop` and the ingress loop
 with no runtime coverage at all — the two functions where this project's last two
 real bugs lived. As of 2026-09-12 [`tests/`](tests/) spawns the real binary
 against a scratch config and a fake upstream and drives it over UDP: 16 cases,
 every one confirmed to fail when the behavior it covers is deliberately broken.
 
-`zig build test` runs both suites (162 tests); `zig build test-integration` runs
+`zig build test` runs both suites (163 tests); `zig build test-integration` runs
 just the harness, and `-Dtest-filter=<substr>` narrows it to a single case.
 
 What is *not* covered there is concurrency — every case is one query at a time —

@@ -380,9 +380,18 @@ pub const Cache = struct {
     /// and ages the TTLs in what it was given — so a borrow would also be a
     /// write into the shared entry, corrupting it for every later reader.
     ///
-    /// An expired entry reports a miss and is left for the sweeper: reclaiming
-    /// it here would turn every lookup into a writer and serialize the read
-    /// path for no gain.
+    /// **An expired entry is reclaimed here, not left for the sweeper.** The
+    /// lock above is already exclusive — `Io.Mutex` has no shared mode, so every
+    /// lookup is a writer whether or not this removes anything — which makes the
+    /// reclaim a hash remove and a free rather than a concurrency cost, and it is
+    /// paid only on the rare path where a hit turns out to be stale.
+    ///
+    /// What it buys is a **slot**, not the memory. `put` does not evict at
+    /// capacity; it undoes the insert and declines to cache. So a dead entry
+    /// holds a live one out until the next sweep, and with 300-second TTLs a
+    /// cache sitting at `max_entries` produces those continuously — a resolver
+    /// that has stopped accepting new answers while full of ones it cannot
+    /// serve.
     pub fn get(self: *Cache, key: CacheKey, now_ns: i64, out: []u8) ?Hit {
         self.mutex.lock(self.io) catch {
             std.log.err("cache: failed to acquire lock on get", .{});
@@ -391,7 +400,13 @@ pub const Cache = struct {
         defer self.mutex.unlock(self.io);
 
         const entry = self.map.getContext(key, self.ctx) orelse return null;
-        if (entry.isExpired(now_ns)) return null;
+        if (entry.isExpired(now_ns)) {
+            // `fetchRemove` rather than `remove`: the entry owns `bytes`, and
+            // dropping the key without freeing them is the same leak the
+            // unmanaged map invites in `put`.
+            if (self.map.fetchRemoveContext(key, self.ctx)) |kv| self.gpa.free(kv.value.bytes);
+            return null;
+        }
         // Treated as a miss rather than truncated: a short buffer is a caller
         // bug, and half a DNS message is worse than none.
         if (entry.bytes.len > out.len) return null;
@@ -446,6 +461,18 @@ pub const Cache = struct {
     }
 
     /// Removes and frees every entry past its deadline, returning the count.
+    ///
+    /// **This is the backstop, not the primary reclaimer.** `get` reclaims an
+    /// entry the moment it finds one expired, so anything still here at sweep
+    /// time is a *cold* key — one that expired and was never asked for again.
+    /// Nothing else would ever collect those, which is why the sweep still has
+    /// to exist: without it a cache could fill permanently with names that had
+    /// one burst of traffic and then went quiet.
+    ///
+    /// The split matters for what each side is allowed to cost. `get` runs on
+    /// the query path and reclaims exactly one entry it was already holding the
+    /// lock for; this walks the whole map and allocates, so it runs on the
+    /// sweeper's timer instead.
     ///
     /// Reports a number rather than the evicted entries, unlike
     /// `sweepExpiredQueries`. That table hands back `PendingQuery` values so the
@@ -704,7 +731,7 @@ test "get is a copy, not a borrow" {
     try testing.expectEqualSlices(u8, &reply, again[0..reply.len]);
 }
 
-test "an expired entry reports a miss but is not reclaimed by get" {
+test "an expired entry reports a miss and is reclaimed by get" {
     var threaded: std.Io.Threaded = undefined;
     var cache = testCache(&threaded, 16);
     defer cache.deinit();
@@ -715,9 +742,52 @@ test "an expired entry reports a miss but is not reclaimed by get" {
     try cache.put(key, &[_]u8{ 1, 2, 3 }, 0, 1000);
 
     var out: [64]u8 = undefined;
+
+    // One nanosecond either side of the deadline, so the reclaim is pinned to
+    // expiry and not to "get was called twice".
     try testing.expect(cache.get(key, 999, &out) != null);
+    try testing.expectEqual(@as(usize, 1), cache.map.count());
+
     try testing.expect(cache.get(key, 1000, &out) == null);
-    // Still resident: reclaiming on the read path is the sweeper's job.
+
+    // Gone, without a sweep having run. The count is the whole assertion: the
+    // miss alone would look identical if the entry were merely skipped, which
+    // is what this used to do.
+    try testing.expectEqual(@as(usize, 0), cache.map.count());
+
+    // And a second lookup of a key that is now absent is still a clean miss
+    // rather than a double free — `deinit` below is what would catch that.
+    try testing.expect(cache.get(key, 1000, &out) == null);
+}
+
+test "reclaiming on get frees the slot a full cache was refusing to reuse" {
+    var threaded: std.Io.Threaded = undefined;
+
+    // A cache of exactly one entry, so "at capacity" is reachable in two puts
+    // rather than ten thousand.
+    var cache = testCache(&threaded, 1);
+    defer cache.deinit();
+    defer threaded.deinit();
+
+    var buf: [64]u8 = undefined;
+    const stale = try keyFromWire(questionWire(&buf, 0), 0x55);
+    var fresh = stale;
+    fresh.qtype = 28; // same name, AAAA — a genuinely distinct key
+
+    try cache.put(stale, &[_]u8{ 1, 2, 3 }, 0, 1000);
+
+    // At capacity with a dead entry in the only slot. This is the state the
+    // change exists for: `put` declines new keys here rather than evicting, so
+    // before the reclaim landed, `fresh` could not be cached at all until the
+    // next sweep — up to 30 seconds of a resolver that has quietly stopped
+    // accepting answers while full of one it cannot serve.
+    var out: [64]u8 = undefined;
+    try testing.expect(cache.get(stale, 1000, &out) == null);
+
+    try cache.put(fresh, &[_]u8{ 4, 5, 6 }, 1000, 2000);
+
+    const hit = cache.get(fresh, 1000, &out) orelse return error.FreshEntryNotCached;
+    try testing.expectEqualSlices(u8, &[_]u8{ 4, 5, 6 }, out[0..hit.len]);
     try testing.expectEqual(@as(usize, 1), cache.map.count());
 }
 
