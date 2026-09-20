@@ -458,9 +458,18 @@ the compile-time `127.0.0.1` was an accidental safety interlock. Now
 `VORTEX_LISTEN_HOST=0.0.0.0` is one line in a file, and two open items become live exposure
 the moment anyone writes it:
 
-- **P1.5** — the ingress loop does an unbounded `group.async` + `gpa.dupe` per datagram.
-  A UDP flood spawns unbounded coroutines and unbounded heap. Memory-exhaustion DoS.
-  **As of 08-09 this is the only open P1 and the last code-level gate.**
+- **P1.5** — the ingress loop spawns a handler and does a `gpa.dupe` per datagram with no
+  bound of its own. **As of 08-09 this is the only open P1 and the last code-level gate.**
+
+  **Premise corrected 2026-09-19.** This bullet read *"a UDP flood spawns unbounded
+  coroutines and unbounded heap. Memory-exhaustion DoS."* `std.Io.Threaded` — which is what
+  `std.process.Init` gives us — already caps handlers at `cpu_count - 1` and runs the
+  overflow **inline on the calling thread** rather than queueing it, which bounds the dupe
+  heap along with it. What a flood actually produces is a *serialized ingress loop* (drops
+  move into the kernel's receive buffer, invisible to us) and an unbounded **`PendingTable`**
+  holding 5 s of arrivals. Still a gate, still the only open P1 — the cap just belongs on
+  in-flight pending queries rather than on spawned handlers. Evidence and the full reading
+  are in [next_steps.md](next_steps.md) under P1.5.
 - **P2.7** — no per-client rate limiting, so it can be conscripted into amplification.
 
 The 08-09 datapath work removed several *other* reasons not to expose this — replies are now
@@ -557,7 +566,7 @@ are all about surviving contact with a real network:
 | ~~P1.1 / P1.2 / P1.3 / P1.4 / P4.2~~ ✅ 08-09 | Datapath closed out; P1.5 is the only P1 left |
 | ~~**P2.5 integration harness**~~ ✅ 09-12 | Topped this list for one pass and came off it. 12 end-to-end cases, all mutation-checked. It was here because both of the last two real bugs were found only by driving sockets; everything below now ships with it in place, which was the point |
 | ~~**P2.2 blocklist cache + refresh**~~ ✅ 09-13 | Topped this list for one pass and came off it, like the harness before it. The 404 that proved it was fixed by swapping in another hard-coded URL, which re-armed the same trap against a different host — one that rate-limits; that class is now closed by retry + cache + a fail policy, not by picking a better URL |
-| **P1.5 concurrency cap** | Now the top of this list. Gate for leaving localhost |
+| **P1.5 in-flight cap** | Now the top of this list. Gate for leaving localhost. Scope corrected 09-19: the bound belongs on `PendingTable` occupancy, not on spawned handlers — the runtime already caps those |
 | P2.7 rate limiting | Gate for leaving localhost |
 | P2.6 bind + service unit | `0.0.0.0:53`, privileged port, launchd/systemd |
 | P2.4 graceful shutdown | Currently the only exit is a crash or Ctrl-C mid-write |

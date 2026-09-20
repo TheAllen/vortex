@@ -125,14 +125,58 @@ that way — is in [changelog.md](changelog.md#reference--the-three-closed-p0s-i
 **Only P1.5 remains open.** P1.1–P1.4 landed 2026-08-09; see
 [changelog.md](changelog.md#p11p14-all-landed-2026-08-09).
 
-**P1.5 — bounded in-flight concurrency / backpressure.** The ingress loop does an unbounded
+**P1.5 — bounded in-flight work / backpressure.** The ingress loop does an unbounded
 `group.async(handleQuery, …)` plus a `gpa.dupe` **per received datagram**. The P1.2 fix put
 a `catch` on that `dupe`, so an allocation failure now sheds one datagram instead of killing
-the server — but that is a backstop, not a bound: nothing caps how many handlers are in
-flight before the allocator starts failing. A UDP flood still spawns unbounded coroutines and
-unbounded heap — a trivial memory-exhaustion DoS the moment this leaves localhost. Cap
-concurrent handlers (semaphore / fixed worker pool / bounded queue) and shed load past the
-cap. Distinct from per-client rate limiting (P2.7): this protects the process itself.
+the server — but that is a backstop, not a bound. Still the last code-level gate on a bind
+off localhost, and still distinct from per-client rate limiting (P2.7): this protects the
+process itself.
+
+> **Premise corrected 2026-09-19 — the cap belongs somewhere else than this entry said.**
+> This item read *"a UDP flood still spawns unbounded coroutines and unbounded heap — a
+> trivial memory-exhaustion DoS"* and prescribed *"cap concurrent handlers (semaphore /
+> fixed worker pool / bounded queue)"*. Both halves are wrong about the runtime we actually
+> get: `std.process.Init` hands us a `std.Io.Threaded` (`std/start.zig:724`), and read
+> against the 0.16.0 source —
+>
+> - **`Io.Threaded` already caps the handlers.** `async_limit` defaults to `cpu_count - 1`
+>   (`std/Io/Threaded.zig:1639`), and `groupAsync` does **not** queue past it: at the limit
+>   it destroys the task and calls `groupAsyncEager` → `start(context)` **inline on the
+>   calling thread** (`std/Io/Threaded.zig:2197`). Same inline fallback on
+>   `builtin.single_threaded`, on task-allocation OOM, and on `Thread.spawn` failure.
+>   `busy_count` is decremented only when a task *returns* (`std/Io/Threaded.zig:1799`), so
+>   a handler blocked in a syscall holds its thread for the duration.
+> - **The `dupe` heap is bounded by the same mechanism.** Past the limit handlers run inline
+>   and free on return, so roughly `cpu_count` dupes are live at once — not a flood's worth.
+>
+> **What a flood actually does**, in two parts, neither fixed by a semaphore around the spawn:
+>
+> 1. **The ingress loop goes serial.** Past `async_limit`, `group.async` is a blocking call
+>    *inside the loop*, so it stops calling `receive` while it runs a policy lookup and an
+>    upstream send. Throughput collapses to serial and the kernel's UDP receive buffer
+>    overflows — the drops happen in the kernel, where Vortex cannot see or count them.
+> 2. **`PendingTable` grows without bound, and it is the real vector.** `handleQuery`
+>    inserts an entry and returns immediately after the upstream send
+>    ([main.zig](../src/main.zig), `appendQuery` then `send`) — it never awaits the reply,
+>    `dispatcherLoop` does. Entries live until answered or swept at 5 s, so occupancy is
+>    arrival-rate × 5 s and nothing else bounds it.
+>
+> **So: cap in-flight pending queries, not spawned handlers.** Shed the datagram when
+> `PendingTable` is at capacity, before the `dupe` and the spawn — the same position the
+> oversized-query FORMERR already occupies. A handler semaphore mostly re-implements what
+> the runtime is already doing.
+>
+> **Do not lean on the inline degradation as the backpressure mechanism.** `async` is
+> explicitly *permitted* to run inline — that is why it may return a null future, and why
+> `io.concurrent` exists separately to demand parallelism and fail with
+> `error.ConcurrencyUnavailable`. What is written above is the 0.16.0 implementation, not a
+> contract it promises to keep. Note also that `Group.concurrent` uses `concurrent_limit`,
+> which defaults to `.unlimited`: moving handlers onto it would make this entry's original
+> unbounded-spawn premise true.
+>
+> **The side benefit is testability.** A cap on `PendingTable` is asserted against a number
+> Vortex owns and can report, rather than against a coroutine count the harness has no way
+> to observe from outside the process.
 
 ---
 
@@ -553,6 +597,11 @@ the number of in-flight handlers a flood can create.
 > on its own. Rewriting this section against that is a separate pass, and the case for doing
 > so keeps strengthening: every item it names is done, what is left is entirely the
 > deployability block, and the list is now down to three.
+>
+> **2026-09-19:** the verbatim text above ends on *"nothing yet bounds the number of in-flight
+> handlers a flood can create"* — which is no longer the right way to state the gap. The
+> runtime bounds the handlers; what is unbounded is `PendingTable`. The order is unchanged,
+> P1.5 is still first, and only its shape moved. See P1.5 above.
 
 For the view from above — how far along the whole project is, which of these bands is worth
 the most per unit of effort, and why "no open P0s" does **not** mean "safe to deploy" — see
