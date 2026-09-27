@@ -2,7 +2,14 @@
 
 Reviewed **2026-09-15** against the current source (Zig 0.16.0, `zig build test` →
 **163/163 pass** — 147 unit tests, of which 127 are real behavior tests, plus **16
-integration cases**). **No open P0s, and no open P1 bugs** — all three P0s are pinned by
+integration cases**). *Updated 2026-09-27: 166/166 — 149 unit, 17 integration.*
+
+**2026-09-27: background loops now get threads of their own.** Spawning them with
+`group.async` made Vortex hang at startup on any host with ≤ 3 CPUs, and serialized every
+handler on a 4-CPU one; see
+[changelog.md](changelog.md#landed-2026-09-27--background-loops-get-threads-of-their-own).
+This was a prerequisite for P1.5 and P2.4, both of which reason about what the runtime does
+at its limits. **No open P0s, and no open P1 bugs** — all three P0s are pinned by
 regression tests that fail under mutation.
 
 **P2.2 blocklist resilience landed 2026-09-13**, and with it the last of the two
@@ -140,6 +147,7 @@ process itself.
 > against the 0.16.0 source —
 >
 > - **`Io.Threaded` already caps the handlers.** `async_limit` defaults to `cpu_count - 1`
+>   (since 2026-09-27: `VORTEX_HANDLER_THREADS` plus one slot per background loop)
 >   (`std/Io/Threaded.zig:1639`), and `groupAsync` does **not** queue past it: at the limit
 >   it destroys the task and calls `groupAsyncEager` → `start(context)` **inline on the
 >   calling thread** (`std/Io/Threaded.zig:2197`). Same inline fallback on

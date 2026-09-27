@@ -9,6 +9,60 @@ Newest first. Open work lives in [next_steps.md](next_steps.md).
 
 ---
 
+## Landed 2026-09-27 — background loops get threads of their own
+
+**A startup hang on any host with three or fewer CPUs**, found while planning P1.5 and
+reproduced before it was fixed. The dispatcher, sweeper and refresher were spawned with
+`group.async`. `Io.Threaded` sizes `async_limit` at CPUs − 1, and at the limit `async` does
+not queue — it runs the task **inline on the calling thread** (`std/Io/Threaded.zig`,
+`groupAsync` → `groupAsyncEager`). A loop never returns, so whichever loop hit the limit ran
+inside `main` forever and the ingress loop never started: bound, silent, unanswering.
+
+| CPUs | Before |
+|---|---|
+| ≤ 2 | Hung at startup under any config |
+| 3 | Hung at startup under the default config (refresh on = three loops, two slots) |
+| 4 | Started, but the loops held all three slots for life, so every handler ran inline on the ingress thread — fully serial |
+
+Reproduced on a 10-CPU machine by forcing `async_limit` to 2: with refresh off it served,
+with the default refresh it never logged `listening=`.
+
+**The fix is two parts, and they cover different halves:**
+
+- **Loops start with `group.concurrent`** (`spawnLoop` in [main.zig](../src/main.zig)). It gets a
+  thread or fails with `error.ConcurrencyUnavailable`, which is now fatal at startup. The inline
+  fallback also fires on task-allocation OOM and on `Thread.spawn` failure, so this closes the
+  hang for every cause, not just the limit.
+- **`async_limit` is raised by the loop count** (`asyncLimit`). `concurrent` tasks still count in
+  the same busy counter `async` is compared against, so without this the loops would still eat
+  the handlers' slots. This is what needed `main` to own its `Io.Threaded` — `std.process.Init`
+  exposes its runtime only as a type-erased `Io`, and `setAsyncLimit` is a method on the
+  concrete type.
+
+`VORTEX_HANDLER_THREADS` makes the handler share an operator knob (default CPUs − 1, and `0`
+is legal: every handler inline on the ingress thread).
+
+**Two bugs found on the way, both on failure paths:**
+
+- **Owning the runtime broke error exits.** When `main` returns an error, `start.zig` logs it
+  through `logFn` *after* `main`'s defers have run — and `obs_log` still pointed at the
+  now-deinitialized runtime, so the record deadlocked on its stderr lock. The fail-closed case
+  caught it as a hang. `obs_log` is now handed back to `init.io` before the runtime goes.
+- **The harness buried "did not start" under a crash.** `Instance.start` copied the spawned
+  `Child` into the instance and kept its errdefer on the local. On the not-ready path
+  `reportChildLog` killed and reaped the instance's copy, then the errdefer killed the stale
+  local — a reaped pid — and panicked with `SRCH`. The errdefer now targets the instance.
+
+**Tests:** 166/166 (was 163/163) — 149 unit plus 17 integration: a `settings` test pinning
+`0` as distinct from unset, an `asyncLimit` test, and an integration case that starts with
+`VORTEX_HANDLER_THREADS=0` and refresh on, then round-trips a forwarded query. Mutation-checked:
+reverting to `async` loops without the extra slots fails it with `VortexDidNotStart`. Reverting
+*only* `concurrent` → `async` passes, by design — with the slots reserved the loops fit; what
+`concurrent` adds is that the OOM and spawn-failure fallbacks become errors instead of hangs,
+which no harness case can provoke.
+
+---
+
 ## Landed 2026-09-15 — the cache reclaims expired entries on read
 
 `Cache.get` now removes and frees an entry it finds expired, instead of reporting a miss and
