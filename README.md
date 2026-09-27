@@ -64,6 +64,7 @@ and edit. Running with no `.env` at all is a supported mode.
 | `VORTEX_BLOCKLIST_SOURCE` | StevenBlack `hosts` (URL or local path) |
 | `VORTEX_SUFFIX_BLOCKLIST_SOURCE` | oisd `small.oisd.nl/domainswild2` (URL or local path) |
 | `VORTEX_CACHE_MAX_ENTRIES` | `10000` (`0` disables the cache) |
+| `VORTEX_HANDLER_THREADS` | CPU count − 1 (`0` handles every query on the ingress thread) |
 | `VORTEX_ENV_FILE` | `.env` |
 
 A missing `.env` is fine; a file named explicitly via `VORTEX_ENV_FILE` that

@@ -85,6 +85,10 @@ pub const Options = struct {
     /// inside their own scratch directory.
     cache_dir: []const u8 = "",
 
+    /// `VORTEX_HANDLER_THREADS`. Null leaves it unset, so the child sizes its
+    /// handler pool from the CPU count like a real deployment does.
+    handler_threads: ?usize = null,
+
     /// How `start` decides the child is up. See `Readiness`.
     readiness: Readiness = .blocked_probe,
 };
@@ -164,25 +168,32 @@ pub const Instance = struct {
         defer environ.deinit();
         try environ.put("VORTEX_ENV_FILE", env_path);
 
-        var child = try std.process.spawn(io, .{
-            .argv = &.{build_options.vortex_exe},
-            .environ_map = &environ,
-            .stdin = .ignore,
-            .stdout = .ignore,
-            .stderr = .pipe,
-        });
-        errdefer child.kill(io);
-
+        // Spawned straight into the instance, with the errdefer on the
+        // instance's copy. `Child` is a value: an errdefer on a local that was
+        // then copied in would kill a stale duplicate, whose id is still set
+        // after `reportChildLog` has killed and reaped the real one — and the
+        // second kill of a reaped pid panics with SRCH, burying the "did not
+        // start" diagnostic under a harness crash.
         var instance: Instance = .{
             .io = io,
             .gpa = gpa,
-            .child = child,
+            .child = try std.process.spawn(io, .{
+                .argv = &.{build_options.vortex_exe},
+                .environ_map = &environ,
+                .stdin = .ignore,
+                .stdout = .ignore,
+                .stderr = .pipe,
+            }),
             .child_stderr = .empty,
             .client = client,
             .upstream = upstream,
             .listen_addr = listen_addr,
             .tmp = tmp,
         };
+        errdefer {
+            instance.stopChild();
+            instance.child_stderr.deinit(gpa);
+        }
 
         try instance.waitUntilReady(opts.readiness);
         return instance;
@@ -612,6 +623,9 @@ fn writeEnvFile(io: Io, gpa: std.mem.Allocator, tmp: *testing.TmpDir, fields: En
     // binary's own default rather than one the harness picked for it.
     if (fields.opts.on_failure) |policy| {
         try body.print(gpa, "VORTEX_BLOCKLIST_ON_FAILURE={s}\n", .{policy});
+    }
+    if (fields.opts.handler_threads) |n| {
+        try body.print(gpa, "VORTEX_HANDLER_THREADS={d}\n", .{n});
     }
 
     try tmp.dir.writeFile(io, .{ .sub_path = "vortex.env", .data = body.items });

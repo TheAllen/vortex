@@ -672,14 +672,68 @@ fn supervise(io: std.Io, ctx: *const Context, name: []const u8, loop: LoopFn) st
     }
 }
 
+/// Handler threads when `VORTEX_HANDLER_THREADS` is unset: `std.Io.Threaded`'s
+/// own default of one less than the CPU count, so the ingress thread and the
+/// handlers together fill the machine.
+fn defaultHandlerThreads() usize {
+    const cpus = std.Thread.getCpuCount() catch 1;
+    return cpus -| 1;
+}
+
+/// The `async_limit` that leaves `handler_threads` slots for handlers once
+/// `loops` long-lived loops are running.
+///
+/// The addition is the point. `Io.Threaded` keeps one busy count for `async`
+/// and `concurrent` tasks alike, and compares it against `async_limit` when an
+/// `async` task arrives. A loop never returns, so without the extra slots every
+/// loop permanently takes one away from the handlers — on a 4-CPU host the
+/// three loops took all three, and every query ran inline on the ingress
+/// thread.
+fn asyncLimit(handler_threads: usize, loops: usize) std.Io.Limit {
+    return .limited(handler_threads + loops);
+}
+
+/// Starts a supervised background loop on a thread of its own.
+///
+/// `concurrent`, never `async`. Once the async limit is reached, `async` does
+/// not queue a task: it runs it **inline on the calling thread**. For a
+/// per-query handler that is only a slowdown. For a loop that never returns it
+/// means `main` never returns from the spawn — the ingress loop never starts,
+/// and the process sits there bound and silent. That was a real startup hang on
+/// any host with three or fewer CPUs (two slots for three loops, with the
+/// default refresh interval). `concurrent` either gets a thread or fails, and a
+/// failure here is fatal at startup rather than a hang nobody can diagnose.
+fn spawnLoop(group: *std.Io.Group, io: std.Io, ctx: *const Context, name: []const u8, loop: LoopFn) !void {
+    group.concurrent(io, supervise, .{ io, ctx, name, loop }) catch |err| {
+        std.log.err("cannot start {s} loop on its own thread: {s}", .{ name, @errorName(err) });
+        return err;
+    };
+}
+
 pub fn main(init: std.process.Init) !void {
-    // A standard set of pre-initialized useful APIs
-    const io = init.io;
     const gpa = init.gpa;
+
+    // Our own runtime rather than `init.io`, because the async limit has to be
+    // raised by the number of background loops (see `asyncLimit`) and
+    // `std.process.Init` exposes its `Threaded` only as a type-erased `Io`.
+    // Declared first so it is torn down last: `deinit` joins the worker
+    // threads, which must not happen while anything below still uses them.
+    var threaded: std.Io.Threaded = .init(gpa, .{
+        .argv0 = .init(init.minimal.args),
+        .environ = init.minimal.environ,
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
 
     // Before anything that can log, so diagnostics share one stderr lock with
     // the rest of the process rather than interleaving with it.
     obs_log.init(io);
+    // Handed back to `init.io` before `threaded` is torn down, because logging
+    // outlives `main`: when `main` returns an error, `start.zig` logs it through
+    // `logFn` *after* every defer here has run. Left pointing at `threaded`, that
+    // record locks stderr through a runtime that no longer exists — found as a
+    // hang in the fail-closed case, which is exactly the path that returns one.
+    defer obs_log.init(init.io);
 
     // Resolve configuration before anything else, so a bad env file fails
     // before we have opened a socket. `environ_map` is not threadsafe; loading
@@ -690,6 +744,13 @@ pub fn main(init: std.process.Init) !void {
     // Only now can logging honour the operator: everything above this line —
     // including `Settings.load`'s own diagnostics — used the bootstrap defaults.
     obs_log.configure(io, cfg.log_level, cfg.log_format);
+
+    // Before the first `async` anywhere — `buildSnapshot` below is one — so no
+    // task is ever admitted under the old limit. The refresher only exists when
+    // refresh is enabled, and the count has to agree with what is spawned.
+    const handler_threads = cfg.handler_threads orelse defaultHandlerThreads();
+    const loops: usize = if (cfg.blocklist_refresh_secs == 0) 2 else 3;
+    threaded.setAsyncLimit(asyncLimit(handler_threads, loops));
 
     const client_socket, const upstream_socket = try initSockets(io, cfg);
     defer client_socket.close(io);
@@ -771,15 +832,16 @@ pub fn main(init: std.process.Init) !void {
     var group: std.Io.Group = std.Io.Group.init;
     defer group.cancel(io);
 
-    group.async(io, supervise, .{ io, &ctx, "dispatcher", dispatcherLoop });
-    group.async(io, supervise, .{ io, &ctx, "sweeper", sweeperLoop });
-    if (ctx.refresh != null) group.async(io, supervise, .{ io, &ctx, "refresher", refresherLoop });
+    try spawnLoop(&group, io, &ctx, "dispatcher", dispatcherLoop);
+    try spawnLoop(&group, io, &ctx, "sweeper", sweeperLoop);
+    if (ctx.refresh != null) try spawnLoop(&group, io, &ctx, "refresher", refresherLoop);
 
-    std.log.info("listening={s}:{d} upstream={s}:{d}", .{
+    std.log.info("listening={s}:{d} upstream={s}:{d} handler_threads={d}", .{
         cfg.listen_host,
         cfg.listen_port,
         cfg.upstream_host,
         cfg.upstream_port,
+        handler_threads,
     });
     var buffer: [4096]u8 = undefined;
     while (true) {
@@ -884,6 +946,18 @@ test "initialize sockets" {
     const test_socket = try initIpAddress("0.0.0.0", 5454);
 
     std.debug.assert(test_socket.getPort() == 5454);
+}
+
+test "asyncLimit reserves a slot per loop on top of the handlers" {
+    const testing = std.testing;
+
+    // Handlers keep exactly what they were given: the loops' slots come on top,
+    // never out of the handlers' share.
+    try testing.expectEqual(std.Io.Limit.limited(3 + 3), asyncLimit(3, 3));
+
+    // 0 handler threads is legal — every query inline on the ingress thread —
+    // and must still leave room for the loops.
+    try testing.expectEqual(std.Io.Limit.limited(2), asyncLimit(0, 2));
 }
 
 test "backoffSeconds binds the supervisor's ceiling" {

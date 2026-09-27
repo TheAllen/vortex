@@ -679,3 +679,32 @@ fn waitUntilBlocked(vortex: *Instance, name: []const u8) !void {
     std.debug.print("'{s}' was never blocked after {d} rounds\n", .{ name, deadline_rounds });
     return error.RefreshNeverLanded;
 }
+
+// ── Runtime ───────────────────────────────────────────────────────────────
+
+test "with no handler threads to spare, every background loop still gets its own" {
+    const gpa = testing.allocator;
+
+    // The runtime's async limit is what a small host has: `Io.Threaded` sizes it
+    // at CPUs − 1, and at the limit `async` runs a task inline on the caller
+    // instead of queueing it. The background loops used to be spawned that way,
+    // so on a host with three or fewer CPUs one of them ran inline in `main`,
+    // never returned, and the ingress loop never started. 0 handler threads
+    // reproduces that host on any machine: no slot for anything but the loops.
+    //
+    // Refresh is enabled — a long interval, so it never actually fires — because
+    // the refresher is the third loop, and three loops against two slots was the
+    // shape of the original hang.
+    var vortex = try Instance.start(testing.io, gpa, .{
+        .handler_threads = 0,
+        .refresh_secs = 3600,
+    });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    // Readiness already proved the ingress loop runs. A forwarded round trip
+    // proves the dispatcher does too: with no handler threads the handler runs
+    // inline on the ingress thread, so the reply can only come back through a
+    // dispatcher running on a thread of its own.
+    try expectForwarded(&vortex, "loops.test", 0x1001);
+}

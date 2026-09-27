@@ -166,6 +166,19 @@ pub const Settings = struct {
     /// ~4.1 MB of key array whether or not it is full. Zero disables caching.
     cache_max_entries: usize,
 
+    /// Worker threads available to per-query handlers, or null for the
+    /// runtime's own default of one less than the CPU count.
+    ///
+    /// Past this many concurrent handlers, `std.Io.Threaded` does not queue the
+    /// next one: it runs it inline on the ingress thread, which stops receiving
+    /// until the handler returns. So this is the ceiling on handler parallelism,
+    /// and 0 is a legal value meaning "handle every query on the ingress thread".
+    ///
+    /// The background loops are deliberately **not** counted here. They never
+    /// return, so a slot one of them took would never come back; `main` adds
+    /// their count on top of this before it spawns anything.
+    handler_threads: ?usize,
+
     pub const defaults: Settings = .{
         .listen_host = "127.0.0.1",
         .listen_port = 5354,
@@ -201,6 +214,9 @@ pub const Settings = struct {
         // and well under the ~50k mark where the inline-key representation
         // stops being obviously the right trade.
         .cache_max_entries = 10_000,
+
+        // The runtime's default, resolved against the CPU count at startup.
+        .handler_threads = null,
     };
 
     /// Environment file consulted when `VORTEX_ENV_FILE` is unset. Missing is
@@ -224,8 +240,8 @@ pub const Settings = struct {
         InvalidLogLevel,
         /// `VORTEX_LOG_FORMAT` was set to something that isn't a format.
         InvalidLogFormat,
-        /// `VORTEX_CACHE_MAX_ENTRIES` or `VORTEX_BLOCKLIST_REFRESH_SECS` was set
-        /// to something that isn't a count.
+        /// `VORTEX_CACHE_MAX_ENTRIES`, `VORTEX_BLOCKLIST_REFRESH_SECS` or
+        /// `VORTEX_HANDLER_THREADS` was set to something that isn't a count.
         InvalidCacheSize,
         /// `VORTEX_BLOCKLIST_ON_FAILURE` was set to something that isn't a policy.
         InvalidFailurePolicy,
@@ -308,6 +324,10 @@ pub const Settings = struct {
                 "VORTEX_CACHE_MAX_ENTRIES",
                 defaults.cache_max_entries,
             ),
+            .handler_threads = if (environ.get("VORTEX_HANDLER_THREADS")) |raw|
+                if (raw.len == 0) defaults.handler_threads else try envCount(environ, "VORTEX_HANDLER_THREADS", 0)
+            else
+                defaults.handler_threads,
         };
     }
 
@@ -730,6 +750,27 @@ test "fromEnviron resolves both blocklist sources" {
         Settings.defaults.blocklist_source,
         (try Settings.fromEnviron(&map)).blocklist_source,
     );
+}
+
+test "fromEnviron resolves handler_threads, keeping 0 distinct from unset" {
+    var map = Environ.Map.init(testing.allocator);
+    defer map.deinit();
+
+    // Unset and explicitly empty both mean "the runtime's default".
+    try testing.expectEqual(@as(?usize, null), (try Settings.fromEnviron(&map)).handler_threads);
+    try map.put("VORTEX_HANDLER_THREADS", "");
+    try testing.expectEqual(@as(?usize, null), (try Settings.fromEnviron(&map)).handler_threads);
+
+    // 0 is a real setting — every handler inline on the ingress thread — and
+    // must not collapse into the default the way an empty value does.
+    try map.put("VORTEX_HANDLER_THREADS", "0");
+    try testing.expectEqual(@as(?usize, 0), (try Settings.fromEnviron(&map)).handler_threads);
+
+    try map.put("VORTEX_HANDLER_THREADS", "6");
+    try testing.expectEqual(@as(?usize, 6), (try Settings.fromEnviron(&map)).handler_threads);
+
+    try map.put("VORTEX_HANDLER_THREADS", "four");
+    try testing.expectError(error.InvalidCacheSize, Settings.fromEnviron(&map));
 }
 
 test "fromEnviron rejects the pre-rename blocklist variables" {
