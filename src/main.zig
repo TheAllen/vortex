@@ -160,11 +160,11 @@ fn handleQuery(
         // `get` handed back a copy, so this cannot reach the stored entry —
         // which is what lets one entry serve many clients with different IDs.
         //
-        // `q_end` is the right records offset for the cached reply too: upstream
-        // echoes our question verbatim, so its question section is the same
-        // length as the one we just parsed out of the query.
+        // The client's own question bytes go in, not just its ID: the entry was
+        // filled by whoever asked first, in their casing. Same name, so same
+        // length — which also makes `q_end` the cached reply's records offset.
         const served = hit_buf[0..hit.len];
-        cache_mod.finalizeServed(served, q_end, header.id, hit.age_secs) catch |err| {
+        cache_mod.finalizeServed(served, data[12..q_end], header.id, hit.age_secs) catch |err| {
             // Fall through to a normal upstream query rather than failing the
             // client: a cache that cannot render a hit is a slow cache, not a
             // broken resolver.

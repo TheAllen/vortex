@@ -597,6 +597,72 @@ test "P2.2 refresh refuses to install an empty list" {
     }
 }
 
+test "an upstream reply with TC=1 is relayed but never cached" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .cache_max_entries = 100 });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    const name = "truncated.example.com";
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&query_buf, 0xA1A1, name, .{}));
+
+    var upstream_buf: [wire.max_message]u8 = undefined;
+    const forwarded = try vortex.recvUpstream(&upstream_buf, harness.default_timeout_ms);
+
+    // What upstream sends a client whose answer did not fit: TC=1 in the header.
+    // A real record in the answer and a long TTL, so every *other* cache rule
+    // says yes — the header bit is the only thing that can refuse it.
+    var reply_buf: [wire.max_message]u8 = undefined;
+    const reply = try wire.reply(&reply_buf, forwarded.data, .{
+        .addresses = &.{.{ 192, 0, 2, 77 }},
+        .ttl = 3600,
+    });
+    reply[2] |= 0x02; // TC=1
+    try vortex.sendUpstreamReply(&forwarded.from, reply);
+
+    // Relayed as-is: the client is told it is truncated, and can retry.
+    var client_buf: [wire.max_message]u8 = undefined;
+    try testing.expect(wire.isTruncated(try vortex.recvClient(&client_buf, harness.default_timeout_ms)));
+
+    // But not stored. Before this was fixed the second query was answered from
+    // cache — TC bit included — for the whole hour, so a client that *could*
+    // have taken the full answer was handed the truncated one instead.
+    try expectForwarded(&vortex, name, 0xA1A2);
+}
+
+test "a cache hit echoes the asking client's question casing" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .cache_max_entries = 100 });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    // Fill the entry with one casing...
+    var first_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&first_buf, 0xB1B1, "Cased.Example.COM", .{}));
+    var upstream_buf: [wire.max_message]u8 = undefined;
+    const forwarded = try vortex.recvUpstream(&upstream_buf, harness.default_timeout_ms);
+    var reply_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendUpstreamReply(&forwarded.from, try wire.reply(&reply_buf, forwarded.data, .{
+        .addresses = &.{.{ 192, 0, 2, 88 }},
+    }));
+    var client_buf: [wire.max_message]u8 = undefined;
+    _ = try vortex.recvClient(&client_buf, harness.default_timeout_ms);
+
+    // ...and ask again with another, the way a 0x20 client randomizes it.
+    var second_buf: [wire.max_message]u8 = undefined;
+    const second = wire.query(&second_buf, 0xB1B2, "cASED.eXAMPLE.com", .{});
+    try vortex.sendQuery(second);
+    try vortex.expectNoUpstreamQuery(500);
+
+    var hit_buf: [wire.max_message]u8 = undefined;
+    const hit = try vortex.recvClient(&hit_buf, harness.default_timeout_ms);
+
+    // The question section is exactly what *this* client sent. The query has
+    // nothing after its question, so everything past the header is question.
+    const question = second[12..];
+    try testing.expectEqualSlices(u8, question, hit[12..][0..question.len]);
+}
+
 // ── Helpers for the resilience cases ──────────────────────────────────────
 
 /// Waits `ms` on the same clock Vortex schedules its own timers against.

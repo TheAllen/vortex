@@ -9,6 +9,39 @@ Newest first. Open work lives in [next_steps.md](next_steps.md).
 
 ---
 
+## Landed 2026-09-28 — cache: TC=1 is never stored, and hits echo the client's casing
+
+Phase 1 of the protocol-completeness plan. Two defects in the P3.3 cache, both on the path a
+client sees.
+
+**An upstream reply with TC=1 was cached.** `isCacheable`'s documentation listed TC=1 as a
+refusal, but `dispatcherLoop` passed it `reply_msg.flags.trunc` — the kernel's flag for *our*
+receive buffer overflowing — and nothing read the header's TC bit. So when upstream truncated
+an answer to fit one requester's limit (512 bytes for a client without EDNS), that truncated
+reply was stored and served, TC bit included, to every client for the full TTL, however large
+an answer they could take. Reproduced with a probe case before the fix: the second query was
+answered from cache with TC=1. Upstreams that reply to a truncated query with an empty answer
+section escaped it, because no TTL could be extracted; ones that send a partial answer did not.
+`isCacheable` now refuses either source.
+
+**A hit echoed the first requester's question casing.** The key is the lowercased name, so a
+`Cased.Example.COM` entry serves `cASED.eXAMPLE.com` — with the first client's question bytes.
+A client using 0x20 (random QNAME casing as extra anti-spoofing entropy; Unbound does this)
+compares the echo exactly and drops the reply. This was listed as known residue of P3.3.
+`finalizeServed` now takes the asking client's question bytes and writes them over the
+stored question, after checking the two are the same name case-insensitively. A mismatch is
+`error.QuestionMismatch`, which the existing hit path already turns into a normal upstream
+query. Same name means same length, so the compression pointers into offset 12 are untouched,
+and the question slice now also fixes the records offset the function used to take separately.
+
+**Tests:** 174/174 (153 unit, 21 integration). Unit: `isCacheable` refuses a header TC=1;
+`finalizeServed` writes the client's casing and moves nothing else; a same-length different
+name is refused. Integration: a TC=1 reply is relayed to the client but the next query is
+forwarded; a hit's question section matches the second client's bytes exactly.
+Mutation-checked — dropping the TC check, the casing copy, or the name check each fails a case.
+
+---
+
 ## Landed 2026-09-28 — P1.5 pending-table cap
 
 `PendingTable` refuses new entries past `VORTEX_MAX_PENDING` (default 4096, range 1..65536),

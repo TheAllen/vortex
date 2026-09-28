@@ -12,8 +12,12 @@ This was a prerequisite for P1.5 and P2.4, both of which reason about what the r
 at its limits.
 
 **2026-09-28: P1.5 landed** — `PendingTable` is capped by `VORTEX_MAX_PENDING` and drops past
-it; see [changelog.md](changelog.md#landed-2026-09-28--p15-pending-table-cap). *170/170 — 151
-unit, 19 integration.* What stands between Vortex and a bind off localhost is now P2.6 and P2.7. **No open P0s, and no open P1 bugs** — all three P0s are pinned by
+it; see [changelog.md](changelog.md#landed-2026-09-28--p15-pending-table-cap).
+
+**2026-09-28: cache fixes landed** — TC=1 replies are no longer cached, and hits echo the
+asking client's question casing; see
+[changelog.md](changelog.md#landed-2026-09-28--cache-tc1-is-never-stored-and-hits-echo-the-clients-casing).
+*174/174 — 153 unit, 21 integration.* Phase 1 of the protocol plan under [P3](#p3--protocol-completeness). What stands between Vortex and a bind off localhost is now P2.6 and P2.7. **No open P0s, and no open P1 bugs** — all three P0s are pinned by
 regression tests that fail under mutation.
 
 **P2.2 blocklist resilience landed 2026-09-13**, and with it the last of the two
@@ -381,6 +385,22 @@ process itself.
 The **compression → response parsing → caching** chain is complete as of 2026-09-05.
 What remains in this band is EDNS0, TCP fallback, and the multi-upstream arc.
 
+**Plan, agreed 2026-09-28** — three phases, one branch each:
+
+1. ~~**Cache correctness**~~ ✅ 2026-09-28 — TC=1 never cached; hits echo the client's casing.
+2. **EDNS0 (P3.5)** — a pure OPT parser (`dns/edns.zig`) with FORMERR for malformed/duplicate
+   OPTs and BADVERS for version > 0; our own OPT on blocked replies; the forwarded OPT's
+   payload size clamped to our buffer; the cache keyed by EDNS/DO with a size check on hits;
+   the DNSSEC posture (P4.7) written down.
+3. **TCP (P3.6)** — a client-facing listener (accept loop via `concurrent`; connection handlers
+   via `concurrent` under `VORTEX_MAX_TCP_CONNS`, since a connection lives as long as its
+   client keeps it open), the validate → policy → cache step shared with UDP, TCP to upstream
+   for TCP clients. **The advertised/clamped EDNS size drops to 1232** (DNS Flag Day 2020) in
+   this phase, not phase 2: 1232 produces more TC=1, and TC=1 is only honest once there is a
+   TCP listener to retry against.
+
+Multi-upstream and DoT (P3.7) are planned after phase 3, together with P4.3 failover.
+
 1. ~~**DNS message compression (pointer following).**~~ **Done 2026-08-13** —
    [name_reader.zig](../src/dns/name_reader.zig) reads names with pointer following, bounded
    by a strictly-backwards rule plus a 64-jump cap; `question.zig` is refactored onto its
@@ -420,8 +440,9 @@ What remains in this band is EDNS0, TCP fallback, and the multi-upstream arc.
      trip all forward. Wasteful, not wrong; needs an in-flight set
    - **An eviction policy** — at `max_entries` the cache refuses new keys rather than
      choosing a victim, because there is no recency data to justify one
-   - **The question-section casing echo** — a hit returns the first requester's casing,
-     which breaks a client doing 0x20 verification
+   - ~~**The question-section casing echo**~~ **Fixed 2026-09-28** — a hit now carries the
+     asking client's question bytes. Found alongside it: TC=1 replies were being cached;
+     also fixed
 4. ~~**Wildcard / suffix blocking.**~~ **Done 2026-07-30.** Remaining polish: fold the
    hand-rolled `Policy` into the comptime duck-typed `Filter`/`Chain` from
    [filter-design.md](filter-design.md), and add a suffix-*allow* matcher for the entries
