@@ -249,7 +249,12 @@ pub fn ageTtlsInPlace(
 /// and so each rule can be pinned by a test that needs no socket.
 ///
 ///   * **TC=1** — the records are known-incomplete. Caching a truncated answer
-///     pins a partial result for the whole TTL.
+///     pins a partial result for the whole TTL, and serves it — TC bit and
+///     all — to every later client, however large a reply *they* could take.
+///     Two sources, both refused: `truncated` is our own receive buffer
+///     overflowing (the kernel's flag), and `header.tc` is upstream saying it
+///     cut the reply to fit the requester's limit. Only the first was checked
+///     until 2026-09-28, while this comment promised both.
 ///   * **QDCOUNT != 1** — the record walk starts at `12 + question_len`, which
 ///     is only where records begin given exactly one question. Caching what a
 ///     walk from the wrong offset produced is the silent desynchronization the
@@ -261,7 +266,7 @@ pub fn ageTtlsInPlace(
 ///   * **ttl** — null means nothing usable was found; zero means upstream
 ///     explicitly said do not reuse this. Both are refusals.
 pub fn isCacheable(header: Header, truncated: bool, ttl: ?u32) bool {
-    if (truncated) return false;
+    if (truncated or header.tc == 1) return false;
     if (header.question_count != 1) return false;
     switch (header.rcode) {
         .no_error, .name_error => {},
@@ -280,20 +285,38 @@ pub fn isCacheable(header: Header, truncated: bool, ttl: ?u32) bool {
 /// happens to look fine in a test. Taking one mutable slice makes the aliasing
 /// question impossible to get wrong.
 ///
-/// Two edits: restore the client's transaction ID, then age every TTL by how
-/// long the entry has been held. Neither can reach the stored entry, because
-/// this never sees it.
+/// Three edits: restore the client's transaction ID, restore the client's
+/// question bytes, then age every TTL by how long the entry has been held. None
+/// can reach the stored entry, because this never sees it.
+///
+/// `query_question` is the asking client's question section — `query[12..q_end]`.
+/// It also fixes where the records start, since the cached reply's question is
+/// the same name and so the same length.
 pub fn finalizeServed(
     served: []u8,
-    records_start: usize,
+    query_question: []const u8,
     client_id: u16,
     age_secs: u32,
 ) !void {
-    if (served.len < 12) return error.Truncated;
+    const records_start = 12 + query_question.len;
+    if (served.len < records_start) return error.Truncated;
 
     // The client is owed the ID it asked with, not the one the cache happens to
     // hold from whichever query first populated the entry.
     std.mem.writeInt(u16, served[0..2], client_id, .big);
+
+    // And the question it asked with, byte for byte. The key is the *lowercased*
+    // name, so an entry filled by `Example.COM` is a hit for `eXAMPLE.com` —
+    // but the stored reply echoes the first requester's casing. A client using
+    // 0x20 (random QNAME casing as extra spoofing entropy, which Unbound does)
+    // compares the echo exactly and drops a reply that does not match.
+    //
+    // Checked case-insensitively first: an equal-length question that is not
+    // the same name means the entry and the key disagree, and serving it would
+    // hand the client an answer to something else.
+    const stored_question = served[12..records_start];
+    if (!std.ascii.eqlIgnoreCase(stored_question, query_question)) return error.QuestionMismatch;
+    @memcpy(stored_question, query_question);
 
     var header = Header{};
     header.parseHeader(served[0..12]);
@@ -1234,8 +1257,12 @@ test "isCacheable refuses each disqualifying condition on its own" {
     const ok = headerOf(&positive_reply);
     try testing.expect(isCacheable(ok, false, 100));
 
-    // Truncated: the records are incomplete, whatever the TTL says.
+    // Truncated: the records are incomplete, whatever the TTL says — whether
+    // our buffer overflowed or upstream set TC=1 itself.
     try testing.expect(!isCacheable(ok, true, 100));
+    var tc = ok;
+    tc.tc = 1;
+    try testing.expect(!isCacheable(tc, false, 100));
 
     // QDCOUNT != 1: records do not start where the walk assumed.
     var two_questions = ok;
@@ -1259,7 +1286,7 @@ test "isCacheable refuses each disqualifying condition on its own" {
 
 test "finalizeServed restores the client's ID and ages the TTLs" {
     var served = positive_reply;
-    try finalizeServed(&served, fixture_records, 0x1234, 60);
+    try finalizeServed(&served, positive_reply[12..fixture_records], 0x1234, 60);
 
     // The client's ID, not the 0xABCD the fixture was stored with.
     try testing.expectEqual(@as(u16, 0x1234), std.mem.readInt(u16, served[0..2], .big));
@@ -1276,13 +1303,37 @@ test "finalizeServed restores the client's ID and ages the TTLs" {
 
 test "finalizeServed rejects a runt too short to hold a header" {
     var runt = [_]u8{ 1, 2, 3, 4 };
-    try testing.expectError(error.Truncated, finalizeServed(&runt, 0, 1, 0));
+    try testing.expectError(error.Truncated, finalizeServed(&runt, &.{}, 1, 0));
 }
 
 test "finalizeServed at zero age moves nothing but the ID" {
     // The same instant it was stored. A good check that aging by 0 is not
     // quietly rewriting TTLs to something else.
     var served = positive_reply;
-    try finalizeServed(&served, fixture_records, 0xABCD, 0);
+    try finalizeServed(&served, positive_reply[12..fixture_records], 0xABCD, 0);
     try testing.expectEqualSlices(u8, &positive_reply, &served);
+}
+
+test "finalizeServed echoes the asking client's casing, not the first requester's" {
+    // The same question as the fixture's "a.com A IN", cased the way a 0x20
+    // client might send it.
+    const asked = [_]u8{ 1, 'A', 3, 'c', 'O', 'M', 0, 0, 1, 0, 1 };
+
+    var served = positive_reply;
+    try finalizeServed(&served, &asked, 0xABCD, 0);
+
+    // Exactly the client's bytes in the question...
+    try testing.expectEqualSlices(u8, &asked, served[12..fixture_records]);
+    // ...and nothing else moved: header and records are as stored.
+    try testing.expectEqualSlices(u8, positive_reply[0..12], served[0..12]);
+    try testing.expectEqualSlices(u8, positive_reply[fixture_records..], served[fixture_records..]);
+    // The stored entry keeps its own casing for the next client.
+    try testing.expectEqual(@as(u8, 'a'), positive_reply[13]);
+}
+
+test "finalizeServed refuses a question that is a different name" {
+    // Same length, different name: the entry cannot be an answer to this.
+    const other = [_]u8{ 1, 'b', 3, 'c', 'o', 'm', 0, 0, 1, 0, 1 };
+    var served = positive_reply;
+    try testing.expectError(error.QuestionMismatch, finalizeServed(&served, &other, 1, 0));
 }
