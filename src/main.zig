@@ -151,8 +151,9 @@ fn handleQuery(
         const now: i64 = @intCast(std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds);
 
         // On the coroutine stack, like the ingress and dispatcher buffers. Note
-        // this is per in-flight handler, so it is one of the things P1.5's cap
-        // will be sizing against once that lands.
+        // this is per in-flight handler, so it is bounded by the handler count
+        // (`VORTEX_HANDLER_THREADS`), not by P1.5's pending cap — a cache hit
+        // never takes a pending slot.
         var hit_buf: [4096]u8 = undefined;
         const hit = cache.get(key, now, &hit_buf) orelse break :serve;
 
@@ -190,9 +191,18 @@ fn handleQuery(
         .question_hash = question_hash,
         .question_len = question_len,
         .expires_at = @intCast(std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds + 5 * std.time.ns_per_s),
-    }) catch {
-        std.log.err("Failed to append query to Pending table", .{});
-        return;
+    }) catch |err| switch (err) {
+        // P1.5: at the cap, drop without a reply. Deliberately silent in both
+        // directions — no log line per refusal (the sweeper reports a count),
+        // and no SERVFAIL, because a flood's source addresses are often spoofed
+        // and answering each packet reflects traffic at someone else, even
+        // with no amplification. Blocked names and cache hits returned above
+        // this line, so they are still answered while the table is full.
+        error.TableFull => return,
+        else => {
+            std.log.err("Failed to append query to Pending table: {s}", .{@errorName(err)});
+            return;
+        },
     };
     std.mem.writeInt(u16, data[0..2], proxy_id, .big);
 
@@ -390,6 +400,13 @@ fn sweeperLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
                 if (dropped > 0) std.log.debug("cache: swept {d} expired entries", .{dropped});
             }
         }
+
+        // One line per tick, not per refusal: see `PendingTable.takeShed`.
+        const shed = ctx.pending_table.takeShed();
+        if (shed > 0) std.log.warn("shed {d} queries: pending table full (VORTEX_MAX_PENDING={d})", .{
+            shed,
+            ctx.pending_table.max_pending,
+        });
 
         evicted.clearRetainingCapacity();
         ctx.pending_table.sweepExpiredQueries(&evicted);
@@ -782,7 +799,7 @@ pub fn main(init: std.process.Init) !void {
 
     var seed: u64 = undefined;
     io.random(std.mem.asBytes(&seed));
-    var pending_table = PendingTable.init(gpa, io, seed);
+    var pending_table = PendingTable.init(gpa, io, seed, cfg.max_pending);
     defer pending_table.deinit();
 
     var question_seed: u64 = undefined;

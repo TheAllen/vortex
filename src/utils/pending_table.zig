@@ -54,13 +54,23 @@ pub const PendingTable = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, seed: u64) PendingTable {
+    /// Most entries the table will hold; `appendQuery` refuses past it (P1.5).
+    /// At most the 16-bit ID space, so a free proxy ID always exists below it.
+    max_pending: usize,
+    /// Queries refused at the cap since the last `takeShed`. Guarded by
+    /// `mutex`, like everything else here — it only changes inside
+    /// `appendQuery`'s critical section anyway.
+    shed: u64 = 0,
+
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, seed: u64, max_pending: usize) PendingTable {
+        std.debug.assert(max_pending >= 1 and max_pending <= std.math.maxInt(u16) + 1);
         return PendingTable{
             .map = std.AutoHashMap(u16, PendingQuery).init(gpa),
             .mutex = std.Io.Mutex.init,
             .rng = std.Random.DefaultPrng.init(seed),
             .gpa = gpa,
             .io = io,
+            .max_pending = max_pending,
         };
     }
 
@@ -70,11 +80,20 @@ pub const PendingTable = struct {
 
     /// Appends a query to the pending table and generate a random u16 integer value
     /// as the proxy_id. Provides mechanism to retry if deduping proxy_id.
+    ///
+    /// Returns `error.TableFull` once `max_pending` entries are in flight — the
+    /// P1.5 bound. Checked before any ID is drawn, which is what keeps a full
+    /// table cheap: the old guard only fired at 65,536 entries, after 16 random
+    /// draws and a linear scan of the whole ID space, all under this mutex, for
+    /// every query a flood sent.
     pub fn appendQuery(self: *PendingTable, pending_query: PendingQuery) !u16 {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
-        if (self.map.count() > std.math.maxInt(u16)) return error.IdSpaceExhausted;
+        if (self.map.count() >= self.max_pending) {
+            self.shed +|= 1;
+            return error.TableFull;
+        }
 
         var attempts: u16 = 0;
         while (attempts < 16) : (attempts += 1) {
@@ -99,6 +118,21 @@ pub const PendingTable = struct {
         }
 
         return error.IdSpaceExhausted;
+    }
+
+    /// Returns and resets the number of queries refused at the cap.
+    ///
+    /// A count rather than a log line per refusal, because the refusals arrive
+    /// at flood rate: logging each one would turn a shed datagram into a write
+    /// to stderr, which is the resource the cap exists to protect. The sweeper
+    /// reports this once a tick instead.
+    pub fn takeShed(self: *PendingTable) u64 {
+        self.mutex.lock(self.io) catch return 0;
+        defer self.mutex.unlock(self.io);
+
+        const shed = self.shed;
+        self.shed = 0;
+        return shed;
     }
 
     /// Looks up an entry **without** removing it.
@@ -177,6 +211,10 @@ pub const PendingTable = struct {
 
 const testing = std.testing;
 
+/// Every proxy ID — the largest cap the table accepts, and what the tests that
+/// are not about the cap use so it never interferes.
+const id_space: usize = std.math.maxInt(u16) + 1;
+
 /// A `PendingQuery` expiring `offset_ns` from now — negative for already-expired.
 /// Deliberately reads the *same clock and unit* the sweeper does: if the two
 /// ever drift apart — different unit (bug B1) or different clock — the sweep
@@ -231,7 +269,7 @@ test "hashQuestion matches only on identical question bytes" {
 }
 
 test "appendQuery then complete round trips, and complete is idempotent" {
-    var table = PendingTable.init(testing.allocator, testing.io, 0x5EED);
+    var table = PendingTable.init(testing.allocator, testing.io, 0x5EED, id_space);
     defer table.deinit();
 
     const proxy_id = try table.appendQuery(queryExpiringIn(testing.io, 0xABCD, std.time.ns_per_s));
@@ -250,7 +288,7 @@ test "appendQuery then complete round trips, and complete is idempotent" {
 }
 
 test "sweep removes expired entries and leaves live ones (B1 regression)" {
-    var table = PendingTable.init(testing.allocator, testing.io, 1);
+    var table = PendingTable.init(testing.allocator, testing.io, 1, id_space);
     defer table.deinit();
 
     // One entry a second past its deadline, one a full hour out.
@@ -278,7 +316,7 @@ test "sweep removes expired entries and leaves live ones (B1 regression)" {
 }
 
 test "sweep is a no-op when nothing has expired" {
-    var table = PendingTable.init(testing.allocator, testing.io, 2);
+    var table = PendingTable.init(testing.allocator, testing.io, 2, id_space);
     defer table.deinit();
 
     for (0..8) |i| {
@@ -295,7 +333,7 @@ test "sweep is a no-op when nothing has expired" {
 }
 
 test "appendQuery hands out distinct proxy IDs" {
-    var table = PendingTable.init(testing.allocator, testing.io, 0xC0FFEE);
+    var table = PendingTable.init(testing.allocator, testing.io, 0xC0FFEE, id_space);
     defer table.deinit();
 
     // A reused proxy ID would silently overwrite an in-flight query, so the
@@ -313,8 +351,39 @@ test "appendQuery hands out distinct proxy IDs" {
     try testing.expectEqual(@as(u32, 4096), table.map.count());
 }
 
+test "appendQuery refuses at max_pending, counts the refusals, and recovers" {
+    var table = PendingTable.init(testing.allocator, testing.io, 11, 3);
+    defer table.deinit();
+
+    var ids: [3]u16 = undefined;
+    for (&ids, 0..) |*id, i| {
+        id.* = try table.appendQuery(queryExpiringIn(testing.io, @intCast(i), 3600 * std.time.ns_per_s));
+    }
+
+    // At the cap: refused, and refused without touching what is in flight.
+    try testing.expectError(error.TableFull, table.appendQuery(
+        queryExpiringIn(testing.io, 0xBAD, 3600 * std.time.ns_per_s),
+    ));
+    try testing.expectError(error.TableFull, table.appendQuery(
+        queryExpiringIn(testing.io, 0xBAD, 3600 * std.time.ns_per_s),
+    ));
+    try testing.expectEqual(@as(u32, 3), table.map.count());
+    for (ids, 0..) |id, i| try testing.expectEqual(@as(u16, @intCast(i)), table.peek(id).?.client_id);
+
+    // Every refusal is counted, and reading the count resets it — the sweeper
+    // reports a per-tick figure, not a running total.
+    try testing.expectEqual(@as(u64, 2), table.takeShed());
+    try testing.expectEqual(@as(u64, 0), table.takeShed());
+
+    // A completed query frees its slot for the next one: the cap bounds
+    // occupancy, not the total ever admitted.
+    try testing.expect(table.complete(ids[1]) != null);
+    _ = try table.appendQuery(queryExpiringIn(testing.io, 3, 3600 * std.time.ns_per_s));
+    try testing.expectEqual(@as(u64, 0), table.takeShed());
+}
+
 test "appendQuery fails cleanly once the 16-bit ID space is full" {
-    var table = PendingTable.init(testing.allocator, testing.io, 7);
+    var table = PendingTable.init(testing.allocator, testing.io, 7, id_space);
     defer table.deinit();
 
     // Fill every one of the 65,536 possible proxy IDs. The tail of this loop
@@ -329,8 +398,9 @@ test "appendQuery fails cleanly once the 16-bit ID space is full" {
     // live entry. Note this pins the *behavior*, not the guard: the old
     // `>= maxInt(u32)` guard (bug B5) also ended up here, just after a futile
     // 65k-entry scan under the mutex. What B5 cost was time, which a test
-    // cannot assert on without being flaky.
-    try testing.expectError(error.IdSpaceExhausted, table.appendQuery(
+    // cannot assert on without being flaky. Since P1.5 the ID space is simply
+    // the largest cap, so a full one is `TableFull` like any other.
+    try testing.expectError(error.TableFull, table.appendQuery(
         queryExpiringIn(testing.io, 0, 3600 * std.time.ns_per_s),
     ));
     try testing.expectEqual(@as(u32, capacity), table.map.count());
@@ -342,7 +412,7 @@ test "appendQuery fails cleanly once the 16-bit ID space is full" {
 }
 
 test "peek does not consume the entry" {
-    var table = PendingTable.init(testing.allocator, testing.io, 3);
+    var table = PendingTable.init(testing.allocator, testing.io, 3, id_space);
     defer table.deinit();
 
     const id = try table.appendQuery(queryExpiringIn(testing.io, 0x4242, std.time.ns_per_s));
