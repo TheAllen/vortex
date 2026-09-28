@@ -708,3 +708,67 @@ test "with no handler threads to spare, every background loop still gets its own
     // dispatcher running on a thread of its own.
     try expectForwarded(&vortex, "loops.test", 0x1001);
 }
+
+// ── The pending cap (P1.5) ────────────────────────────────────────────────
+
+/// Sends a query and asserts it reaches the fake upstream, leaving it
+/// unanswered so it keeps its pending-table slot. Returns the forwarded copy so
+/// a case can answer it later.
+fn forwardAndHold(vortex: *Instance, buf: []u8, name: []const u8, id: u16) !Instance.Forwarded {
+    var query_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&query_buf, id, name, .{}));
+    return vortex.recvUpstream(buf, harness.default_timeout_ms);
+}
+
+test "at the pending cap a forwarded query is dropped, and a blocked one is still answered" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .max_pending = 4 });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    // Fill the table: four queries reach the upstream and are never answered.
+    // Everything below happens well inside their 5 s deadline, so the sweeper
+    // cannot free a slot mid-case.
+    var held: [4][wire.max_message]u8 = undefined;
+    for (&held, 0..) |*buf, i| {
+        var name_buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "fill{d}.test", .{i});
+        _ = try forwardAndHold(&vortex, buf, name, @intCast(0x2000 + i));
+    }
+
+    // The fifth is shed: never forwarded, and never answered — a drop, not a
+    // SERVFAIL, so a flood with spoofed sources reflects nothing.
+    var query_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&query_buf, 0x2100, "over.test", .{}));
+    try vortex.expectNoUpstreamQuery(500);
+    try vortex.expectNoClientReply(500);
+
+    // And the half that pins *where* the cap sits. A blocked name never takes
+    // a slot, so it is answered while the table is full. A cap checked at
+    // ingress — before the policy verdict — would shed this too, and a flood of
+    // forwarded names would switch the blocklist off for everyone.
+    try expectBlocked(&vortex, "ads.example.com", 0x2200);
+}
+
+test "a slot freed by an upstream reply is reused by the next query" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .max_pending = 1 });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    var held_buf: [wire.max_message]u8 = undefined;
+    const held = try forwardAndHold(&vortex, &held_buf, "first.test", 0x3001);
+
+    // Full at one: the second is shed.
+    var query_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&query_buf, 0x3002, "second.test", .{}));
+    try vortex.expectNoUpstreamQuery(500);
+
+    // Answering the first completes its entry and relays the reply...
+    var reply_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendUpstreamReply(&held.from, try wire.reply(&reply_buf, held.data, .{}));
+    var client_buf: [wire.max_message]u8 = undefined;
+    try testing.expectEqual(@as(u16, 0x3001), wire.id(try vortex.recvClient(&client_buf, harness.default_timeout_ms)));
+
+    // ...and the slot it held goes to the next query. The cap bounds what is
+    // in flight, not how many queries the process ever forwards.
+    try expectForwarded(&vortex, "third.test", 0x3003);
+}

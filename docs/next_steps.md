@@ -9,7 +9,11 @@ integration cases**). *Updated 2026-09-27: 166/166 — 149 unit, 17 integration.
 handler on a 4-CPU one; see
 [changelog.md](changelog.md#landed-2026-09-27--background-loops-get-threads-of-their-own).
 This was a prerequisite for P1.5 and P2.4, both of which reason about what the runtime does
-at its limits. **No open P0s, and no open P1 bugs** — all three P0s are pinned by
+at its limits.
+
+**2026-09-28: P1.5 landed** — `PendingTable` is capped by `VORTEX_MAX_PENDING` and drops past
+it; see [changelog.md](changelog.md#landed-2026-09-28--p15-pending-table-cap). *170/170 — 151
+unit, 19 integration.* What stands between Vortex and a bind off localhost is now P2.6 and P2.7. **No open P0s, and no open P1 bugs** — all three P0s are pinned by
 regression tests that fail under mutation.
 
 **P2.2 blocklist resilience landed 2026-09-13**, and with it the last of the two
@@ -129,8 +133,11 @@ that way — is in [changelog.md](changelog.md#reference--the-three-closed-p0s-i
 
 ## P1 — Hardening the dispatcher path
 
-**Only P1.5 remains open.** P1.1–P1.4 landed 2026-08-09; see
-[changelog.md](changelog.md#p11p14-all-landed-2026-08-09).
+**None open.** P1.1–P1.4 landed 2026-08-09; see
+[changelog.md](changelog.md#p11p14-all-landed-2026-08-09). **P1.5 landed 2026-09-28**
+([changelog.md](changelog.md#landed-2026-09-28--p15-pending-table-cap)) — the entry below is
+kept as the reasoning that shaped it. One divergence: the check sits in `appendQuery`, not at
+ingress, so blocked names and cache hits are still answered while the table is full.
 
 **P1.5 — bounded in-flight work / backpressure.** The ingress loop does an unbounded
 `group.async(handleQuery, …)` plus a `gpa.dupe` **per received datagram**. The P1.2 fix put

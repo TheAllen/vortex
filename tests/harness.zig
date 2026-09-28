@@ -89,6 +89,10 @@ pub const Options = struct {
     /// handler pool from the CPU count like a real deployment does.
     handler_threads: ?usize = null,
 
+    /// `VORTEX_MAX_PENDING`. Null leaves the binary's default, which no case
+    /// comes near; the P1.5 cases set it small enough to fill by hand.
+    max_pending: ?usize = null,
+
     /// How `start` decides the child is up. See `Readiness`.
     readiness: Readiness = .blocked_probe,
 };
@@ -626,6 +630,9 @@ fn writeEnvFile(io: Io, gpa: std.mem.Allocator, tmp: *testing.TmpDir, fields: En
     }
     if (fields.opts.handler_threads) |n| {
         try body.print(gpa, "VORTEX_HANDLER_THREADS={d}\n", .{n});
+    }
+    if (fields.opts.max_pending) |n| {
+        try body.print(gpa, "VORTEX_MAX_PENDING={d}\n", .{n});
     }
 
     try tmp.dir.writeFile(io, .{ .sub_path = "vortex.env", .data = body.items });

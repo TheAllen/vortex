@@ -179,6 +179,18 @@ pub const Settings = struct {
     /// their count on top of this before it spawns anything.
     handler_threads: ?usize,
 
+    /// Hard cap on queries forwarded upstream and not yet answered or swept —
+    /// the occupancy of `PendingTable`. Past it, a query that would go upstream
+    /// is dropped without a reply; blocked names and cache hits never take a
+    /// slot and are still answered.
+    ///
+    /// This, not the handler count, is what a flood grows: a handler returns
+    /// right after the upstream send, but its entry lives until the reply or
+    /// the 5 s sweep. Sized against a silent upstream, the default admits
+    /// ~800 qps for the full deadline; against a healthy one it is far more.
+    /// 1..65536 — the proxy ID is 16 bits, so the table cannot hold more.
+    max_pending: usize,
+
     pub const defaults: Settings = .{
         .listen_host = "127.0.0.1",
         .listen_port = 5354,
@@ -217,6 +229,8 @@ pub const Settings = struct {
 
         // The runtime's default, resolved against the CPU count at startup.
         .handler_threads = null,
+
+        .max_pending = 4096,
     };
 
     /// Environment file consulted when `VORTEX_ENV_FILE` is unset. Missing is
@@ -243,6 +257,8 @@ pub const Settings = struct {
         /// `VORTEX_CACHE_MAX_ENTRIES`, `VORTEX_BLOCKLIST_REFRESH_SECS` or
         /// `VORTEX_HANDLER_THREADS` was set to something that isn't a count.
         InvalidCacheSize,
+        /// `VORTEX_MAX_PENDING` was not a whole number in 1..65536.
+        InvalidMaxPending,
         /// `VORTEX_BLOCKLIST_ON_FAILURE` was set to something that isn't a policy.
         InvalidFailurePolicy,
         /// A variable that no longer exists under that name is still set. See
@@ -328,7 +344,26 @@ pub const Settings = struct {
                 if (raw.len == 0) defaults.handler_threads else try envCount(environ, "VORTEX_HANDLER_THREADS", 0)
             else
                 defaults.handler_threads,
+            .max_pending = try envMaxPending(environ),
         };
+    }
+
+    /// Upper bound on `max_pending`: one entry per 16-bit proxy ID.
+    pub const max_pending_limit: usize = std.math.maxInt(u16) + 1;
+
+    /// `envCount` plus a range, and 0 is an error rather than "off": this is a
+    /// safety bound, and a value that disabled it would be one typo away from
+    /// the unbounded table it exists to prevent.
+    fn envMaxPending(environ: *const Environ.Map) ParseError!usize {
+        const key = "VORTEX_MAX_PENDING";
+        const raw = environ.get(key) orelse return defaults.max_pending;
+        if (raw.len == 0) return defaults.max_pending;
+        const n = std.fmt.parseInt(usize, raw, 10) catch 0;
+        if (n == 0 or n > max_pending_limit) {
+            log.err("{s}: '{s}' is not a whole number in 1..{d}", .{ key, raw, max_pending_limit });
+            return error.InvalidMaxPending;
+        }
+        return n;
     }
 
     /// Same fail-loud contract as `envPort`: silently falling back to the
@@ -771,6 +806,26 @@ test "fromEnviron resolves handler_threads, keeping 0 distinct from unset" {
 
     try map.put("VORTEX_HANDLER_THREADS", "four");
     try testing.expectError(error.InvalidCacheSize, Settings.fromEnviron(&map));
+}
+
+test "fromEnviron bounds max_pending to the proxy ID space" {
+    var map = Environ.Map.init(testing.allocator);
+    defer map.deinit();
+
+    try testing.expectEqual(@as(usize, 4096), (try Settings.fromEnviron(&map)).max_pending);
+
+    // Both ends of the range are accepted, exactly.
+    try map.put("VORTEX_MAX_PENDING", "1");
+    try testing.expectEqual(@as(usize, 1), (try Settings.fromEnviron(&map)).max_pending);
+    try map.put("VORTEX_MAX_PENDING", "65536");
+    try testing.expectEqual(@as(usize, 65536), (try Settings.fromEnviron(&map)).max_pending);
+
+    // 0 is not "unlimited", one past the ID space cannot be honoured, and a
+    // non-number is not silently the default.
+    for ([_][]const u8{ "0", "65537", "4k" }) |bad| {
+        try map.put("VORTEX_MAX_PENDING", bad);
+        try testing.expectError(error.InvalidMaxPending, Settings.fromEnviron(&map));
+    }
 }
 
 test "fromEnviron rejects the pre-rename blocklist variables" {

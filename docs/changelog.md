@@ -9,6 +9,46 @@ Newest first. Open work lives in [next_steps.md](next_steps.md).
 
 ---
 
+## Landed 2026-09-28 — P1.5 pending-table cap
+
+`PendingTable` refuses new entries past `VORTEX_MAX_PENDING` (default 4096, range 1..65536),
+and `handleQuery` drops the query without a reply. This is the bound the 09-19 premise
+correction called for: the runtime already bounds handlers, but a handler returns right
+after the upstream send while its entry lives until the reply or the 5 s sweep, so occupancy
+was arrival-rate × 5 s and nothing else.
+
+**What the table did at its old limit.** It was never strictly unbounded — the 16-bit proxy ID
+caps it at 65,536 — but reaching that cost 16 random draws plus a linear scan of the whole ID
+space, under the mutex, for every query a flood sent, each followed by an `err`-level log
+line. The cap is now checked before any ID is drawn, so a full table costs one comparison.
+
+**Decisions:**
+
+- **Drop, not SERVFAIL.** Until P2.7 rate limiting exists, answering every refused packet
+  reflects traffic at spoofed sources, even with no amplification. The cost is that when the
+  upstream is dead, clients past the cap wait out their own timeout; the ones in the table
+  still get the sweeper's SERVFAIL.
+- **The check is in `appendQuery`, not at ingress** — a departure from the P1.5 entry, which
+  said to shed before the `dupe`. Blocked names and cache hits return before `appendQuery` and
+  never hold a slot; an ingress check would shed them too, so a flood of forwarded names would
+  switch the blocklist off for everyone. The `dupe` it would have saved is already bounded by
+  the runtime. One check, inside the lock, also leaves no window between check and insert.
+- **Counted, not logged per refusal.** `takeShed` returns and resets a count under the table's
+  mutex; the sweeper logs `shed N queries` at most once a second. A log line per shed
+  datagram would spend stderr at flood rate. The count is the first of P2.3's counters.
+- **0 is an error**, not "off". Every other `0` in `Settings` disables something; disabling a
+  safety bound should not be one typo away.
+
+**Tests:** 170/170 (151 unit, 19 integration). A `settings` test pins the range; a
+`PendingTable` test covers refusal at the cap, the shed count and its reset, and slot reuse; the
+existing ID-space test now expects `TableFull`. Two integration cases, with the cap at 4 and 1:
+the query past the cap is neither forwarded nor answered while a blocked name *is* answered,
+and a slot freed by an upstream reply is reused. Mutation-checked four ways — no cap, SERVFAIL
+instead of drop, the check moved ahead of the policy verdict, and `complete` not freeing its
+entry — each fails at least one case.
+
+---
+
 ## Landed 2026-09-27 — background loops get threads of their own
 
 **A startup hang on any host with three or fewer CPUs**, found while planning P1.5 and
