@@ -291,7 +291,6 @@ test "readName round-trips the one pointer Vortex emits" {
     // blocked_response.build writes the SOA's owner name as 0xC00C. Reading it
     // back must yield the qname — the reader checked against our own writer
     // rather than against a fixture we also wrote by hand.
-    const gpa = testing.allocator;
 
     // zig fmt: off
     const query = [_]u8{
@@ -311,8 +310,8 @@ test "readName round-trips the one pointer Vortex emits" {
     // zig fmt: on
     const question_end = 33;
 
-    const reply = try blocked_response.build(gpa, &query, question_end, .name_error);
-    defer gpa.free(reply);
+    var reply_buf: [512]u8 = undefined;
+    const reply = try blocked_response.buildInto(&reply_buf, &query, question_end, .name_error, .{});
 
     const got = try readName(reply, question_end);
     try testing.expectEqualStrings("ads.example.com", got.name.slice());

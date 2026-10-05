@@ -101,7 +101,21 @@ pub const QueryOptions = struct {
     /// Bytes appended after the question. Used to push a datagram past
     /// Vortex's 4096-byte ingress buffer without inventing a record format.
     padding: usize = 0,
+    /// An EDNS0 OPT record after the question, with ARCOUNT to match. Null
+    /// sends a plain query.
+    edns: ?Edns = null,
 };
+
+/// What a query's OPT record carries. Always RDLENGTH 0 — no options.
+pub const Edns = struct {
+    udp_size: u16 = 4096,
+    do_bit: bool = false,
+    version: u8 = 0,
+    /// How many copies to append. 2 is the duplicate-OPT FORMERR case.
+    count: u16 = 1,
+};
+
+pub const opt_len = 11;
 
 /// Writes a query into `buf` and returns the slice actually used.
 ///
@@ -130,7 +144,51 @@ pub fn query(buf: []u8, msg_id: u16, name: []const u8, opts: QueryOptions) []u8 
     @memset(buf[end..][0..opts.padding], 'P');
     end += opts.padding;
 
+    if (opts.edns) |e| {
+        for (0..e.count) |_| {
+            writeOpt(buf[end..][0..opt_len], e.udp_size, e.version, e.do_bit, 0);
+            end += opt_len;
+        }
+        std.mem.writeInt(u16, buf[10..12], e.count, .big); // ARCOUNT
+    }
+
     return buf[0..end];
+}
+
+fn writeOpt(out: *[opt_len]u8, udp_size: u16, version: u8, do_bit: bool, ext_rcode: u8) void {
+    out[0] = 0; // root owner name
+    std.mem.writeInt(u16, out[1..3], 41, .big); // TYPE = OPT
+    std.mem.writeInt(u16, out[3..5], udp_size, .big); // CLASS = payload size
+    out[5] = ext_rcode;
+    out[6] = version;
+    std.mem.writeInt(u16, out[7..9], if (do_bit) 0x8000 else 0, .big);
+    std.mem.writeInt(u16, out[9..11], 0, .big); // RDLENGTH
+}
+
+/// An OPT record's fields, as read back off the wire.
+pub const Opt = struct {
+    udp_size: u16,
+    ext_rcode: u8,
+    version: u8,
+    do_bit: bool,
+};
+
+/// The OPT record at the very end of `msg`, if there is one there.
+///
+/// Every message a case inspects carries at most one OPT, with no options, as
+/// its last record — so "the last 11 bytes, if they look like an OPT" is the
+/// whole parser. Anything else is null, which the case then fails on.
+pub fn trailingOpt(msg: []const u8) ?Opt {
+    if (msg.len < 12 + opt_len or arcount(msg) == 0) return null;
+    const o = msg[msg.len - opt_len ..];
+    if (o[0] != 0 or std.mem.readInt(u16, o[1..3], .big) != 41) return null;
+    if (std.mem.readInt(u16, o[9..11], .big) != 0) return null;
+    return .{
+        .udp_size = std.mem.readInt(u16, o[3..5], .big),
+        .ext_rcode = o[5],
+        .version = o[6],
+        .do_bit = std.mem.readInt(u16, o[7..9], .big) & 0x8000 != 0,
+    };
 }
 
 /// Encodes `name` as length-prefixed labels at `offset`, terminated by the root

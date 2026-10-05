@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const edns = @import("../dns/edns.zig");
+
 pub const PendingQuery = struct {
     client_id: u16,
     client_addr: std.Io.net.IpAddress,
@@ -18,6 +20,11 @@ pub const PendingQuery = struct {
     /// is per-process.
     question_hash: u64,
     question_len: u16,
+    /// The requester's EDNS class, so the dispatcher can file the reply under
+    /// the cache partition it was shaped for (P3.5). The reply alone cannot
+    /// say: a plain client's query and a DO client's query for the same name
+    /// get different answers, and both come back from upstream looking alike.
+    edns: edns.Class,
     /// Nanoseconds on the **`.boot` clock** (`std.Io.Timestamp.now(io, .boot)`),
     /// the same clock and unit `sweepExpiredQueries` compares against.
     ///
@@ -226,6 +233,7 @@ fn queryExpiringIn(io: std.Io, client_id: u16, offset_ns: i64) PendingQuery {
         .client_addr = std.Io.net.IpAddress.parse("127.0.0.1", 5354) catch unreachable,
         .question_hash = 0,
         .question_len = 0,
+        .edns = .none,
         .expires_at = now + offset_ns,
     };
 }

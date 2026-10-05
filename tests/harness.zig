@@ -95,6 +95,9 @@ pub const Options = struct {
 
     /// How `start` decides the child is up. See `Readiness`.
     readiness: Readiness = .blocked_probe,
+
+    /// `VORTEX_MAX_TCP_CONNS`. Null leaves the binary's default (TCP on).
+    max_tcp_conns: ?usize = null,
 };
 
 /// How to tell that a child is ready to serve.
@@ -126,6 +129,10 @@ pub const Instance = struct {
     /// Where Vortex thinks its upstream resolver is. A case owns both ends of
     /// this: nothing answers unless the case answers.
     upstream: Io.net.Socket,
+    /// The fake upstream's TCP side, on the same port as `upstream`. Vortex
+    /// forwards a query that arrived over TCP over TCP, so a case about that
+    /// accepts here.
+    upstream_tcp: Io.net.Server,
 
     /// Vortex's listening address — where `sendQuery` sends.
     listen_addr: Io.net.IpAddress,
@@ -141,9 +148,9 @@ pub const Instance = struct {
         // Bound before the child is spawned, so its port is known and settled
         // by the time the child is told to forward there. Port 0 means the OS
         // picks; `Socket.address` carries what it picked.
-        const upstream_bind: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-        const upstream = try upstream_bind.bind(io, .{ .mode = .dgram, .protocol = .udp });
+        const upstream, var upstream_tcp = try bindUpstream(io);
         errdefer upstream.close(io);
+        errdefer upstream_tcp.deinit(io);
 
         const client_bind: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
         const client = try client_bind.bind(io, .{ .mode = .dgram, .protocol = .udp });
@@ -191,6 +198,7 @@ pub const Instance = struct {
             .child_stderr = .empty,
             .client = client,
             .upstream = upstream,
+            .upstream_tcp = upstream_tcp,
             .listen_addr = listen_addr,
             .tmp = tmp,
         };
@@ -207,6 +215,7 @@ pub const Instance = struct {
         self.stopChild();
         self.client.close(self.io);
         self.upstream.close(self.io);
+        self.upstream_tcp.deinit(self.io);
         self.child_stderr.deinit(self.gpa);
         self.tmp.cleanup();
         self.* = undefined;
@@ -277,6 +286,62 @@ pub const Instance = struct {
     }
 
     /// Answers a forwarded query from the address it was sent to.
+    // ── TCP ───────────────────────────────────────────────────────────────
+
+    /// Opens a TCP connection to Vortex's listener.
+    pub fn tcpConnect(self: *Instance) !Io.net.Stream {
+        return self.listen_addr.connect(self.io, .{ .mode = .stream, .protocol = .tcp });
+    }
+
+    /// Accepts the connection Vortex opens to the fake upstream to forward a
+    /// TCP query, or `error.Timeout`.
+    pub fn acceptUpstreamTcp(self: *Instance, timeout_ms: u64) !Io.net.Stream {
+        const U = union(enum) { got: anyerror!Io.net.Stream, timeout: Io.Cancelable!void };
+        var results: [2]U = undefined;
+        var sel = Io.Select(U).init(self.io, &results);
+        try sel.concurrent(.got, acceptOne, .{ self.io, &self.upstream_tcp });
+        try sel.concurrent(.timeout, sleepFor, .{ self.io, timeout_ms });
+        const first = try sel.await();
+        if (sel.cancel()) |late| switch (late) {
+            // Accepted just as the timer fired: close it rather than leak it.
+            .got => |r| if (r) |stream| stream.close(self.io) else |_| {},
+            .timeout => {},
+        };
+        return switch (first) {
+            .got => |r| r,
+            .timeout => error.Timeout,
+        };
+    }
+
+    /// Writes one length-prefixed DNS message.
+    pub fn tcpSend(self: *Instance, stream: Io.net.Stream, msg: []const u8) !void {
+        var len: [2]u8 = undefined;
+        std.mem.writeInt(u16, &len, @intCast(msg.len), .big);
+        var w = stream.writer(self.io, &.{});
+        var parts = [_][]const u8{ &len, msg };
+        try w.interface.writeVecAll(&parts);
+    }
+
+    /// Reads one length-prefixed DNS message into `buf`. `error.EndOfStream`
+    /// if the peer closed first, `error.Timeout` if nothing whole arrived in
+    /// time.
+    ///
+    /// Each call reads exactly one frame and buffers nothing beyond it, so
+    /// back-to-back calls on one stream see pipelined replies in order.
+    pub fn tcpRecv(self: *Instance, stream: Io.net.Stream, buf: []u8, timeout_ms: u64) ![]u8 {
+        const U = union(enum) { got: anyerror![]u8, timeout: Io.Cancelable!void };
+        var results: [2]U = undefined;
+        var sel = Io.Select(U).init(self.io, &results);
+        try sel.concurrent(.got, readFrame, .{ self.io, stream, buf });
+        try sel.concurrent(.timeout, sleepFor, .{ self.io, timeout_ms });
+        const first = try sel.await();
+        _ = sel.cancel();
+        return switch (first) {
+            .got => |r| r,
+            .timeout => error.Timeout,
+        };
+    }
+
     pub fn sendUpstreamReply(self: *Instance, to: *const Io.net.IpAddress, msg: []const u8) !void {
         try self.upstream.send(self.io, to, msg);
     }
@@ -634,20 +699,79 @@ fn writeEnvFile(io: Io, gpa: std.mem.Allocator, tmp: *testing.TmpDir, fields: En
     if (fields.opts.max_pending) |n| {
         try body.print(gpa, "VORTEX_MAX_PENDING={d}\n", .{n});
     }
+    if (fields.opts.max_tcp_conns) |n| {
+        try body.print(gpa, "VORTEX_MAX_TCP_CONNS={d}\n", .{n});
+    }
 
     try tmp.dir.writeFile(io, .{ .sub_path = "vortex.env", .data = body.items });
     return tmp.dir.realPathFileAlloc(io, "vortex.env", gpa);
 }
 
-/// Binds UDP port 0, notes what the OS picked, and releases it.
+/// Binds UDP port 0, notes what the OS picked, and releases it — after checking
+/// the same port is free for TCP too, since Vortex listens on both.
+///
+/// The TCP check is not paranoia. The ephemeral range is shared, and earlier
+/// cases' TCP connections leave their ports in TIME_WAIT; a number the kernel
+/// happily hands out for UDP can still be taken on the TCP side.
 ///
 /// See the comment at the call site for why this is acceptable here and not in
 /// production code.
 fn reserveEphemeralPort(io: Io) !u16 {
-    const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    const socket = try addr.bind(io, .{ .mode = .dgram, .protocol = .udp });
-    defer socket.close(io);
-    return socket.address.getPort();
+    var attempt: usize = 0;
+    while (attempt < 20) : (attempt += 1) {
+        const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        const socket = try addr.bind(io, .{ .mode = .dgram, .protocol = .udp });
+        defer socket.close(io);
+        const port = socket.address.getPort();
+
+        const tcp_addr: Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+        var server = tcp_addr.listen(io, .{}) catch continue;
+        server.deinit(io);
+        return port;
+    }
+    return error.NoFreePort;
+}
+
+/// The fake upstream: a UDP socket on an OS-chosen port, and a TCP listener on
+/// the same port number, since Vortex forwards to one address over both. Retried
+/// for the same reason as `reserveEphemeralPort` — the port may be free for UDP
+/// and not for TCP.
+fn bindUpstream(io: Io) !struct { Io.net.Socket, Io.net.Server } {
+    var attempt: usize = 0;
+    while (attempt < 20) : (attempt += 1) {
+        const bind_addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        const udp = try bind_addr.bind(io, .{ .mode = .dgram, .protocol = .udp });
+        const tcp_addr: Io.net.IpAddress = .{ .ip4 = .loopback(udp.address.getPort()) };
+        const tcp = tcp_addr.listen(io, .{}) catch {
+            udp.close(io);
+            continue;
+        };
+        return .{ udp, tcp };
+    }
+    return error.NoFreePort;
+}
+
+fn acceptOne(io: Io, server: *Io.net.Server) anyerror!Io.net.Stream {
+    return server.accept(io);
+}
+
+fn sleepFor(io: Io, ms: u64) Io.Cancelable!void {
+    try io.sleep(.fromMilliseconds(@intCast(ms)), .boot);
+}
+
+/// One frame, read with no buffer so nothing past it is consumed.
+///
+/// A failed read comes back as its real cause — `ConnectionResetByPeer`, say —
+/// rather than the reader's generic `ReadFailed`, because the cases care which:
+/// a peer that closed cleanly and one that reset are different outcomes.
+fn readFrame(io: Io, stream: Io.net.Stream, buf: []u8) anyerror![]u8 {
+    var r = stream.reader(io, &.{});
+    var len: [2]u8 = undefined;
+    r.interface.readSliceAll(&len) catch |err| return r.err orelse err;
+    const n = std.mem.readInt(u16, &len, .big);
+    if (n > buf.len) return error.FrameTooLarge;
+    r.interface.readSliceAll(buf[0..n]) catch |err| return r.err orelse err;
+    return buf[0..n];
 }
 
 fn durationTimeout(ms: u64) Io.Timeout {

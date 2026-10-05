@@ -9,6 +9,90 @@ Newest first. Open work lives in [next_steps.md](next_steps.md).
 
 ---
 
+## Landed 2026-09-28 — P3.5/P3.6: EDNS0 and TCP
+
+Phases 2 and 3 of the protocol plan, combined into one branch. Combining them removed the
+reason for the planned interim: phase 2 alone would have clamped forwarded OPTs to 4096,
+because 1232 produces more TC=1 and TC=1 is only honest with a TCP listener to retry against.
+Here the listener and the 1232 clamp land together.
+
+**One `decide` for both transports.** `handleQuery` was split into a transport-agnostic
+`decide` (header → question → OPT → policy → cache) returning `drop`, `reply` or `forward`,
+and the two things only a transport can do: UDP forwards through `PendingTable` and the
+dispatcher; TCP forwards over its own connection. Cache filling moved out of `dispatcherLoop`
+into `storeReply`, shared the same way. So a rule about what gets blocked, cached or rejected
+cannot drift between UDP and TCP — there is one copy of it.
+
+**EDNS0 ([edns.zig](../src/dns/edns.zig)).**
+- `find` walks *every* record after the question: a second OPT is only detectable by
+  looking, and a query whose counts do not add up is not one whose OPT can be trusted. Both
+  are FORMERR; an OPT outside Additional or with an owner name is too.
+- Version > 0 is **BADVERS** — RCODE 16, which is 0 in the header and 1 in the OPT's
+  extended-RCODE byte, so it cannot be expressed without an OPT in the reply.
+- A blocked name queried with an OPT gets **our** OPT back (payload 1232, DO copied), after
+  the SOA. The test that pinned the old drop was rewritten on purpose, as `next_steps.md`
+  said it would have to be.
+- The forwarded OPT's payload size is **clamped in place** to 1232 (4096 with TCP off), so
+  upstream never sends a reply larger than we will relay unfragmented.
+- **The cache key gained the requester's EDNS class** — none / plain / DO. An answer is
+  shaped by its requester: without the partition, a 1000-byte reply with an OPT and RRSIGs
+  fetched for one client would be served to a plain 512-byte client.
+- **Hit-time size check, for free:** `cache.get` is handed a buffer exactly as large as this
+  client may receive, and `get` already treats an entry that does not fit as a miss. A 900-byte
+  entry is forwarded again for a 512-byte client, never cut.
+
+**TCP.**
+- A listener on the listen address. The accept loop is a supervised loop like the others;
+  **each connection is an `io.concurrent` task**, never `async` — a connection lives as long
+  as its client keeps it open, and `async` may run a task inline, which here would stall
+  every other accept until it ended. `concurrent` has no limit of its own, so
+  [ConnTable](../src/utils/conn_table.zig) is the limit (`VORTEX_MAX_TCP_CONNS`, default 64;
+  past it a connection is closed on arrival), and `asyncLimit` reserves a slot per
+  connection on top of the handlers' share, as it does for the loops.
+- **Idle timeout by cancellation.** `std.Io` streams have no read timeout, and SO_RCVTIMEO
+  underneath is not an option: the runtime treats the resulting EAGAIN as a programmer bug
+  and panics. So each slot holds its task's `Future`, and the sweeper's 1 s tick cancels
+  those that have not completed a message in 10 s. Counted per whole message, so a client
+  trickling a byte at a time cannot hold a slot (slowloris), and a stalled upstream TCP
+  forward is bounded by the same clock.
+- A cancellation arrives at one cancellation point only, and a stream reader reports it as a
+  generic `ReadFailed` with the cause on the side. `streamError` digs it back out: a
+  connection task that swallowed it would carry on, and the sweeper — waiting on that task
+  while holding the table's lock — would wait forever.
+- TCP queries are forwarded over a fresh TCP connection. No `PendingTable`: the stream pairs
+  reply with query, and an off-path attacker cannot race a reply into it. The ID and the
+  question hash are still checked.
+
+**Verified live against 1.1.1.1 with `dig`:** `TXT microsoft.com` comes back TC=1 over UDP
+at 1232, `dig` retries over TCP, and all 58 answers arrive through Vortex's listener and its
+upstream TCP forward. BADVERS, the blocked-reply OPT, and DO pass-through (RRSIGs returned for
+`cloudflare.com`) all behave as specified.
+
+**Found while testing, both fixed:**
+- **A restart could fail with AddressInUse.** The TCP listener did not set SO_REUSEADDR, so
+  for as long as a previous process's TCP connections sat in TIME_WAIT, a new one could not
+  bind. Found as an integration flake: the harness reserves ports by binding UDP, and a port
+  free for UDP can still be in TIME_WAIT on TCP from an earlier case. The listener now sets it;
+  Zig's option sets SO_REUSEPORT too, which cannot let a second Vortex share the port because
+  the UDP socket binds first, without reuse. The harness now checks both protocols.
+- **A refused TCP connection can arrive as a reset, not an EOF.** Closing a socket with an
+  unread query in it makes the kernel send RST. Correct behavior; the harness now reports the
+  real cause instead of a bare `ReadFailed`, and the cap case treats either as "refused".
+
+**Tests:** 206/206 (173 unit, 33 integration). Unit: `edns` (parse, duplicate, misplaced,
+counts, clamp, exact OPT bytes), `blocked_response` (our OPT after the SOA, none when not
+asked, BADVERS shape, short buffer), the cache key's EDNS class, `ConnTable` (cap, reclaim,
+idle cancel, release) with real tasks, and the new setting. Integration, 12 new: OPT on
+blocked replies; the 1232 clamp and its 4096 fallback with TCP off; BADVERS; duplicate OPT;
+cache partitioning; the size-limited hit; TCP blocked, forwarded (a 5000-byte answer, whole),
+pipelined, the connection cap with slot reuse, and a stalled connection closed by the idle
+timeout. **Mutation-checked twelve ways**, each removing one rule — every one fails its case.
+One first reported as missed was a mutation that only touched `eql` while the hash still
+separated the partitions; removing EDNS from the key entirely fails both the integration case
+and a unit test.
+
+---
+
 ## Landed 2026-09-28 — cache: TC=1 is never stored, and hits echo the client's casing
 
 Phase 1 of the protocol-completeness plan. Two defects in the P3.3 cache, both on the path a

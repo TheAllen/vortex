@@ -550,7 +550,6 @@ test "walking our own blocked response yields exactly the synthetic SOA" {
     // exercises the RDLENGTH rule again for free: `blocked_response` emits
     // root-label MNAME and RNAME, so their next_offsets are 21 octets short of
     // where the record actually ends.
-    const gpa = testing.allocator;
 
     // zig fmt: off
     const query = [_]u8{
@@ -570,8 +569,8 @@ test "walking our own blocked response yields exactly the synthetic SOA" {
     // zig fmt: on
     const question_end = 33;
 
-    const reply = try blocked_response.build(gpa, &query, question_end, .name_error);
-    defer gpa.free(reply);
+    var reply_buf: [512]u8 = undefined;
+    const reply = try blocked_response.buildInto(&reply_buf, &query, question_end, .name_error, .{});
 
     var it = walk(reply, question_end);
 

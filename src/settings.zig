@@ -191,6 +191,15 @@ pub const Settings = struct {
     /// 1..65536 — the proxy ID is 16 bits, so the table cannot hold more.
     max_pending: usize,
 
+    /// Concurrent TCP client connections (P3.6). 0 disables the TCP listener.
+    ///
+    /// A cap, because each connection is a thread for as long as its client
+    /// keeps it open — see `ConnTable`. Past it, a new connection is closed on
+    /// arrival. Disabling TCP also raises the EDNS size forwarded queries may
+    /// advertise from 1232 back to 4096, since a truncated reply is only an
+    /// honest answer when there is a TCP listener to retry against.
+    max_tcp_conns: usize,
+
     pub const defaults: Settings = .{
         .listen_host = "127.0.0.1",
         .listen_port = 5354,
@@ -231,6 +240,10 @@ pub const Settings = struct {
         .handler_threads = null,
 
         .max_pending = 4096,
+
+        // Comfortably more than a home network's resolvers will hold open at
+        // once — TCP is the fallback path for truncated answers, not the norm.
+        .max_tcp_conns = 64,
     };
 
     /// Environment file consulted when `VORTEX_ENV_FILE` is unset. Missing is
@@ -254,8 +267,9 @@ pub const Settings = struct {
         InvalidLogLevel,
         /// `VORTEX_LOG_FORMAT` was set to something that isn't a format.
         InvalidLogFormat,
-        /// `VORTEX_CACHE_MAX_ENTRIES`, `VORTEX_BLOCKLIST_REFRESH_SECS` or
-        /// `VORTEX_HANDLER_THREADS` was set to something that isn't a count.
+        /// `VORTEX_CACHE_MAX_ENTRIES`, `VORTEX_BLOCKLIST_REFRESH_SECS`,
+        /// `VORTEX_HANDLER_THREADS` or `VORTEX_MAX_TCP_CONNS` was set to
+        /// something that isn't a count.
         InvalidCacheSize,
         /// `VORTEX_MAX_PENDING` was not a whole number in 1..65536.
         InvalidMaxPending,
@@ -345,6 +359,7 @@ pub const Settings = struct {
             else
                 defaults.handler_threads,
             .max_pending = try envMaxPending(environ),
+            .max_tcp_conns = try envCount(environ, "VORTEX_MAX_TCP_CONNS", defaults.max_tcp_conns),
         };
     }
 
@@ -826,6 +841,17 @@ test "fromEnviron bounds max_pending to the proxy ID space" {
         try map.put("VORTEX_MAX_PENDING", bad);
         try testing.expectError(error.InvalidMaxPending, Settings.fromEnviron(&map));
     }
+}
+
+test "fromEnviron reads max_tcp_conns, with 0 meaning no TCP listener" {
+    var map = Environ.Map.init(testing.allocator);
+    defer map.deinit();
+
+    try testing.expectEqual(@as(usize, 64), (try Settings.fromEnviron(&map)).max_tcp_conns);
+    try map.put("VORTEX_MAX_TCP_CONNS", "0");
+    try testing.expectEqual(@as(usize, 0), (try Settings.fromEnviron(&map)).max_tcp_conns);
+    try map.put("VORTEX_MAX_TCP_CONNS", "lots");
+    try testing.expectError(error.InvalidCacheSize, Settings.fromEnviron(&map));
 }
 
 test "fromEnviron rejects the pre-rename blocklist variables" {

@@ -8,6 +8,7 @@ const Cache = cache_mod.Cache;
 const CacheKey = cache_mod.CacheKey;
 const Context = @import("utility.zig").Context;
 const Refresher = @import("utility.zig").Refresher;
+const Tcp = @import("utility.zig").Tcp;
 const DomainBlockList = @import("blocklist/domain_blocklist.zig").DomainBlockList;
 const Header = @import("dns/header.zig").Header;
 const pending_table_mod = @import("utils/pending_table.zig");
@@ -21,6 +22,8 @@ const settings_mod = @import("settings.zig");
 const Settings = settings_mod.Settings;
 const SuffixBlockList = @import("blocklist/suffix_blocklist.zig").SuffixBlockList;
 const Question = @import("dns/question.zig").Question;
+const edns = @import("dns/edns.zig");
+const ConnTable = @import("utils/conn_table.zig").ConnTable;
 
 /// Every `std.log.*` call in the process — ours and the standard library's —
 /// renders through [obs/log.zig](obs/log.zig).
@@ -70,11 +73,161 @@ fn initSockets(io: std.Io, cfg: Settings) !struct {
     };
 }
 
-/// Per-query coroutine that checks the QName of a DNS packet and decide if it belongs to the block-list
-/// Workflow:
-///   1. Check the QName in Question section of the packet
-///   2a. Parse the ID if not in blocklist
-///   2b. Craft Response section and send back to client (no need to parse header)
+/// How a query arrived, which decides how large a reply it can take: over UDP,
+/// what its OPT advertises (512 without one); over TCP, a full 64 KiB.
+const Transport = enum { udp, tcp };
+
+/// What the datapath decided to do with one query. Shared by both transports,
+/// which differ only in how they carry the bytes and how they forward.
+const Outcome = union(enum) {
+    /// Send nothing: a response (QR=1 — answering it would make us a
+    /// reflector), or a question section too malformed to answer about.
+    drop,
+    /// Answered locally. A prefix of the caller's `out` buffer.
+    reply: []u8,
+    /// Needs upstream.
+    forward: Forward,
+};
+
+const Forward = struct {
+    client_id: u16,
+    /// One past the question section, as `parseQuestion` returned it.
+    q_end: usize,
+    /// The requester's EDNS class — the cache partition its answer belongs to.
+    class: edns.Class,
+};
+
+/// Validates a query and decides its fate: drop, answer locally, or forward.
+///
+/// Everything a query goes through before it needs a socket lives here, so
+/// UDP and TCP cannot drift apart on what they block, cache or reject. The
+/// order is load-bearing:
+///
+///   1. Header — QR=1 dropped; bad opcode or QDCOUNT answered header-only.
+///   2. Question — unparseable is dropped.
+///   3. OPT (P3.5) — malformed or duplicated is FORMERR; version > 0 is BADVERS.
+///   4. Policy — a blocked name is answered here, with our OPT if it sent one.
+///   5. Cache — **after** policy, never before: a name cached and then added to
+///      a refreshed blocklist (P2.2) would otherwise keep resolving for up to a
+///      TTL. The blocklist wins, always.
+///
+/// `data` is mutated only on the forward path, where the OPT's payload size is
+/// clamped. Every reply is written into `out`.
+fn decide(
+    io: std.Io,
+    ctx: *const Context,
+    data: []u8,
+    out: []u8,
+    transport: Transport,
+) std.Io.Cancelable!Outcome {
+    if (data.len < 12) return .drop;
+
+    var header = Header{};
+    header.parseHeader(data[0..12]);
+
+    const rejection = header.validateQuery();
+    if (rejection != .none) {
+        // `rcode()` decides drop-vs-reply. QR=1 is the silent case. The others
+        // are real clients asking for something malformed or unimplemented, so
+        // they get an answer — header-only, since their question section is
+        // exactly what we could not trust.
+        std.log.debug("rejecting query: {s}", .{@tagName(rejection)});
+        const rcode = rejection.rcode() orelse return .drop;
+        out[0..12].* = Header.headerOnlyReply(data, rcode);
+        return .{ .reply = out[0..12] };
+    }
+
+    var question = Question{};
+    const q_end = question.parseQuestion(data, 12) catch |err| {
+        std.log.debug("dropping malformed query: {s}", .{@errorName(err)});
+        return .drop;
+    };
+
+    // Borrows `question`'s inline buffer, so it stays valid for exactly as long
+    // as `question` is in scope.
+    const domain: []const u8 = question.qname.slice();
+
+    const opt = edns.find(data, q_end, header) catch |err| {
+        // RFC 6891 §6.1.1: more than one OPT is FORMERR, and so is one we cannot
+        // locate with confidence. Header-only, like every other FORMERR.
+        std.log.debug("FORMERR for {s}: {s}", .{ domain, @errorName(err) });
+        out[0..12].* = Header.headerOnlyReply(data, .format_error);
+        return .{ .reply = out[0..12] };
+    };
+    const our_opt: ?blocked_response.Opt = if (opt) |o|
+        .{ .udp_size = ctx.edns_udp_size, .do_bit = o.do_bit }
+    else
+        null;
+
+    if (opt) |o| if (o.version > 0) {
+        // BADVERS: we speak version 0 only. Extended RCODE 16 is 1 in the OPT's
+        // top byte with 0 in the header, and needs the OPT to be expressible.
+        std.log.debug("BADVERS for {s}: version {d}", .{ domain, o.version });
+        var badvers = our_opt.?;
+        badvers.ext_rcode = 1;
+        const reply = blocked_response.buildInto(out, data, q_end, .no_error, .{
+            .soa = false,
+            .opt = badvers,
+        }) catch return .drop;
+        return .{ .reply = reply };
+    };
+
+    switch (try ctx.policy.decide(io, domain)) {
+        .allow => query_log.debug("verdict=allow qname={s}", .{domain}),
+        .block => {
+            query_log.debug("verdict=block qname={s}", .{domain});
+            // NXDOMAIN + a synthetic SOA so the client can negatively cache the
+            // block, and our OPT if the query carried one (RFC 6891 §7).
+            const reply = blocked_response.buildInto(out, data, q_end, .name_error, .{
+                .opt = our_opt,
+            }) catch {
+                std.log.warn("dropping blocked reply for {s}: reply buffer too small", .{domain});
+                return .drop;
+            };
+            return .{ .reply = reply };
+        },
+        .pass => query_log.debug("verdict=pass qname={s}", .{domain}),
+    }
+
+    const class = edns.class(opt);
+
+    if (ctx.cache) |cache| serve: {
+        const now: i64 = @intCast(std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds);
+
+        // The buffer handed to `get` is exactly as large as this client may
+        // receive, and `get` treats an entry that does not fit as a miss. That
+        // is the size check: an answer fetched over TCP, or for a client with a
+        // larger EDNS buffer, is never squeezed down to — or silently cut to
+        // fit — one that cannot take it.
+        const limit = switch (transport) {
+            .udp => @min(edns.replyLimit(opt), out.len),
+            .tcp => out.len,
+        };
+        const hit = cache.get(CacheKey.fromQuestion(&question, class), now, out[0..limit]) orelse break :serve;
+
+        // `get` handed back a copy, so this cannot reach the stored entry. The
+        // client's own ID and question bytes go in: the entry was filled by
+        // whoever asked first, in their casing.
+        const served = out[0..hit.len];
+        cache_mod.finalizeServed(served, data[12..q_end], header.id, hit.age_secs) catch |err| {
+            // A cache that cannot render a hit is a slow cache, not a broken
+            // resolver: fall through to upstream.
+            std.log.warn("cache hit for {s} unusable: {s}", .{ domain, @errorName(err) });
+            break :serve;
+        };
+        query_log.debug("verdict=hit qname={s} age={d}s", .{ domain, hit.age_secs });
+        return .{ .reply = served };
+    }
+
+    // Upstream never sends a reply larger than the query advertises, so
+    // clamping the advertisement is what keeps replies within what we relay
+    // unfragmented (1232) — or, with no TCP listener, within our buffer.
+    if (opt) |o| edns.clampInPlace(data, o, ctx.edns_udp_size);
+
+    return .{ .forward = .{ .client_id = header.id, .q_end = q_end, .class = class } };
+}
+
+/// Per-datagram task: decide, then answer or hand the query to upstream.
 fn handleQuery(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -84,120 +237,49 @@ fn handleQuery(
 ) std.Io.Cancelable!void {
     defer gpa.free(data);
 
-    if (data.len < 12) return;
+    // On the task stack, like the ingress and dispatcher buffers. Bounded by
+    // the handler count (`VORTEX_HANDLER_THREADS`), not by P1.5's pending cap —
+    // a local answer never takes a pending slot.
+    var out: [4096]u8 = undefined;
 
-    // Check against block list
-    var header = Header{};
-    header.parseHeader(data[0..12]);
-
-    const rejection = header.validateQuery();
-    if (rejection != .none) {
-        // `rcode()` decides drop-vs-reply. QR=1 is the silent case: answering a
-        // response would make us a reflector. The others are real clients
-        // asking for something malformed or unimplemented, so they get an
-        // answer — header-only, since their question section is exactly what we
-        // could not trust.
-        if (rejection.rcode()) |rcode| {
-            const reply = Header.headerOnlyReply(data, rcode);
-            ctx.client_socket.send(io, &incoming_addr, &reply) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                else => {},
-            };
-        }
-        std.log.debug("rejecting query from {f}: {s}", .{ incoming_addr, @tagName(rejection) });
-        return;
-    }
-
-    var question = Question{};
-    const q_end = question.parseQuestion(data, 12) catch |err| {
-        std.log.debug("dropping malformed query from {f}: {s}", .{ incoming_addr, @errorName(err) });
-        return;
-    };
-
-    // Borrows `question`'s inline buffer, so it stays valid for exactly as long
-    // as `question` is in scope — through the policy decision and the send below.
-    const domain: []const u8 = question.qname.slice();
-
-    switch (try ctx.policy.decide(io, domain)) {
-        .allow => {
-            query_log.debug("verdict=allow qname={s}", .{domain});
-        },
-        .block => {
-            query_log.debug("verdict=block qname={s}", .{domain});
-
-            // NXDOMAIN + a synthetic SOA so the client can negatively cache the
-            // block. Built into a fresh buffer because `data` is a dupe sized to
-            // the exact query length — see blocked_response.build.
-            const reply = blocked_response.build(gpa, data, q_end, .name_error) catch {
-                std.log.warn("dropping blocked reply for {s}: out of memory", .{domain});
-                return;
-            };
-            defer gpa.free(reply);
-
-            ctx.client_socket.send(io, &incoming_addr, reply) catch {};
-            return;
-        },
-        .pass => {
-            query_log.debug("verdict=pass qname={s}", .{domain});
-        },
-    }
-
-    // Cache lookup, and note where it sits: **after** the policy verdict, never
-    // before. A name can be cached and then appear in a refreshed blocklist
-    // (P2.2); checking the cache first would keep serving the old answer and
-    // silently defeat the block for up to a TTL. The blocklist wins, always.
-    if (ctx.cache) |cache| serve: {
-        const key = CacheKey.fromQuestion(&question);
-        const now: i64 = @intCast(std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds);
-
-        // On the coroutine stack, like the ingress and dispatcher buffers. Note
-        // this is per in-flight handler, so it is bounded by the handler count
-        // (`VORTEX_HANDLER_THREADS`), not by P1.5's pending cap — a cache hit
-        // never takes a pending slot.
-        var hit_buf: [4096]u8 = undefined;
-        const hit = cache.get(key, now, &hit_buf) orelse break :serve;
-
-        // `get` handed back a copy, so this cannot reach the stored entry —
-        // which is what lets one entry serve many clients with different IDs.
-        //
-        // The client's own question bytes go in, not just its ID: the entry was
-        // filled by whoever asked first, in their casing. Same name, so same
-        // length — which also makes `q_end` the cached reply's records offset.
-        const served = hit_buf[0..hit.len];
-        cache_mod.finalizeServed(served, data[12..q_end], header.id, hit.age_secs) catch |err| {
-            // Fall through to a normal upstream query rather than failing the
-            // client: a cache that cannot render a hit is a slow cache, not a
-            // broken resolver.
-            std.log.warn("cache hit for {s} unusable: {s}", .{ domain, @errorName(err) });
-            break :serve;
-        };
-
-        query_log.debug("verdict=hit qname={s} age={d}s", .{ domain, hit.age_secs });
-        ctx.client_socket.send(io, &incoming_addr, served) catch |err| switch (err) {
+    switch (try decide(io, ctx, data, &out, .udp)) {
+        .drop => {},
+        .reply => |reply| ctx.client_socket.send(io, &incoming_addr, reply) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
-            else => std.log.warn("cache hit send failed: {s}", .{@errorName(err)}),
-        };
-        return;
+            else => std.log.warn("reply send to {f} failed: {s}", .{ incoming_addr, @errorName(err) }),
+        },
+        .forward => |f| try forwardUdp(io, ctx, incoming_addr, data, f),
     }
+}
 
+/// Sends a query upstream over the shared UDP socket; `dispatcherLoop` relays
+/// the reply and the sweeper SERVFAILs it if none comes.
+fn forwardUdp(
+    io: std.Io,
+    ctx: *const Context,
+    incoming_addr: std.Io.net.IpAddress,
+    data: []u8,
+    f: Forward,
+) std.Io.Cancelable!void {
     // q_end is one past the question section, so the question occupies
     // data[12..q_end]. parseQuestion already bounded it against data.len.
-    const question_len: u16 = @intCast(q_end - 12);
+    const question_len: u16 = @intCast(f.q_end - 12);
     const question_hash = pending_table_mod.hashQuestion(ctx.question_seed, data, question_len).?;
 
     const proxy_id = ctx.pending_table.appendQuery(.{
-        .client_id = header.id,
+        .client_id = f.client_id,
         .client_addr = incoming_addr,
         .question_hash = question_hash,
         .question_len = question_len,
+        .edns = f.class,
         .expires_at = @intCast(std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds + 5 * std.time.ns_per_s),
     }) catch |err| switch (err) {
         // P1.5: at the cap, drop without a reply. Deliberately silent in both
         // directions — no log line per refusal (the sweeper reports a count),
         // and no SERVFAIL, because a flood's source addresses are often spoofed
         // and answering each packet reflects traffic at someone else, even
-        // with no amplification. Blocked names and cache hits returned above
-        // this line, so they are still answered while the table is full.
+        // with no amplification. Local answers returned from `decide` before
+        // this, so they are still given while the table is full.
         error.TableFull => return,
         else => {
             std.log.err("Failed to append query to Pending table: {s}", .{@errorName(err)});
@@ -212,6 +294,67 @@ fn handleQuery(
             _ = ctx.pending_table.complete(proxy_id);
             std.log.err("upstream send query failed: {s}", .{@errorName(err)});
         },
+    };
+}
+
+/// Files a verified upstream reply in the cache, under the partition of the
+/// requester it was fetched for. Shared by the UDP dispatcher and the TCP path.
+///
+/// Returns an error only when the reply's question does not parse, which the
+/// UDP path has always treated as "do not relay".
+fn storeReply(
+    io: std.Io,
+    ctx: *const Context,
+    reply: []const u8,
+    overflowed: bool,
+    class: edns.Class,
+) error{MalformedReply}!void {
+    var reply_header = Header{};
+    reply_header.parseHeader(reply[0..12]);
+
+    var reply_question = Question{};
+    const offset = reply_question.parseQuestion(reply, 12) catch |err| {
+        std.log.warn("failed to parse reply question: {s}", .{@errorName(err)});
+        return error.MalformedReply;
+    };
+
+    // Read-only walk: a parse failure abandons the walk and nothing else — the
+    // reply is relayed verbatim whatever it finds, and is simply not cached.
+    //
+    // Two guards, which stopped being cosmetic when the walk's output started
+    // deciding what gets *stored*:
+    //
+    //   * Overflowed — the records are known-incomplete.
+    //   * QDCOUNT != 1 — records begin at `12 + question_len` only when there
+    //     is exactly one question. Walking from the wrong offset is the silent
+    //     desynchronization this design exists to avoid.
+    const walkable = !overflowed and reply_header.question_count == 1;
+
+    var min_ttl: ?u32 = null;
+    if (walkable) walk: {
+        min_ttl = cache_mod.replyTtlSeconds(reply, offset, reply_header) catch |err| {
+            std.log.debug("record walk for {s}: {s}", .{ reply_question.qname.slice(), @errorName(err) });
+            break :walk;
+        };
+
+        // The label is load-bearing: an unlabelled `break` in a `while`
+        // condition binds to the nearest enclosing loop.
+        var it = ResourceRecordIter.init(reply, offset, reply_header);
+        walk_log: while (true) {
+            const next = it.next() catch break :walk_log;
+            const record = next orelse break :walk_log;
+            query_log.debug("record name={s} type={d} ttl={d}", .{ record.name.slice(), record.type, record.ttl });
+        }
+    }
+
+    const cache = ctx.cache orelse return;
+    if (!cache_mod.isCacheable(reply_header, overflowed, min_ttl)) return;
+
+    const now: i64 = @intCast(std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds);
+    const ttl_ns = @as(i64, min_ttl.?) * std.time.ns_per_s;
+    cache.put(CacheKey.fromQuestion(&reply_question, class), reply, now, now + ttl_ns) catch |err| {
+        // A cache that cannot store is a slow cache. The reply goes out anyway.
+        std.log.warn("cache put failed: {s}", .{@errorName(err)});
     };
 }
 
@@ -264,94 +407,17 @@ fn dispatcherLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
             continue;
         };
 
-        var reply_header = Header{};
-        reply_header.parseHeader(reply_msg.data[0..12]);
-
-        var reply_question = Question{};
-        var offset: usize = 12;
-        offset = reply_question.parseQuestion(reply_msg.data, offset) catch |err| switch (err) {
-            error.Canceled => return error.Canceled,
-            else => {
-                std.log.warn("failed to parse reply question: {s}", .{@errorName(err)});
-                continue;
-            },
-        };
-
-        // Parse resource records. Read-only: the datapath below relays upstream's
-        // bytes verbatim whatever this finds, so a parse failure abandons the
-        // walk and nothing else. A resolver that stopped resolving because it
-        // disagreed with a record it was only logging would be a worse outcome
-        // than any log line is worth.
-        // The label is load-bearing: an unlabelled `break` in a `while`
-        // *condition* binds to the enclosing loop — here the dispatcher's own
-        // `while (true)` — which silently swallows the reply and drops out of
-        // the loop entirely instead of just ending the walk.
-        //
-        // The two guards below were specified with P3.2 and skipped. They stop
-        // being cosmetic here: while the walk only logged, a wrong offset cost
-        // one bad log line, but its output now decides what gets *stored*.
-        //
-        //   * TC=1 — the records are known-incomplete, so errors from walking
-        //     them mean nothing and the result must not be cached.
-        //   * QDCOUNT != 1 — records begin at `12 + question_len` only when
-        //     there is exactly one question. Walking from the wrong offset is
-        //     the silent desynchronization this design exists to avoid.
-        const walkable = !reply_msg.flags.trunc and reply_header.question_count == 1;
-
-        var resourceRecordIter = ResourceRecordIter.init(reply_msg.data, offset, reply_header);
-        var min_ttl: ?u32 = null;
-        if (walkable) walk: {
-            min_ttl = cache_mod.replyTtlSeconds(reply_msg.data, offset, reply_header) catch |err| {
-                // A malformed reply is still relayed verbatim — the read-only
-                // stance P3.2 shipped under holds. It is simply not cached.
-                std.log.debug("record walk for id={x}: {s}", .{ proxy_id, @errorName(err) });
-                break :walk;
-            };
-
-            // Kept at debug and behind the walk: one line per record per query
-            // is a lot of log for a home network, and P2.3's per-query event is
-            // where these fields eventually belong.
-            walk_log: while (true) {
-                const next = resourceRecordIter.next() catch break :walk_log;
-                const record = next orelse break :walk_log;
-                query_log.debug("record name={s} type={d} ttl={d}", .{
-                    record.name.slice(),
-                    record.type,
-                    record.ttl,
-                });
-            }
-        }
-
         // Store before the transaction ID is rewritten, so the entry holds
-        // upstream's bytes rather than one client's view of them. Every serve
-        // rewrites the ID anyway, but caching the un-rewritten form keeps the
-        // stored copy honest about what actually arrived.
-        if (ctx.cache) |cache| {
-            if (cache_mod.isCacheable(reply_header, reply_msg.flags.trunc, min_ttl)) {
-                const now: i64 = @intCast(std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds);
-                const ttl_ns = @as(i64, min_ttl.?) * std.time.ns_per_s;
-                cache.put(
-                    CacheKey.fromQuestion(&reply_question),
-                    reply_msg.data,
-                    now,
-                    now + ttl_ns,
-                ) catch |err| {
-                    // A cache that cannot store is a slow cache. The client's
-                    // reply is already in hand and goes out regardless.
-                    std.log.warn("cache put failed: {s}", .{@errorName(err)});
-                };
-            }
-        }
+        // upstream's bytes rather than one client's view of them.
+        storeReply(io, ctx, reply_msg.data, reply_msg.flags.trunc, entry.edns) catch continue;
 
         std.mem.writeInt(u16, reply_msg.data[0..2], entry.client_id, .big);
 
-        // The datagram was larger than `msg_buf` and the tail was discarded. We
-        // forward the client's OPT verbatim, so a client advertising an EDNS0
-        // buffer above 4096 can legitimately provoke this. Relaying the prefix
-        // as-is hands the client a silently corrupt message; TC=1 tells them it
-        // is incomplete and to retry over TCP. (That retry has nowhere to land
-        // until P3.6 adds a TCP listener — an honest failure rather than
-        // silent corruption.)
+        // The datagram was larger than `msg_buf` and the tail was discarded.
+        // Since P3.5 the forwarded OPT is clamped, so a conforming upstream
+        // cannot provoke this; one that ignores the advertised size still can.
+        // Relaying the prefix as-is would hand the client a silently corrupt
+        // message; TC=1 tells it to retry over TCP.
         if (reply_msg.flags.trunc) {
             std.log.warn("upstream reply for id={x} exceeded {d}-byte buffer; setting TC", .{
                 proxy_id,
@@ -368,6 +434,147 @@ fn dispatcherLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
             },
         };
     }
+}
+
+// ── TCP (P3.6) ────────────────────────────────────────────────────────────
+
+/// Largest DNS message over TCP: the 2-byte length prefix caps it.
+const tcp_max_message = std.math.maxInt(u16);
+
+/// How long a TCP connection may go without completing a message before the
+/// sweeper cancels it. RFC 7766 §6.2.3 asks for a timeout "on the order of
+/// seconds". Counted per *message*, so it also bounds a stalled upstream: a
+/// forward that has not come back by then takes its connection with it.
+const tcp_idle_ns: i64 = 10 * std.time.ns_per_s;
+
+/// Accepts TCP connections and gives each its own task, up to the table's cap.
+fn tcpAcceptLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
+    const tcp = ctx.tcp orelse return parkForever(io);
+    while (true) {
+        const stream = tcp.server.accept(io) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {
+                // Brief pause: an error like EMFILE would otherwise come back
+                // immediately and spin this loop.
+                std.log.warn("tcp accept: {s}", .{@errorName(err)});
+                try io.sleep(std.Io.Duration.fromMilliseconds(50), std.Io.Clock.boot);
+                continue;
+            },
+        };
+
+        const slot = tcp.conns.claim(io) orelse {
+            std.log.debug("refusing tcp connection: {d} already open (VORTEX_MAX_TCP_CONNS)", .{tcp.conns.slots.len});
+            stream.close(io);
+            continue;
+        };
+        // `concurrent`, never `async`: a connection lives as long as its client
+        // keeps it open, and `async` may run it inline — right here, where it
+        // would stop every other connection from being accepted until it ends.
+        const future = io.concurrent(tcpConnection, .{ io, ctx, stream, slot }) catch |err| {
+            std.log.warn("cannot start tcp connection task: {s}", .{@errorName(err)});
+            tcp.conns.release(io, slot);
+            stream.close(io);
+            continue;
+        };
+        tcp.conns.attach(io, slot, future);
+    }
+}
+
+/// Serves one TCP connection: length-prefixed queries in, answers out, in
+/// order (RFC 7766 permits pipelining; answering in order is always correct).
+fn tcpConnection(io: std.Io, ctx: *const Context, stream: std.Io.net.Stream, slot: *ConnTable.Slot) void {
+    defer slot.finish();
+    defer stream.close(io);
+
+    // Two full-size message buffers per connection: 128 KiB, which is why the
+    // connection count is capped. `reply_buf` keeps two bytes in front for
+    // the length prefix, so a reply goes out in one write.
+    const bufs = ctx.gpa.alloc(u8, 2 * (2 + tcp_max_message)) catch return;
+    defer ctx.gpa.free(bufs);
+    const query_buf = bufs[0 .. 2 + tcp_max_message];
+    const reply_buf = bufs[2 + tcp_max_message ..];
+
+    var read_buf: [512]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    var writer = stream.writer(io, &.{});
+
+    while (true) {
+        // Any read or write failure ends the connection — including a
+        // cancellation from the idle sweep, which surfaces here as a failed read.
+        var len_bytes: [2]u8 = undefined;
+        reader.interface.readSliceAll(&len_bytes) catch return;
+        const len = std.mem.readInt(u16, &len_bytes, .big);
+        if (len < 12) return;
+        const query = query_buf[0..len];
+        reader.interface.readSliceAll(query) catch return;
+        slot.touch(io);
+
+        const out = reply_buf[2..];
+        const reply: []const u8 = switch (decide(io, ctx, query, out, .tcp) catch return) {
+            // Over TCP a drop leaves the client waiting on a stream it owns, so
+            // close it instead: that is an answer it can act on.
+            .drop => return,
+            .reply => |r| r,
+            .forward => |f| tcpForward(io, ctx, query, out, f) catch |err| switch (err) {
+                error.Canceled => return,
+                else => blk: {
+                    std.log.warn("tcp upstream: {s}", .{@errorName(err)});
+                    out[0..12].* = Header.synthesizedReply(f.client_id, .server_failure);
+                    break :blk out[0..12];
+                },
+            },
+        };
+
+        std.mem.writeInt(u16, reply_buf[0..2], @intCast(reply.len), .big);
+        writer.interface.writeAll(reply_buf[0 .. 2 + reply.len]) catch return;
+    }
+}
+
+/// Forwards one query to upstream over a fresh TCP connection and reads the
+/// reply into `out`.
+///
+/// No `PendingTable`: the connection itself pairs the reply with the query,
+/// and an off-path attacker cannot inject into an established TCP stream the
+/// way they can race a UDP reply. The ID and question are still checked — a
+/// confused upstream is not only an attacker's problem.
+fn tcpForward(io: std.Io, ctx: *const Context, query: []const u8, out: []u8, f: Forward) ![]u8 {
+    const upstream = try ctx.upstream_addr.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    defer upstream.close(io);
+
+    var len_bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &len_bytes, @intCast(query.len), .big);
+    var writer = upstream.writer(io, &.{});
+    var parts = [_][]const u8{ &len_bytes, query };
+    writer.interface.writeVecAll(&parts) catch return streamError(writer.err);
+
+    var read_buf: [512]u8 = undefined;
+    var reader = upstream.reader(io, &read_buf);
+    reader.interface.readSliceAll(&len_bytes) catch return streamError(reader.err);
+    const len = std.mem.readInt(u16, &len_bytes, .big);
+    if (len < 12 or len > out.len) return error.BadUpstreamReply;
+    const reply = out[0..len];
+    reader.interface.readSliceAll(reply) catch return streamError(reader.err);
+
+    const question_len: u16 = @intCast(f.q_end - 12);
+    const asked = pending_table_mod.hashQuestion(ctx.question_seed, query, question_len).?;
+    if (std.mem.readInt(u16, reply[0..2], .big) != f.client_id or
+        pending_table_mod.hashQuestion(ctx.question_seed, reply, question_len) != asked)
+    {
+        return error.BadUpstreamReply;
+    }
+
+    storeReply(io, ctx, reply, false, f.class) catch return error.BadUpstreamReply;
+    return reply;
+}
+
+/// A stream reader or writer reports failure as `ReadFailed`/`WriteFailed` and
+/// keeps the cause on the side. A cancellation has to come back out as
+/// `error.Canceled`: it is delivered to one cancellation point only, so a
+/// caller that swallowed it would carry on — and the canceller, which waits
+/// for this task to end, would wait forever.
+fn streamError(cause: anytype) anyerror {
+    if (cause) |err| return if (err == error.Canceled) error.Canceled else err;
+    return error.EndOfStream;
 }
 
 fn sweeperLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
@@ -407,6 +614,15 @@ fn sweeperLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
             shed,
             ctx.pending_table.max_pending,
         });
+
+        // TCP connections ride the same tick: a connection that has not
+        // completed a message in `tcp_idle_ns` is cancelled, which is the only
+        // way to end a blocked read — `std.Io` streams have no read timeout.
+        if (ctx.tcp) |tcp| {
+            const now: i64 = @intCast(std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds);
+            const ended = tcp.conns.cancelIdle(io, now, tcp_idle_ns);
+            if (ended > 0) std.log.debug("tcp: closed {d} idle connections", .{ended});
+        }
 
         evicted.clearRetainingCapacity();
         ctx.pending_table.sweepExpiredQueries(&evicted);
@@ -698,16 +914,17 @@ fn defaultHandlerThreads() usize {
 }
 
 /// The `async_limit` that leaves `handler_threads` slots for handlers once
-/// `loops` long-lived loops are running.
+/// `long_lived` concurrent tasks are running — the background loops, plus one
+/// per TCP connection slot.
 ///
 /// The addition is the point. `Io.Threaded` keeps one busy count for `async`
 /// and `concurrent` tasks alike, and compares it against `async_limit` when an
 /// `async` task arrives. A loop never returns, so without the extra slots every
 /// loop permanently takes one away from the handlers — on a 4-CPU host the
 /// three loops took all three, and every query ran inline on the ingress
-/// thread.
-fn asyncLimit(handler_threads: usize, loops: usize) std.Io.Limit {
-    return .limited(handler_threads + loops);
+/// thread. An open TCP connection holds its slot the same way.
+fn asyncLimit(handler_threads: usize, long_lived: usize) std.Io.Limit {
+    return .limited(handler_threads + long_lived);
 }
 
 /// Starts a supervised background loop on a thread of its own.
@@ -763,15 +980,37 @@ pub fn main(init: std.process.Init) !void {
     obs_log.configure(io, cfg.log_level, cfg.log_format);
 
     // Before the first `async` anywhere — `buildSnapshot` below is one — so no
-    // task is ever admitted under the old limit. The refresher only exists when
-    // refresh is enabled, and the count has to agree with what is spawned.
+    // task is ever admitted under the old limit. The refresher and the TCP
+    // accept loop only exist when enabled, and the count has to agree with
+    // what is spawned.
     const handler_threads = cfg.handler_threads orelse defaultHandlerThreads();
-    const loops: usize = if (cfg.blocklist_refresh_secs == 0) 2 else 3;
-    threaded.setAsyncLimit(asyncLimit(handler_threads, loops));
+    const tcp_enabled = cfg.max_tcp_conns > 0;
+    const loops: usize = 2 + @as(usize, @intFromBool(cfg.blocklist_refresh_secs != 0)) + @intFromBool(tcp_enabled);
+    threaded.setAsyncLimit(asyncLimit(handler_threads, loops + cfg.max_tcp_conns));
 
     const client_socket, const upstream_socket = try initSockets(io, cfg);
     defer client_socket.close(io);
     defer upstream_socket.close(io);
+
+    // TCP on the same address and port as UDP (RFC 7766: a resolver that
+    // answers over UDP must also answer over TCP). Declared here so its
+    // teardown runs after the group's: the accept loop and the sweeper both
+    // reach it, and both are stopped by `group.cancel` below.
+    const listen_addr = try initIpAddress(cfg.listen_host, cfg.listen_port);
+    //
+    // `reuse_address`, because without it a restart fails with AddressInUse
+    // for as long as the previous process's TCP connections sit in TIME_WAIT —
+    // up to a couple of minutes after every restart that had TCP clients. It
+    // sets SO_REUSEPORT too, which on its own would let a second Vortex share
+    // the port; that cannot happen here, because the UDP socket above binds
+    // first and without reuse, so a second instance fails there.
+    var tcp_server: ?std.Io.net.Server = if (tcp_enabled) try listen_addr.listen(io, .{ .reuse_address = true }) else null;
+    defer if (tcp_server) |*server| server.deinit(io);
+    var tcp_conns: ?ConnTable = if (tcp_enabled) try ConnTable.init(gpa, cfg.max_tcp_conns) else null;
+    defer if (tcp_conns) |*conns| conns.deinit();
+    // Runs before `deinit` above: every connection task has to be gone first.
+    defer if (tcp_conns) |*conns| conns.cancelAll(io);
+    const tcp: ?Tcp = if (tcp_enabled) .{ .server = &tcp_server.?, .conns = &tcp_conns.? } else null;
 
     const upstream_addr = try initIpAddress(cfg.upstream_host, cfg.upstream_port);
 
@@ -831,7 +1070,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .http_client = &http_client, .cfg = &cfg };
     if (refresher == null) std.log.info("blocklist refresh disabled (VORTEX_BLOCKLIST_REFRESH_SECS=0)", .{});
 
-    const ctx = Context.init(
+    var ctx = Context.init(
         &client_socket,
         &upstream_socket,
         upstream_addr,
@@ -842,6 +1081,10 @@ pub fn main(init: std.process.Init) !void {
         question_seed,
         if (refresher) |*r| r else null,
     );
+    ctx.tcp = if (tcp) |*t| t else null;
+    // 1232 only when there is a TCP listener to retry against; see
+    // `Context.edns_udp_size`.
+    ctx.edns_udp_size = if (tcp_enabled) edns.advertised_udp_size else edns.no_tcp_udp_size;
 
     // Tasks live in the group, not in discarded futures, so completions
     // always have live result storage. Per-task resources are released as
@@ -852,13 +1095,16 @@ pub fn main(init: std.process.Init) !void {
     try spawnLoop(&group, io, &ctx, "dispatcher", dispatcherLoop);
     try spawnLoop(&group, io, &ctx, "sweeper", sweeperLoop);
     if (ctx.refresh != null) try spawnLoop(&group, io, &ctx, "refresher", refresherLoop);
+    if (ctx.tcp != null) try spawnLoop(&group, io, &ctx, "tcp accept", tcpAcceptLoop);
 
-    std.log.info("listening={s}:{d} upstream={s}:{d} handler_threads={d}", .{
+    std.log.info("listening={s}:{d} upstream={s}:{d} handler_threads={d} tcp_conns={d} edns_udp_size={d}", .{
         cfg.listen_host,
         cfg.listen_port,
         cfg.upstream_host,
         cfg.upstream_port,
         handler_threads,
+        cfg.max_tcp_conns,
+        ctx.edns_udp_size,
     });
     var buffer: [4096]u8 = undefined;
     while (true) {
@@ -922,6 +1168,7 @@ test {
     _ = @import("dns/authority.zig");
     _ = @import("dns/blocked_response.zig");
     _ = @import("dns/cache.zig");
+    _ = @import("dns/edns.zig");
     _ = @import("dns/header.zig");
     _ = @import("dns/name_reader.zig");
     _ = @import("dns/question.zig");
@@ -933,6 +1180,7 @@ test {
     _ = @import("blocklist/suffix_blocklist.zig");
     _ = @import("blocklist/policy.zig");
     _ = @import("utils/pending_table.zig");
+    _ = @import("utils/conn_table.zig");
     _ = @import("utility.zig");
     _ = @import("obs/log.zig");
     _ = @import("settings.zig");

@@ -13,6 +13,7 @@ const Name = name_reader.Name;
 const Question = @import("question.zig").Question;
 const Header = @import("header.zig").Header;
 const resource_record = @import("resource_record.zig");
+const edns = @import("edns.zig");
 
 /// TYPE 41. Excluded from every TTL computation below, because OPT reuses the
 /// TTL field for extended-RCODE, version and the DO bit (RFC 6891 §6.1.3) — it
@@ -51,6 +52,11 @@ pub const CacheKey = struct {
     qname: Name,
     qtype: u16,
     qclass: u16,
+    /// Which kind of requester the stored answer was shaped for (P3.5). A reply
+    /// fetched for an EDNS client carries an OPT and may exceed 512 bytes; one
+    /// fetched with DO set carries RRSIGs. Neither may be served to a client
+    /// that did not ask the same way, so each is its own entry.
+    edns: edns.Class,
 
     /// The one place a key is made, so canonicalization cannot diverge between
     /// the lookup in `handleQuery` and the insert in `dispatcherLoop`.
@@ -60,8 +66,8 @@ pub const CacheKey = struct {
     /// already the case-insensitive form RFC 4343 requires. If that ever
     /// regresses, the symptom is not a blocklist miss but a *cache* that gives
     /// `Ads.Example.COM` its own entry — pinned by a test below.
-    pub fn fromQuestion(q: *const Question) CacheKey {
-        return .{ .qname = q.qname, .qtype = q.qtype, .qclass = q.qclass };
+    pub fn fromQuestion(q: *const Question, class: edns.Class) CacheKey {
+        return .{ .qname = q.qname, .qtype = q.qtype, .qclass = q.qclass, .edns = class };
     }
 
     /// Hashing and equality for `std.HashMap`.
@@ -93,6 +99,7 @@ pub const CacheKey = struct {
             // Native endianness is fine — this never leaves the process.
             h.update(std.mem.asBytes(&k.qtype));
             h.update(std.mem.asBytes(&k.qclass));
+            h.update(&[_]u8{@intFromEnum(k.edns)});
             return h.final();
         }
 
@@ -101,6 +108,7 @@ pub const CacheKey = struct {
         pub fn eql(_: Context, a: CacheKey, b: CacheKey) bool {
             return a.qtype == b.qtype and
                 a.qclass == b.qclass and
+                a.edns == b.edns and
                 std.mem.eql(u8, a.qname.slice(), b.qname.slice());
         }
     };
@@ -551,7 +559,7 @@ const testing = std.testing;
 fn keyFromWire(wire: []const u8, tail: u8) !CacheKey {
     var q = Question{};
     _ = try q.parseQuestion(wire, 12);
-    var key = CacheKey.fromQuestion(&q);
+    var key = CacheKey.fromQuestion(&q, .none);
     @memset(key.qname.buf[key.qname.len..], tail);
     return key;
 }
@@ -606,6 +614,21 @@ test "qtype and qclass are not interchangeable" {
     const ctx = CacheKey.Context{ .seed = 0 };
     try testing.expect(!ctx.eql(base, swapped));
     try testing.expect(ctx.hash(base) != ctx.hash(swapped));
+}
+
+test "EDNS class discriminates: an answer shaped for one requester is not another's" {
+    var buf: [64]u8 = undefined;
+    const none = try keyFromWire(questionWire(&buf, 0), 0x33);
+    var plain = none;
+    plain.edns = .plain;
+    var dnssec = none;
+    dnssec.edns = .dnssec;
+
+    const ctx = CacheKey.Context{ .seed = 0 };
+    try testing.expect(!ctx.eql(none, plain));
+    try testing.expect(!ctx.eql(plain, dnssec));
+    try testing.expect(ctx.hash(none) != ctx.hash(plain));
+    try testing.expect(ctx.hash(plain) != ctx.hash(dnssec));
 }
 
 test "qtype discriminates: same name, A vs AAAA are different entries" {

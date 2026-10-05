@@ -65,6 +65,7 @@ and edit. Running with no `.env` at all is a supported mode.
 | `VORTEX_SUFFIX_BLOCKLIST_SOURCE` | oisd `small.oisd.nl/domainswild2` (URL or local path) |
 | `VORTEX_CACHE_MAX_ENTRIES` | `10000` (`0` disables the cache) |
 | `VORTEX_MAX_PENDING` | `4096` (1–65536; queries forwarded and awaiting a reply — past it, forwarded queries are dropped) |
+| `VORTEX_MAX_TCP_CONNS` | `64` (`0` disables the TCP listener) |
 | `VORTEX_HANDLER_THREADS` | CPU count − 1 (`0` handles every query on the ingress thread) |
 | `VORTEX_ENV_FILE` | `.env` |
 
@@ -104,8 +105,11 @@ naming its replacement rather than a silent fall back to the default list.
 ```
                     ┌──────────────────────────────────────────┐
    client ──UDP──▶  │  ingress loop            (main.zig)      │
+   client ──TCP──▶  │  tcp accept loop → one task per conn     │
+                    │  decide — shared by both transports:     │
                     │    ├─ validateQuery      (header.zig)    │  QR=1 → drop
                     │    ├─ parseQuestion      (question.zig)  │  malformed → drop
+                    │    ├─ edns.find          (edns.zig)      │  bad OPT → FORMERR/BADVERS
                     │    └─ Policy.decide      (policy.zig)    │
                     │         allow → forward                  │
                     │         block → NXDOMAIN + SOA ──────────┼──▶ client
@@ -123,10 +127,19 @@ naming its replacement rather than a silent fall back to the default list.
                     │    └─ restore client ID ─────────────────┼──▶ client
                     └──────────────────────────────────────────┘
 
-A cache hit never reaches the upstream socket at all: `handleQuery` checks
+A cache hit never reaches the upstream socket at all: `decide` checks
 `cache.zig` **after** the policy verdict — so a refreshed blocklist is never
 shadowed by a stale entry — and answers from memory with the client's
-transaction ID restored and every TTL aged by how long the entry has been held.
+transaction ID and question casing restored and every TTL aged by how long the
+entry has been held.
+
+The diagram is the UDP path. A query that arrives over TCP goes through the same
+`decide`, and if it has to be forwarded, goes upstream over its own TCP
+connection rather than through `PendingTable` — the stream pairs reply with
+query by itself. EDNS0 is spoken on both: a query's OPT is answered with ours
+(payload 1232, DO copied), a forwarded OPT is clamped to 1232 so upstream never
+sends a reply that would fragment, and cache entries are partitioned by whether
+the requester sent an OPT and whether it set DO.
 ```
 
 One coroutine per query via `std.Io.Group`, plus two long-lived loops (dispatcher
@@ -186,11 +199,11 @@ per RFC 2308, and OPT is excluded from every TTL computation, since TYPE 41
 reuses that field for flags rather than a duration.
 
 > [!WARNING]
-> **Do not bind this off localhost yet.** There is no cap on in-flight handlers —
-> a UDP flood spawns unbounded coroutines and heap — and no per-client rate
-> limiting. The localhost default is load-bearing as a security control, not a dev
-> convenience. Since configuration became runtime, removing that guard rail is a
-> one-line edit rather than a recompile, so this matters more than it used to.
+> **Do not bind this off localhost yet.** Queries awaiting upstream are capped
+> (`VORTEX_MAX_PENDING`) and so are TCP connections (`VORTEX_MAX_TCP_CONNS`), but
+> there is no per-client rate limiting, so a resolver reachable from outside can
+> still be conscripted into DNS amplification. The localhost default is
+> load-bearing as a security control, not a dev convenience.
 
 **The blocklists survive their sources.** A failed fetch is retried, then falls
 back to an on-disk copy written on the last success; if even that is missing,
@@ -200,8 +213,8 @@ daily by default — and a refresh that would empty a list which currently has
 entries is refused rather than installed, because that is what a 200 OK serving
 an error page looks like by the time it reaches the parser.
 
-The gap is everything around the datapath: EDNS0, TCP fallback, graceful
-shutdown, and metrics. [`docs/next_steps.md`](docs/next_steps.md) is the full
+The gap is everything around the datapath: graceful shutdown, metrics, rate
+limiting, and a deployment surface. EDNS0 and TCP landed 2026-09-28. [`docs/next_steps.md`](docs/next_steps.md) is the full
 prioritized board.
 
 The testing gap that used to sit here is closed. The 147 unit tests are all over
@@ -211,7 +224,8 @@ real bugs lived. As of 2026-09-12 [`tests/`](tests/) spawns the real binary
 against a scratch config and a fake upstream and drives it over UDP: 16 cases,
 every one confirmed to fail when the behavior it covers is deliberately broken.
 
-`zig build test` runs both suites (163 tests); `zig build test-integration` runs
+`zig build test` runs both suites (206 tests: 173 unit, 33 integration, the
+integration cases now over TCP as well as UDP); `zig build test-integration` runs
 just the harness, and `-Dtest-filter=<substr>` narrows it to a single case.
 
 What is *not* covered there is concurrency — every case is one query at a time —
