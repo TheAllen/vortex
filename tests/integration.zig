@@ -838,3 +838,321 @@ test "a slot freed by an upstream reply is reused by the next query" {
     // in flight, not how many queries the process ever forwards.
     try expectForwarded(&vortex, "third.test", 0x3003);
 }
+
+// ── EDNS0 (P3.5) ──────────────────────────────────────────────────────────
+
+test "a blocked name queried with EDNS gets our OPT back, and without EDNS gets none" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{});
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    var buf: [wire.max_message]u8 = undefined;
+
+    // RFC 6891 §7: an OPT in the query means one in the reply — ours, carrying
+    // *our* payload size (1232), not the client's 4096 echoed back, with DO
+    // copied across.
+    try vortex.sendQuery(wire.query(&query_buf, 0xE001, "ads.example.com", .{
+        .edns = .{ .udp_size = 4096, .do_bit = true },
+    }));
+    const with = try vortex.recvClient(&buf, harness.default_timeout_ms);
+    try testing.expectEqual(@as(u4, wire.RCode.name_error), wire.rcode(with));
+    try testing.expectEqual(@as(u16, 1), wire.arcount(with));
+    const opt = wire.trailingOpt(with) orelse return error.NoOptInReply;
+    try testing.expectEqual(@as(u16, 1232), opt.udp_size);
+    try testing.expect(opt.do_bit);
+    try testing.expectEqual(@as(u8, 0), opt.ext_rcode);
+
+    // And no OPT for a client that did not send one: it would not know what
+    // to do with a record it never asked for.
+    try vortex.sendQuery(wire.query(&query_buf, 0xE002, "ads.example.com", .{}));
+    const without = try vortex.recvClient(&buf, harness.default_timeout_ms);
+    try testing.expectEqual(@as(u16, 0), wire.arcount(without));
+}
+
+test "a forwarded query's EDNS payload size is clamped to 1232" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{});
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&query_buf, 0xE101, "big.example.com", .{
+        .edns = .{ .udp_size = 8192, .do_bit = true },
+    }));
+
+    // Upstream sizes its reply to what the query advertises. 1232 is what
+    // Vortex will relay unfragmented, and the DO bit rides through unchanged.
+    var upstream_buf: [wire.max_message]u8 = undefined;
+    const forwarded = try vortex.recvUpstream(&upstream_buf, harness.default_timeout_ms);
+    const opt = wire.trailingOpt(forwarded.data) orelse return error.NoOptForwarded;
+    try testing.expectEqual(@as(u16, 1232), opt.udp_size);
+    try testing.expect(opt.do_bit);
+
+    var reply_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendUpstreamReply(&forwarded.from, try wire.reply(&reply_buf, forwarded.data, .{}));
+    var client_buf: [wire.max_message]u8 = undefined;
+    _ = try vortex.recvClient(&client_buf, harness.default_timeout_ms);
+}
+
+test "with TCP disabled the clamp is 4096, not 1232" {
+    // 1232 produces more TC=1, and TC=1 is only an honest answer when there is
+    // a TCP listener to retry against. Without one, only our buffer bounds it.
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .max_tcp_conns = 0 });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&query_buf, 0xE201, "notcp.example.com", .{
+        .edns = .{ .udp_size = 8192 },
+    }));
+    var upstream_buf: [wire.max_message]u8 = undefined;
+    const forwarded = try vortex.recvUpstream(&upstream_buf, harness.default_timeout_ms);
+    try testing.expectEqual(@as(u16, 4096), (wire.trailingOpt(forwarded.data) orelse return error.NoOptForwarded).udp_size);
+
+    // And the listener really is absent.
+    try testing.expectError(error.ConnectionRefused, vortex.tcpConnect());
+}
+
+test "an unsupported EDNS version is answered BADVERS and never forwarded" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{});
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&query_buf, 0xE301, "future.example.com", .{
+        .edns = .{ .version = 1 },
+    }));
+
+    var buf: [wire.max_message]u8 = undefined;
+    const answer = try vortex.recvClient(&buf, harness.default_timeout_ms);
+    // BADVERS is RCODE 16: 0 in the header's four bits, 1 in the OPT's
+    // extended-RCODE byte — and the reply states the version we do speak.
+    try testing.expectEqual(@as(u16, 0xE301), wire.id(answer));
+    try testing.expectEqual(@as(u4, 0), wire.rcode(answer));
+    const opt = wire.trailingOpt(answer) orelse return error.NoOptInReply;
+    try testing.expectEqual(@as(u8, 1), opt.ext_rcode);
+    try testing.expectEqual(@as(u8, 0), opt.version);
+    try vortex.expectNoUpstreamQuery(300);
+}
+
+test "a query carrying two OPT records is FORMERR" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{});
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&query_buf, 0xE401, "twice.example.com", .{
+        .edns = .{ .count = 2 },
+    }));
+    var buf: [wire.max_message]u8 = undefined;
+    const answer = try vortex.recvClient(&buf, harness.default_timeout_ms);
+    try testing.expectEqual(@as(u4, wire.RCode.format_error), wire.rcode(answer));
+    try vortex.expectNoUpstreamQuery(300);
+}
+
+test "the cache keeps EDNS and plain answers apart" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .cache_max_entries = 100 });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    const name = "split.example.com";
+
+    // A plain client fills an entry. With an address in it: an answer with no
+    // records has no TTL to cache by.
+    var fill_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&fill_buf, 0xE501, name, .{}));
+    var fill_up: [wire.max_message]u8 = undefined;
+    const filled = try vortex.recvUpstream(&fill_up, harness.default_timeout_ms);
+    var fill_reply: [wire.max_message]u8 = undefined;
+    try vortex.sendUpstreamReply(&filled.from, try wire.reply(&fill_reply, filled.data, .{
+        .addresses = &.{.{ 192, 0, 2, 8 }},
+    }));
+    var fill_client: [wire.max_message]u8 = undefined;
+    _ = try vortex.recvClient(&fill_client, harness.default_timeout_ms);
+
+    // An EDNS client asking the same name must not be handed that answer — it
+    // was shaped for a requester that sent no OPT. So it goes upstream.
+    var query_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&query_buf, 0xE502, name, .{ .edns = .{} }));
+    var upstream_buf: [wire.max_message]u8 = undefined;
+    const forwarded = try vortex.recvUpstream(&upstream_buf, harness.default_timeout_ms);
+    var reply_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendUpstreamReply(&forwarded.from, try wire.reply(&reply_buf, forwarded.data, .{
+        .addresses = &.{.{ 192, 0, 2, 9 }},
+    }));
+    var client_buf: [wire.max_message]u8 = undefined;
+    _ = try vortex.recvClient(&client_buf, harness.default_timeout_ms);
+
+    // And the plain entry is still there for the next plain client.
+    try vortex.sendQuery(wire.query(&query_buf, 0xE503, name, .{}));
+    try vortex.expectNoUpstreamQuery(300);
+    try testing.expectEqual(@as(u16, 0xE503), wire.id(try vortex.recvClient(&client_buf, harness.default_timeout_ms)));
+}
+
+test "a cached answer larger than the client can take over UDP is fetched again, not cut" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .cache_max_entries = 100 });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    const name = "wide.example.com";
+
+    // An EDNS client with a 1232-byte buffer caches a 900-byte answer.
+    var query_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&query_buf, 0xE601, name, .{ .edns = .{ .udp_size = 1232 } }));
+    var upstream_buf: [wire.max_message]u8 = undefined;
+    const forwarded = try vortex.recvUpstream(&upstream_buf, harness.default_timeout_ms);
+    var reply_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendUpstreamReply(&forwarded.from, try wire.reply(&reply_buf, forwarded.data, .{
+        .addresses = &.{.{ 192, 0, 2, 10 }},
+        .min_len = 900,
+    }));
+    var client_buf: [wire.max_message]u8 = undefined;
+    try testing.expect((try vortex.recvClient(&client_buf, harness.default_timeout_ms)).len >= 900);
+
+    // Same partition (EDNS, no DO), but this client advertises 512. The entry
+    // does not fit, so it is a miss — forwarded, never sent oversize or cut.
+    try vortex.sendQuery(wire.query(&query_buf, 0xE602, name, .{ .edns = .{ .udp_size = 512 } }));
+    _ = try vortex.recvUpstream(&upstream_buf, harness.default_timeout_ms);
+}
+
+// ── TCP (P3.6) ────────────────────────────────────────────────────────────
+
+test "a blocked name is answered over TCP" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{});
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    const conn = try vortex.tcpConnect();
+    defer conn.close(testing.io);
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    try vortex.tcpSend(conn, wire.query(&query_buf, 0xF001, "ads.example.com", .{}));
+    var buf: [wire.max_message]u8 = undefined;
+    const answer = try vortex.tcpRecv(conn, &buf, harness.default_timeout_ms);
+    try testing.expectEqual(@as(u16, 0xF001), wire.id(answer));
+    try testing.expectEqual(@as(u4, wire.RCode.name_error), wire.rcode(answer));
+    try testing.expectEqual(@as(u16, 1), wire.nscount(answer)); // the SOA
+}
+
+test "a forwarded name over TCP goes upstream over TCP and comes back whole" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{});
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    const conn = try vortex.tcpConnect();
+    defer conn.close(testing.io);
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    try vortex.tcpSend(conn, wire.query(&query_buf, 0xF101, "tcp.example.com", .{}));
+
+    // Not the UDP socket: a TCP client's query stays on TCP end to end.
+    const up = try vortex.acceptUpstreamTcp(harness.default_timeout_ms);
+    defer up.close(testing.io);
+    var up_buf: [wire.max_message]u8 = undefined;
+    const forwarded = try vortex.tcpRecv(up, &up_buf, harness.default_timeout_ms);
+    try testing.expectEqual(@as(u16, 0xF101), wire.id(forwarded));
+
+    // Larger than any UDP reply Vortex would relay — the reason TCP exists.
+    var reply_buf: [wire.max_message]u8 = undefined;
+    try vortex.tcpSend(up, try wire.reply(&reply_buf, forwarded, .{
+        .addresses = &.{.{ 192, 0, 2, 11 }},
+        .min_len = 5000,
+    }));
+
+    var buf: [wire.max_message]u8 = undefined;
+    const answer = try vortex.tcpRecv(conn, &buf, harness.default_timeout_ms);
+    try testing.expectEqual(@as(u16, 0xF101), wire.id(answer));
+    try testing.expect(answer.len >= 5000);
+    try testing.expect(!wire.isTruncated(answer));
+    try vortex.expectNoUpstreamQuery(200);
+}
+
+test "pipelined queries on one TCP connection are all answered, in order" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{});
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    const conn = try vortex.tcpConnect();
+    defer conn.close(testing.io);
+
+    // Three frames in one burst, before reading anything back (RFC 7766 §6.2.1.1).
+    var query_buf: [wire.max_message]u8 = undefined;
+    for ([_]u16{ 0xF201, 0xF202, 0xF203 }) |qid| {
+        try vortex.tcpSend(conn, wire.query(&query_buf, qid, "ads.example.com", .{}));
+    }
+    var buf: [wire.max_message]u8 = undefined;
+    for ([_]u16{ 0xF201, 0xF202, 0xF203 }) |qid| {
+        try testing.expectEqual(qid, wire.id(try vortex.tcpRecv(conn, &buf, harness.default_timeout_ms)));
+    }
+}
+
+test "past the TCP connection cap a new connection is closed, and a freed slot is reused" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .max_tcp_conns = 1 });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    var buf: [wire.max_message]u8 = undefined;
+
+    // Occupy the only slot, and prove it is being served.
+    const first = try vortex.tcpConnect();
+    try vortex.tcpSend(first, wire.query(&query_buf, 0xF301, "ads.example.com", .{}));
+    _ = try vortex.tcpRecv(first, &buf, harness.default_timeout_ms);
+
+    // The second is accepted by the kernel and closed by Vortex on arrival.
+    const second = try vortex.tcpConnect();
+    defer second.close(testing.io);
+    try testing.expectError(error.EndOfStream, vortex.tcpRecv(second, &buf, harness.default_timeout_ms));
+
+    // Once the first hangs up, its slot goes to a later connection. Polled,
+    // not assumed: the slot is freed when the first connection's task has
+    // seen the EOF and returned, which is shortly after the close — and a
+    // connection arriving in between is, correctly, refused at the cap.
+    first.close(testing.io);
+    var attempt: usize = 0;
+    while (attempt < 40) : (attempt += 1) {
+        const next = try vortex.tcpConnect();
+        defer next.close(testing.io);
+        // A refused connection may already be reset by the time we write.
+        vortex.tcpSend(next, wire.query(&query_buf, 0xF302, "ads.example.com", .{})) catch {
+            try sleepMs(50);
+            continue;
+        };
+        // Refused shows up as EOF, or as a reset when the kernel discards the
+        // query we already wrote into a socket Vortex closed unread.
+        const answer = vortex.tcpRecv(next, &buf, harness.default_timeout_ms) catch |err| switch (err) {
+            error.EndOfStream, error.ConnectionResetByPeer => {
+                try sleepMs(50);
+                continue;
+            },
+            else => return err,
+        };
+        try testing.expectEqual(@as(u16, 0xF302), wire.id(answer));
+        return;
+    }
+    return error.SlotNeverFreed;
+}
+
+test "a TCP connection that stalls mid-message is closed after the idle timeout" {
+    // The slow case in this file: ~10 s of idle timeout plus up to 1 s of sweep.
+    // It is the one path that ends a connection from outside — by cancelling
+    // its task — so it is worth the wait.
+    var vortex = try Instance.start(testing.io, testing.allocator, .{});
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    const conn = try vortex.tcpConnect();
+    defer conn.close(testing.io);
+
+    // One byte of a two-byte length prefix, then nothing. A timeout counted per
+    // read would never fire on a client that trickles; this one counts per
+    // whole message.
+    var w = conn.writer(testing.io, &.{});
+    try w.interface.writeAll(&.{0});
+
+    var buf: [wire.max_message]u8 = undefined;
+    const started = std.Io.Clock.boot.now(testing.io);
+    try testing.expectError(error.EndOfStream, vortex.tcpRecv(conn, &buf, 15_000));
+    const elapsed_ms: u64 = @intCast(started.untilNow(testing.io, .boot).toMilliseconds());
+    try testing.expect(elapsed_ms >= 9_000);
+}

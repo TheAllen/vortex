@@ -17,7 +17,11 @@ it; see [changelog.md](changelog.md#landed-2026-09-28--p15-pending-table-cap).
 **2026-09-28: cache fixes landed** — TC=1 replies are no longer cached, and hits echo the
 asking client's question casing; see
 [changelog.md](changelog.md#landed-2026-09-28--cache-tc1-is-never-stored-and-hits-echo-the-clients-casing).
-*174/174 — 153 unit, 21 integration.* Phase 1 of the protocol plan under [P3](#p3--protocol-completeness). What stands between Vortex and a bind off localhost is now P2.6 and P2.7. **No open P0s, and no open P1 bugs** — all three P0s are pinned by
+Phase 1 of the protocol plan under [P3](#p3--protocol-completeness).
+
+**2026-09-28: EDNS0 and TCP landed** (P3.5 + P3.6, phases 2 and 3 of that plan, combined) —
+see [changelog.md](changelog.md#landed-2026-09-28--p35p36-edns0-and-tcp).
+*206/206 — 173 unit, 33 integration.* What stands between Vortex and a bind off localhost is now P2.6 and P2.7. **No open P0s, and no open P1 bugs** — all three P0s are pinned by
 regression tests that fail under mutation.
 
 **P2.2 blocklist resilience landed 2026-09-13**, and with it the last of the two
@@ -383,16 +387,18 @@ process itself.
 ## P3 — Protocol completeness
 
 The **compression → response parsing → caching** chain is complete as of 2026-09-05.
-What remains in this band is EDNS0, TCP fallback, and the multi-upstream arc.
+**EDNS0 and TCP are done as of 2026-09-28.** What remains in this band is the multi-upstream
+arc (P3.7) and the residue listed under P3.5 and P3.6 below.
 
-**Plan, agreed 2026-09-28** — three phases, one branch each:
+**Plan, agreed 2026-09-28** — three phases; 2 and 3 were combined into one branch, which
+let the 1232 clamp land in the same change as the TCP listener:
 
 1. ~~**Cache correctness**~~ ✅ 2026-09-28 — TC=1 never cached; hits echo the client's casing.
-2. **EDNS0 (P3.5)** — a pure OPT parser (`dns/edns.zig`) with FORMERR for malformed/duplicate
+2. ~~**EDNS0 (P3.5)**~~ ✅ 2026-09-28 — a pure OPT parser (`dns/edns.zig`) with FORMERR for malformed/duplicate
    OPTs and BADVERS for version > 0; our own OPT on blocked replies; the forwarded OPT's
    payload size clamped to our buffer; the cache keyed by EDNS/DO with a size check on hits;
    the DNSSEC posture (P4.7) written down.
-3. **TCP (P3.6)** — a client-facing listener (accept loop via `concurrent`; connection handlers
+3. ~~**TCP (P3.6)**~~ ✅ 2026-09-28 — a client-facing listener (accept loop via `concurrent`; connection handlers
    via `concurrent` under `VORTEX_MAX_TCP_CONNS`, since a connection lives as long as its
    client keeps it open), the validate → policy → cache step shared with UDP, TCP to upstream
    for TCP clients. **The advertised/clamped EDNS size drops to 1232** (DNS Flag Day 2020) in
@@ -448,22 +454,28 @@ Multi-upstream and DoT (P3.7) are planned after phase 3, together with P4.3 fail
    [filter-design.md](filter-design.md), and add a suffix-*allow* matcher for the entries
    parked in the allowlist's "NEEDS SUFFIX-ALLOW" comment
    ([allowlist.zig](../src/blocklist/allowlist.zig)).
-5. **EDNS0 (RFC 6891).** 4096-byte buffers are in place on both sockets; still missing:
-   parse the client's OPT record, attach our own OPT on upstream queries to advertise the
-   4096 capacity, and **preserve/echo the client OPT on blocked responses** —
-   `blocked_response.build` truncates the message at `question_end`, dropping any OPT, which
-   is a protocol violation if the client sent one. That behavior is **pinned by a test**
-   ("build drops a trailing OPT record and clears ARCOUNT"), so fixing this means
-   deliberately rewriting that test — which is the point: the drop stops being an
-   unexamined default and becomes a decision. Echoing an OPT also changes the response-size
-   arithmetic `WIRE_LEN` currently makes trivial.
-6. **TCP fallback.** On TC=1 from upstream, retry over TCP with 2-byte length framing
-   (RFC 1035 §4.2.2). The dispatcher detects TC=1 and hands off to a TCP path.
-   **Newly concrete as of 08-09:** we now *set* TC=1 ourselves when an upstream reply
-   overflows the 4096-byte buffer, so a conforming client will retry over TCP and find
-   nothing listening. That is a deliberate, honest failure rather than the silent corruption
-   it replaced — but it means this item now has a reachable trigger, not just a theoretical
-   one. A TCP listener would also remove the ingress-side FORMERR for oversized queries.
+5. ~~**EDNS0 (RFC 6891).**~~ **Done 2026-09-28** — [edns.zig](../src/dns/edns.zig). The
+   pinned test "build drops a trailing OPT record" was rewritten as planned, into "build
+   answers an OPT with our own OPT". **Residue, each small and deliberately out of scope:**
+   - **Header-only replies carry no OPT** — the FORMERR/NOTIMP for a bad header, and the
+     sweeper's SERVFAIL (which no longer has the query to read an OPT from). RFC 6891 wants
+     one whenever the query had one; clients cope, and the sweeper case needs the class
+     stored on `PendingQuery` plus the DO bit to fix.
+   - **Forwarded replies relay upstream's OPT verbatim**, so the payload size a client sees
+     on a forwarded answer is upstream's, not ours. A strict forwarder rewrites it.
+   - **EDNS options (cookies, ECS, padding) are passed through untouched**, never parsed.
+6. ~~**TCP fallback.**~~ **Done 2026-09-28** — a client-facing listener on the listen
+   address, with each connection a `concurrent` task in a [ConnTable](../src/utils/conn_table.zig)
+   slot (`VORTEX_MAX_TCP_CONNS`, default 64), idle ones cancelled by the sweeper after 10 s,
+   and TCP queries forwarded over TCP. The TC=1 we set on an oversized upstream reply now has
+   somewhere to land. **Residue:**
+   - **One upstream TCP connection per forwarded query.** No pooling or reuse. Fine for a
+     fallback path; the first thing to change if TCP ever carries real volume, and the
+     groundwork for DoT (P3.7).
+   - **The upstream TCP connection ignores `VORTEX_UPSTREAM_BIND_*`**; it connects from
+     wherever the kernel picks.
+   - **The oversized-UDP-query FORMERR stays.** A query over 4096 bytes over UDP is still
+     malformed; the difference is that TCP now exists for one that genuinely needs the room.
 7. **Multiple upstreams / DoT / DoH.** Future arcs the dispatcher architecture was chosen
    to accommodate (a connection pool replaces `upstream_socket`, same `PendingTable`
    pattern). See the evolution table in [upstream-design.md](upstream-design.md).
@@ -517,12 +529,16 @@ real sinkhole (the Pi-hole / AdGuard Home / Unbound-`local-zone` feature class).
   domains, per-client query/block ratios, and a query log with a retention/privacy
   policy (DNS query logs are PII). This is the dashboard half of what makes Pi-hole
   Pi-hole; scope it once the per-query event exists.
-- **P4.7 — DNSSEC posture.** Decide and document: we're a non-authoritative forwarder, so
-  blocked synthetic answers can't be signed — a validating client with DO set that
-  queries a blocked name will get a bogus/unsigned answer. Confirm we pass the DO bit and
-  RRSIGs through untouched on the *forwarded* path, and document that blocking is
-  incompatible with strict downstream validation of the blocked names (every sinkhole has
-  this caveat).
+- ~~**P4.7 — DNSSEC posture.**~~ **Decided and documented 2026-09-28**, with P3.5:
+  - **Forwarded path: transparent.** The client's OPT — DO bit included — goes upstream
+    with only its payload size clamped, and the reply, RRSIGs and all, comes back verbatim.
+    Verified live against 1.1.1.1 (`dig +dnssec cloudflare.com` returns the RRSIG).
+  - **Cache: partitioned by DO**, so an answer carrying RRSIGs is never served to a client
+    that did not ask for them, and one without is never served to a client that did.
+  - **Blocked names: unsigned, by nature.** The synthesized NXDOMAIN cannot be signed, so a
+    validating client with DO set gets a bogus answer for a blocked name. That is the
+    caveat every sinkhole carries, and it is only about the *blocked* names: everything
+    forwarded validates as it would without Vortex in the path.
 
 ---
 

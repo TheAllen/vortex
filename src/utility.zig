@@ -5,6 +5,15 @@ const PendingTable = @import("utils/pending_table.zig").PendingTable;
 const Policy = @import("blocklist/policy.zig").Policy;
 const Cache = @import("dns/cache.zig").Cache;
 const Settings = @import("settings.zig").Settings;
+const ConnTable = @import("utils/conn_table.zig").ConnTable;
+const edns = @import("dns/edns.zig");
+
+/// The TCP listener and its connection table (P3.6), or absent when
+/// `VORTEX_MAX_TCP_CONNS=0`.
+pub const Tcp = struct {
+    server: *std.Io.net.Server,
+    conns: *ConnTable,
+};
 
 /// Everything `refresherLoop` needs that the datapath does not.
 ///
@@ -48,6 +57,15 @@ pub const Context = struct {
     /// coroutine sees it in — nothing on the datapath reads this.
     refresh: ?*const Refresher = null,
 
+    /// Null when TCP is disabled. The accept loop reads the server; the
+    /// sweeper reads the table, to end idle connections.
+    tcp: ?*const Tcp = null,
+
+    /// The UDP payload size we advertise in our own OPT records, and the most
+    /// a forwarded query may advertise on a client's behalf (P3.5): 1232 with a
+    /// TCP listener to retry against, our 4096 buffer without one.
+    edns_udp_size: u16 = edns.advertised_udp_size,
+
     pub fn init(
         client_socket: *const std.Io.net.Socket,
         upstream_socket: *const std.Io.net.Socket,
@@ -81,4 +99,5 @@ test "refAllDecls" {
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(Context);
     std.testing.refAllDecls(Refresher);
+    std.testing.refAllDecls(Tcp);
 }

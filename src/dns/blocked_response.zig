@@ -2,55 +2,87 @@ const std = @import("std");
 
 const Authority = @import("authority.zig").Authority;
 const Header = @import("header.zig").Header;
+const edns = @import("edns.zig");
 
-/// Builds the complete locally-synthesized reply to a query we are answering
-/// ourselves: the original question echoed back, response flags set, and a
-/// synthetic SOA in the Authority section so the client can negatively cache
-/// the result (RFC 2308).
+/// Builds a locally-synthesized reply to a query we are answering ourselves:
+/// the original question echoed back, response flags set, then optionally a
+/// synthetic SOA in Authority (so a blocked name can be negatively cached, RFC
+/// 2308) and optionally our own OPT in Additional.
 ///
 /// Pure: bytes in, bytes out. `query` is only read, so this is unit-testable
 /// without an `Io`, a socket, or a `Context` — which is the whole reason it
 /// lives here instead of inline in `handleQuery`. See next_steps.md P0.C2.
 ///
 /// `question_end` is `parseQuestion`'s return value: the offset one past the
-/// question section. Anything after it in `query` (an OPT record, most
-/// commonly) is dropped — see next_steps.md P3.5.
+/// question section. Anything after it in `query` is **not** copied — the
+/// client's OPT least of all, since RFC 6891 §7 wants the *responder's* OPT in
+/// a reply, not the requester's echoed back. `opts.opt` is how ours gets in.
 ///
 /// `rcode` is a parameter rather than a hard-coded NXDOMAIN because the same
-/// shape serves P4.1's NODATA path (RCODE=0) and P4.2's FORMERR/NOTIMP replies.
+/// shape serves P4.1's NODATA path (RCODE=0) and BADVERS (RCODE 0 in the header,
+/// extended RCODE 1 in the OPT).
 ///
-/// Returns a fresh buffer of exactly `question_end + Authority.WIRE_LEN` bytes,
-/// owned by the caller. The incoming datagram cannot be extended in place: it
-/// is a `dupe` sized to the exact query length (main.zig), with no room for the
-/// 34 appended bytes.
-pub fn build(
-    gpa: std.mem.Allocator,
+/// Writes into `out` and returns the used prefix; `error.NoSpaceLeft` if `out`
+/// is shorter than `wireLen`. The incoming datagram cannot be extended in
+/// place: it is a `dupe` sized to the exact query length (main.zig).
+pub fn buildInto(
+    out: []u8,
     query: []const u8,
     question_end: usize,
     rcode: Header.RCode,
-) std.mem.Allocator.Error![]u8 {
+    opts: Options,
+) error{NoSpaceLeft}![]u8 {
     std.debug.assert(question_end >= 12);
     std.debug.assert(question_end <= query.len);
 
-    // The Question end position plus the Authority wire length.
-    const out = try gpa.alloc(u8, question_end + Authority.WIRE_LEN);
-    errdefer gpa.free(out);
+    const len = wireLen(question_end, opts);
+    if (out.len < len) return error.NoSpaceLeft;
+    const reply = out[0..len];
 
-    // Copying only up to `question_end` is what truncates the message.
-    @memcpy(out[0..question_end], query[0..question_end]);
+    // Copying only up to `question_end` is what drops whatever followed.
+    @memcpy(reply[0..question_end], query[0..question_end]);
 
-    Header.writeResponseFlags(out, rcode);
+    Header.writeResponseFlags(reply, rcode);
 
-    // Zero ANCOUNT / NSCOUNT / ARCOUNT (bytes 6..12), then claim the one
-    // authority record we are about to append. QDCOUNT (4..6) stays as sent.
-    @memset(out[6..12], 0);
-    std.mem.writeInt(u16, out[8..10], 1, .big); // NSCOUNT = 1
+    // Zero ANCOUNT / NSCOUNT / ARCOUNT (bytes 6..12), then claim exactly the
+    // records appended below. QDCOUNT (4..6) stays as sent.
+    @memset(reply[6..12], 0);
+    var at = question_end;
 
-    var authority = Authority{};
-    const end = authority.write_authority_section(out, question_end);
-    std.debug.assert(end == out.len);
+    if (opts.soa) {
+        std.mem.writeInt(u16, reply[8..10], 1, .big); // NSCOUNT = 1
+        var authority = Authority{};
+        at = authority.write_authority_section(reply, at);
+    }
+    if (opts.opt) |opt| {
+        std.mem.writeInt(u16, reply[10..12], 1, .big); // ARCOUNT = 1
+        edns.writeOpt(reply[at..][0..edns.opt_wire_len], opt.udp_size, opt.do_bit, opt.ext_rcode);
+        at += edns.opt_wire_len;
+    }
+    std.debug.assert(at == reply.len);
 
-    return out;
+    return reply;
+}
+
+pub const Options = struct {
+    /// Append the synthetic SOA. On for a blocked name, off for BADVERS.
+    soa: bool = true,
+    /// Append our OPT. Set exactly when the query carried one.
+    opt: ?Opt = null,
+};
+
+pub const Opt = struct {
+    udp_size: u16,
+    do_bit: bool,
+    /// Upper 8 bits of a 12-bit RCODE. 1 with a header RCODE of 0 is BADVERS.
+    ext_rcode: u8 = 0,
+};
+
+/// Bytes `buildInto` writes for this question and these options.
+pub fn wireLen(question_end: usize, opts: Options) usize {
+    return question_end +
+        (if (opts.soa) @as(usize, Authority.WIRE_LEN) else 0) +
+        (if (opts.opt != null) @as(usize, edns.opt_wire_len) else 0);
 }
 
 const testing = std.testing;
@@ -102,10 +134,8 @@ const query_ads_example_com = [_]u8{
 const ads_question_end = 33;
 
 test "build emits the exact blocked-response bytes (C2 regression)" {
-    const gpa = testing.allocator;
-
-    const reply = try build(gpa, &query_ads_example_com, ads_question_end, .name_error);
-    defer gpa.free(reply);
+    var buf: [512]u8 = undefined;
+    const reply = try buildInto(&buf, &query_ads_example_com, ads_question_end, .name_error, .{});
 
     // Length: header + question + one 34-byte SOA, and nothing else.
     try testing.expectEqual(@as(usize, ads_question_end + Authority.WIRE_LEN), reply.len);
@@ -136,13 +166,11 @@ test "build emits the exact blocked-response bytes (C2 regression)" {
 }
 
 test "build carries the requested rcode, not a hard-coded NXDOMAIN" {
-    const gpa = testing.allocator;
-
     // NODATA (P4.1) and FORMERR/NOTIMP (P4.2) reuse this same shape; only the
     // low nibble of the flags word may differ.
     for ([_]Header.RCode{ .no_error, .format_error, .server_failure, .not_implemented }) |rcode| {
-        const reply = try build(gpa, &query_ads_example_com, ads_question_end, rcode);
-        defer gpa.free(reply);
+        var buf: [512]u8 = undefined;
+        const reply = try buildInto(&buf, &query_ads_example_com, ads_question_end, rcode, .{});
 
         const flags = std.mem.readInt(u16, reply[2..4], .big);
         try testing.expectEqual(@as(u4, @intFromEnum(rcode)), @as(u4, @truncate(flags)));
@@ -151,31 +179,72 @@ test "build carries the requested rcode, not a hard-coded NXDOMAIN" {
     }
 }
 
-test "build drops a trailing OPT record and clears ARCOUNT" {
-    const gpa = testing.allocator;
-
-    // Same query, but EDNS0-aware: ARCOUNT=1 with a bare OPT record appended
-    // after the question. Vortex currently discards it, which is a protocol
-    // violation the client can notice (next_steps.md P3.5). This test pins the
-    // *current* behavior so fixing P3.5 has to be a deliberate, visible change
-    // rather than a silent one.
-    var query: [ads_question_end + 11]u8 = undefined;
-    @memcpy(query[0..ads_question_end], query_ads_example_com[0..ads_question_end]);
-    std.mem.writeInt(u16, query[10..12], 1, .big); // ARCOUNT = 1
-    @memcpy(query[ads_question_end..], &[_]u8{
+/// `query_ads_example_com` made EDNS0-aware: ARCOUNT=1 and a bare OPT
+/// (payload 4096, DO set) after the question.
+const query_with_opt = blk: {
+    var q: [ads_question_end + 11]u8 = undefined;
+    @memcpy(q[0..ads_question_end], query_ads_example_com[0..ads_question_end]);
+    std.mem.writeInt(u16, q[10..12], 1, .big); // ARCOUNT = 1
+    @memcpy(q[ads_question_end..], &[_]u8{
         0x00, // NAME — root
         0x00, 0x29, // TYPE — OPT (41)
         0x10, 0x00, // CLASS — advertised UDP payload size 4096
-        0x00, 0x00, 0x00, 0x00, // TTL — extended rcode + flags
+        0x00, 0x00, 0x80, 0x00, // TTL — ext rcode 0, version 0, DO
         0x00, 0x00, // RDLENGTH — 0
     });
+    break :blk q;
+};
 
-    const reply = try build(gpa, &query, ads_question_end, .name_error);
-    defer gpa.free(reply);
+test "build answers an OPT with our own OPT, after the SOA (P3.5)" {
+    // This test used to be "build drops a trailing OPT record and clears
+    // ARCOUNT", pinning the protocol violation so that fixing it had to be a
+    // visible decision. This is that decision: RFC 6891 §7 — a query with an
+    // OPT gets one back.
+    var buf: [512]u8 = undefined;
+    const reply = try buildInto(&buf, &query_with_opt, ads_question_end, .name_error, .{
+        .opt = .{ .udp_size = 1232, .do_bit = true },
+    });
 
+    try testing.expectEqual(@as(usize, ads_question_end + Authority.WIRE_LEN + 11), reply.len);
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, reply[8..10], .big)); // NSCOUNT
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, reply[10..12], .big)); // ARCOUNT
+
+    // SOA first, untouched...
+    const soa_end = ads_question_end + Authority.WIRE_LEN;
+    try testing.expectEqualSlices(u8, &golden_soa, reply[ads_question_end..soa_end]);
+    // ...then *our* OPT: 1232, not the client's 4096; DO copied from the query.
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0x29, 0x04, 0xD0, 0, 0, 0x80, 0, 0, 0 }, reply[soa_end..]);
+}
+
+test "build with no OPT requested still drops the client's and clears ARCOUNT" {
+    // The client's OPT is never copied through. Whether one comes back is
+    // `opts.opt`'s decision alone.
+    var buf: [512]u8 = undefined;
+    const reply = try buildInto(&buf, &query_with_opt, ads_question_end, .name_error, .{});
     try testing.expectEqual(@as(usize, ads_question_end + Authority.WIRE_LEN), reply.len);
     try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, reply[10..12], .big));
-    try testing.expectEqualSlices(u8, &golden_soa, reply[ads_question_end..]);
+}
+
+test "build shapes a BADVERS reply: no SOA, RCODE 0, extended RCODE 1" {
+    var buf: [512]u8 = undefined;
+    const reply = try buildInto(&buf, &query_with_opt, ads_question_end, .no_error, .{
+        .soa = false,
+        .opt = .{ .udp_size = 1232, .do_bit = false, .ext_rcode = 1 },
+    });
+
+    try testing.expectEqual(@as(usize, ads_question_end + 11), reply.len);
+    try testing.expectEqual(@as(u16, 0x8180), std.mem.readInt(u16, reply[2..4], .big));
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, reply[8..10], .big)); // no SOA
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, reply[10..12], .big));
+    try testing.expectEqual(@as(u8, 1), reply[ads_question_end + 5]); // ext rcode
+}
+
+test "build refuses a buffer too small for the reply" {
+    var buf: [ads_question_end + Authority.WIRE_LEN - 1]u8 = undefined;
+    try testing.expectError(
+        error.NoSpaceLeft,
+        buildInto(&buf, &query_ads_example_com, ads_question_end, .name_error, .{}),
+    );
 }
 
 // One line of guard per container. `refAllDecls` is shallow and 0.16.0 has no
@@ -184,4 +253,6 @@ test "build drops a trailing OPT record and clears ARCOUNT" {
 // broken through four merged PRs and CI.
 test "refAllDecls" {
     testing.refAllDecls(@This());
+    testing.refAllDecls(Options);
+    testing.refAllDecls(Opt);
 }
