@@ -21,7 +21,13 @@ Phase 1 of the protocol plan under [P3](#p3--protocol-completeness).
 
 **2026-09-28: EDNS0 and TCP landed** (P3.5 + P3.6, phases 2 and 3 of that plan, combined) —
 see [changelog.md](changelog.md#landed-2026-09-28--p35p36-edns0-and-tcp).
-*206/206 — 173 unit, 33 integration.* What stands between Vortex and a bind off localhost is now P2.6 and P2.7. **No open P0s, and no open P1 bugs** — all three P0s are pinned by
+*206/206 — 173 unit, 33 integration.* What stands between Vortex and a bind off localhost is now P2.6 and P2.7.
+
+**2026-10-06: P2.6 landed** — a hardened systemd unit, an IPv6/dual-stack listener and bind
+failures that name their cause; see
+[changelog.md](changelog.md#landed-2026-10-06--p26-deployment-surface-linuxsystemd).
+*208/208 — 173 unit, 35 integration.* **P2.7 is now the only thing between Vortex and a bind
+off localhost.** **No open P0s, and no open P1 bugs** — all three P0s are pinned by
 regression tests that fail under mutation.
 
 **P2.2 blocklist resilience landed 2026-09-13**, and with it the last of the two
@@ -374,9 +380,22 @@ process itself.
      [utility.zig](../src/utility.zig) is now the only file carrying logic with **no
      `test` blocks at all** — and it carries very little. `policy.zig` got its first six on
      2026-09-13.
-6. **Deployment surface.** `127.0.0.1:5354` is dev-only. Real use means `0.0.0.0:53`
-   (privileged port → capability / launchd / systemd unit), an IPv6 listener, and a
-   service definition. Pick the target platform and add the unit files.
+6. ~~**Deployment surface.**~~ **Done 2026-10-06 for Linux/systemd** —
+   [deploy/systemd/](../deploy/systemd/), see
+   [changelog.md](changelog.md#landed-2026-10-06--p26-deployment-surface-linuxsystemd).
+   What is left:
+   - **Validate the unit on a real systemd host.** It was written against the docs and
+     `systemd-analyze security` has not been run; the syscall filter is the likeliest
+     thing to need loosening.
+   - **Reply source address on multihomed hosts.** A wildcard UDP socket's replies leave
+     from whatever address the route picks. Fixing it means `IP_PKTINFO` /
+     `IPV6_RECVPKTINFO` on receive and echoing the destination as the source on send,
+     which `std.Io.net` does not expose. Documented; binding a specific address avoids it.
+   - **More than one listen address** (say, one LAN v4 and one LAN v6 without the
+     wildcard). Today it is one address, which `::` makes enough for most hosts.
+   - **sd_notify readiness** (`Type=notify`), so dependants wait for loaded lists rather
+     than for `exec`. Small, and pairs with P2.4's shutdown work.
+   - **launchd**, if macOS ever becomes a target.
 7. **Rate limiting / abuse controls.** Any resolver reachable beyond localhost needs
    per-client rate limiting (and ideally Response Rate Limiting) so it can't be conscripted
    into DNS amplification. Pairs with, but is separate from, the process-level backpressure

@@ -1,0 +1,86 @@
+# Vortex as a systemd service (P2.6). Install steps and the port-53 caveats
+# are in the README, "Running under systemd".
+#
+#   install -Dm755 zig-out/bin/vortex          /usr/local/bin/vortex
+#   install -Dm644 deploy/systemd/vortex.service /etc/systemd/system/vortex.service
+#   install -Dm640 deploy/systemd/vortex.env     /etc/vortex/vortex.env
+#   systemctl daemon-reload && systemctl enable --now vortex
+#
+# Configuration lives in /etc/vortex/vortex.env, not in Environment= lines here:
+# the process environment overrides the file, so anything set in this unit
+# would silently win over what an operator wrote there.
+
+[Unit]
+Description=Vortex DNS forwarder with blocklist filtering
+Documentation=https://github.com/TheAllen/vortex
+# Blocklists are fetched at startup. Without a network that falls back to the
+# on-disk copy (or to VORTEX_BLOCKLIST_ON_FAILURE), so this is about starting
+# with fresh lists, not about starting at all.
+Wants=network-online.target
+After=network-online.target
+# Lets units that order themselves after name resolution wait for us.
+Wants=nss-lookup.target
+Before=nss-lookup.target
+# A fail-closed start against an unreachable list host fails every time; five
+# tries in five minutes is enough to ride out a blip without hammering the host.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# `exec`, not `notify`: Vortex does not speak sd_notify, so "started" means the
+# binary was executed. Readiness — lists loaded, sockets bound — follows within
+# seconds and is logged as `listening=`.
+Type=exec
+ExecStart=/usr/local/bin/vortex
+# Named explicitly, which also makes the file mandatory: a missing config is a
+# startup error rather than a resolver quietly running on dev defaults.
+Environment=VORTEX_ENV_FILE=/etc/vortex/vortex.env
+Restart=on-failure
+RestartSec=5s
+
+# No graceful shutdown yet (P2.4): SIGTERM ends the process where it stands.
+# In-flight queries are lost and their clients retry, which is what a DNS
+# client does anyway.
+
+# ---- Identity and state ------------------------------------------------
+# A throwaway user allocated at start. Vortex needs no persistent identity —
+# only somewhere to keep its blocklist cache, which StateDirectory provides at
+# /var/lib/vortex, owned by that user and kept across restarts.
+DynamicUser=yes
+StateDirectory=vortex
+WorkingDirectory=%S/vortex
+ConfigurationDirectory=vortex
+UMask=0077
+
+# ---- Port 53 -----------------------------------------------------------
+# The only privilege Vortex needs, and the only one it can ever regain.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+# ---- Sandbox -----------------------------------------------------------
+# DynamicUser already implies ProtectSystem=strict, ProtectHome=read-only,
+# PrivateTmp, RemoveIPC and RestrictSUIDSGID; the rest is spelled out.
+ProtectHome=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+ProcSubset=pid
+# INET for DNS and the HTTPS list fetch; UNIX for the journal.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

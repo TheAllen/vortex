@@ -98,6 +98,50 @@ pub const Options = struct {
 
     /// `VORTEX_MAX_TCP_CONNS`. Null leaves the binary's default (TCP on).
     max_tcp_conns: ?usize = null,
+
+    /// Which address Vortex listens on, and which a case reaches it over.
+    listen: Listen = .ip4_loopback,
+};
+
+/// The listening address a case runs Vortex on (P2.6).
+///
+/// The upstream side stays on IPv4 loopback throughout: what these vary is the
+/// client-facing socket, which is the one a deployment points at `::`.
+pub const Listen = enum {
+    /// `127.0.0.1`, reached on `127.0.0.1`. Every case that is not about the
+    /// listener.
+    ip4_loopback,
+    /// `::1`, reached on `::1` — an IPv6 client end to end.
+    ip6_loopback,
+    /// `::`, reached on `127.0.0.1`: an IPv4 client arriving on an IPv6
+    /// wildcard socket as a v4-mapped address. The shipped unit's
+    /// configuration, and the case that breaks if anything ever starts setting
+    /// `IPV6_V6ONLY` on the listener.
+    dual_stack,
+
+    fn host(self: Listen) []const u8 {
+        return switch (self) {
+            .ip4_loopback => "127.0.0.1",
+            .ip6_loopback => "::1",
+            .dual_stack => "::",
+        };
+    }
+
+    /// Where a client sends to reach a Vortex listening on `host()`.
+    fn target(self: Listen, port: u16) Io.net.IpAddress {
+        return switch (self) {
+            .ip4_loopback, .dual_stack => .{ .ip4 = .loopback(port) },
+            .ip6_loopback => .{ .ip6 = .loopback(port) },
+        };
+    }
+
+    /// An ephemeral client address in `target()`'s family.
+    fn clientBind(self: Listen) Io.net.IpAddress {
+        return switch (self) {
+            .ip4_loopback, .dual_stack => .{ .ip4 = .loopback(0) },
+            .ip6_loopback => .{ .ip6 = .loopback(0) },
+        };
+    }
 };
 
 /// How to tell that a child is ready to serve.
@@ -136,6 +180,7 @@ pub const Instance = struct {
 
     /// Vortex's listening address — where `sendQuery` sends.
     listen_addr: Io.net.IpAddress,
+    listen: Listen,
 
     tmp: testing.TmpDir,
 
@@ -152,7 +197,7 @@ pub const Instance = struct {
         errdefer upstream.close(io);
         errdefer upstream_tcp.deinit(io);
 
-        const client_bind: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        const client_bind = opts.listen.clientBind();
         const client = try client_bind.bind(io, .{ .mode = .dgram, .protocol = .udp });
         errdefer client.close(io);
 
@@ -164,7 +209,7 @@ pub const Instance = struct {
         // port out twice in the microseconds before the child claims it, and a
         // loss shows up as a clean "child exited" rather than a wrong answer.
         const listen_port = try reserveEphemeralPort(io);
-        const listen_addr: Io.net.IpAddress = .{ .ip4 = .loopback(listen_port) };
+        const listen_addr = opts.listen.target(listen_port);
 
         // Absolute, so the child's cwd is irrelevant — and so is the build
         // runner's, since these paths come from `b.path` via build options.
@@ -200,6 +245,7 @@ pub const Instance = struct {
             .upstream = upstream,
             .upstream_tcp = upstream_tcp,
             .listen_addr = listen_addr,
+            .listen = opts.listen,
             .tmp = tmp,
         };
         errdefer {
@@ -419,7 +465,7 @@ pub const Instance = struct {
         // readiness was already established — lands here and is discarded with
         // the socket, rather than sitting in the case's client socket waiting
         // to be mistaken for the reply it is asserting on.
-        const probe_bind: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        const probe_bind = self.listen.clientBind();
         const probe = try probe_bind.bind(self.io, .{ .mode = .dgram, .protocol = .udp });
         defer probe.close(self.io);
 
@@ -483,8 +529,8 @@ pub const Instance = struct {
         }
 
         std.debug.print(
-            "vortex did not answer on 127.0.0.1:{d} within {d}ms\n",
-            .{ self.listen_addr.getPort(), ready_timeout_ms },
+            "vortex did not answer on {f} within {d}ms\n",
+            .{ self.listen_addr, ready_timeout_ms },
         );
         self.reportChildLog();
         return error.VortexDidNotStart;
@@ -663,7 +709,7 @@ fn writeEnvFile(io: Io, gpa: std.mem.Allocator, tmp: *testing.TmpDir, fields: En
     defer body.deinit(gpa);
 
     try body.print(gpa,
-        \\VORTEX_LISTEN_HOST=127.0.0.1
+        \\VORTEX_LISTEN_HOST={s}
         \\VORTEX_LISTEN_PORT={d}
         \\VORTEX_UPSTREAM_HOST=127.0.0.1
         \\VORTEX_UPSTREAM_PORT={d}
@@ -678,6 +724,7 @@ fn writeEnvFile(io: Io, gpa: std.mem.Allocator, tmp: *testing.TmpDir, fields: En
         \\VORTEX_BLOCKLIST_REFRESH_SECS={d}
         \\
     , .{
+        fields.opts.listen.host(),
         fields.listen_port,
         fields.upstream_port,
         fields.opts.blocklist_source orelse build_options.blocklist_path,
