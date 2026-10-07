@@ -357,7 +357,7 @@ test "headerOnlyReply echoes the ID and zeroes every section count" {
     try testing.expectEqual(@as(u16, 0x8181), std.mem.readInt(u16, reply[2..4], .big));
 
     // Every count zero — including QDCOUNT, since no question follows.
-    try testing.expectEqualSlices(u8, &[_]u8{0} ** 8, reply[4..12]);
+    try testing.expectEqualSlices(u8, &@as([8]u8, @splat(0)), reply[4..12]);
 }
 
 test "markTruncated sets TC and touches nothing else" {
@@ -393,7 +393,7 @@ test "synthesizedReply builds a reply from an ID alone" {
     try testing.expectEqual(@as(u16, 0x8182), std.mem.readInt(u16, reply[2..4], .big));
 
     // No sections at all — there is no question to echo.
-    try testing.expectEqualSlices(u8, &[_]u8{0} ** 8, reply[4..12]);
+    try testing.expectEqualSlices(u8, &@as([8]u8, @splat(0)), reply[4..12]);
 
     // The RCODE is the only thing that varies.
     try testing.expectEqual(

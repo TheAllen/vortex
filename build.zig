@@ -68,7 +68,13 @@ pub fn build(b: *std.Build) void {
 
     // This allows the user to pass arguments to the application in the build
     // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
+    //
+    // 0.17 removed `b.args` in favour of `Run.addPassthruArgs`. Chosen at
+    // comptime so this script builds on both: CI pins 0.16, and the branch not
+    // taken is never analysed, so neither toolchain sees the other's API.
+    if (@hasDecl(std.Build.Step.Run, "addPassthruArgs")) {
+        run_cmd.addPassthruArgs();
+    } else if (b.args) |args| {
         run_cmd.addArgs(args);
     }
 

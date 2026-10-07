@@ -262,7 +262,7 @@ test "A and AAAA decode at exactly their width" {
     const a = try parseRdata(.A, &[_]u8{ 192, 168, 1, 42 });
     try testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 42 }, a.a);
 
-    const v6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ [_]u8{0} ** 11 ++ [_]u8{0x01};
+    const v6 = [_]u8{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([11]u8, @splat(0)) ++ [_]u8{0x01};
     const aaaa = try parseRdata(.AAAA, &v6);
     try testing.expectEqualSlices(u8, &v6, aaaa.aaaa);
 }
