@@ -43,11 +43,29 @@ pub const std_options: std.Options = .{
 /// (client, qtype, latency) on a level an operator can leave on.
 const query_log = std.log.scoped(.query);
 
-fn addrBind(io: std.Io, addr: *const std.Io.net.IpAddress) !std.Io.net.Socket {
+fn addrBind(io: std.Io, addr: *const std.Io.net.IpAddress, what: []const u8) !std.Io.net.Socket {
     return addr.bind(io, .{ .mode = .dgram, .protocol = .udp }) catch |err| {
-        std.log.err("Error: failed to create socket...", .{});
+        logBindFailure(what, addr, err);
         return err;
     };
+}
+
+/// Names the address that could not be bound and, for the failures a first
+/// deployment on port 53 actually hits (P2.6), the likely cause — the bare
+/// error name says neither which socket failed nor what to do about it.
+fn logBindFailure(what: []const u8, addr: *const std.Io.net.IpAddress, err: anyerror) void {
+    const hint: []const u8 = switch (err) {
+        error.AddressInUse => " (another process holds this port; on most systemd hosts that is " ++
+            "systemd-resolved's stub listener, see README \"Running under systemd\")",
+        // std 0.16's bind has no AccessDenied: EACCES arrives as Unexpected.
+        error.Unexpected => if (addr.getPort() < 1024)
+            " (ports below 1024 need CAP_NET_BIND_SERVICE, which the systemd unit grants)"
+        else
+            "",
+        error.AddressUnavailable => " (no local interface has this address)",
+        else => "",
+    };
+    std.log.err("cannot bind {s} to {f}: {s}{s}", .{ what, addr.*, @errorName(err), hint });
 }
 
 fn initIpAddress(host: []const u8, port: u16) !std.Io.net.IpAddress {
@@ -59,13 +77,13 @@ fn initSockets(io: std.Io, cfg: Settings) !struct {
     std.Io.net.Socket,
 } {
     const addr: std.Io.net.IpAddress = try initIpAddress(cfg.listen_host, cfg.listen_port);
-    const client_socket: std.Io.net.Socket = try addrBind(io, &addr);
+    const client_socket: std.Io.net.Socket = try addrBind(io, &addr, "udp listener");
 
     const local_upstream_addr: std.Io.net.IpAddress = try std.Io.net.IpAddress.parse(
         cfg.upstream_bind_host,
         cfg.upstream_bind_port,
     );
-    const upstream_socket: std.Io.net.Socket = try addrBind(io, &local_upstream_addr);
+    const upstream_socket: std.Io.net.Socket = try addrBind(io, &local_upstream_addr, "upstream socket");
 
     return .{
         client_socket,
@@ -1004,7 +1022,13 @@ pub fn main(init: std.process.Init) !void {
     // sets SO_REUSEPORT too, which on its own would let a second Vortex share
     // the port; that cannot happen here, because the UDP socket above binds
     // first and without reuse, so a second instance fails there.
-    var tcp_server: ?std.Io.net.Server = if (tcp_enabled) try listen_addr.listen(io, .{ .reuse_address = true }) else null;
+    var tcp_server: ?std.Io.net.Server = if (tcp_enabled)
+        listen_addr.listen(io, .{ .reuse_address = true }) catch |err| {
+            logBindFailure("tcp listener", &listen_addr, err);
+            return err;
+        }
+    else
+        null;
     defer if (tcp_server) |*server| server.deinit(io);
     var tcp_conns: ?ConnTable = if (tcp_enabled) try ConnTable.init(gpa, cfg.max_tcp_conns) else null;
     defer if (tcp_conns) |*conns| conns.deinit();
@@ -1097,11 +1121,10 @@ pub fn main(init: std.process.Init) !void {
     if (ctx.refresh != null) try spawnLoop(&group, io, &ctx, "refresher", refresherLoop);
     if (ctx.tcp != null) try spawnLoop(&group, io, &ctx, "tcp accept", tcpAcceptLoop);
 
-    std.log.info("listening={s}:{d} upstream={s}:{d} handler_threads={d} tcp_conns={d} edns_udp_size={d}", .{
-        cfg.listen_host,
-        cfg.listen_port,
-        cfg.upstream_host,
-        cfg.upstream_port,
+    // `{f}`, not host:port, so an IPv6 listener reads `[::]:53` rather than `:::53`.
+    std.log.info("listening={f} upstream={f} handler_threads={d} tcp_conns={d} edns_udp_size={d}", .{
+        listen_addr,
+        upstream_addr,
         handler_threads,
         cfg.max_tcp_conns,
         ctx.edns_udp_size,

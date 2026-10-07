@@ -100,6 +100,60 @@ These two were called `VORTEX_BLOCKLIST_URL` / `VORTEX_SUFFIX_BLOCKLIST_URL`
 before they learned to take a path. Setting a stale name is a startup error
 naming its replacement rather than a silent fall back to the default list.
 
+## Running under systemd
+
+> [!WARNING]
+> Read the warning under [Where it actually stands](#where-it-actually-stands)
+> first. There is no per-client rate limiting yet (P2.7), so firewall port 53 to
+> the networks you serve; never expose it to the internet.
+
+[`deploy/systemd/`](deploy/systemd/) has a unit and the config file it reads.
+Build a release binary (on the host, or cross-compile from anywhere with
+`-Dtarget=x86_64-linux-musl` / `aarch64-linux-musl`, which gives a static binary)
+and install the three pieces:
+
+```sh
+zig build -Doptimize=ReleaseSafe
+sudo install -Dm755 zig-out/bin/vortex            /usr/local/bin/vortex
+sudo install -Dm644 deploy/systemd/vortex.service /etc/systemd/system/vortex.service
+sudo install -Dm640 deploy/systemd/vortex.env     /etc/vortex/vortex.env
+sudoedit /etc/vortex/vortex.env                   # set VORTEX_UPSTREAM_HOST
+sudo systemctl daemon-reload
+sudo systemctl enable --now vortex
+journalctl -u vortex -f                           # wait for `listening=[::]:53`
+```
+
+The shipped config listens on `[::]:53`, which also accepts IPv4 clients over
+both UDP and TCP under Linux's default `net.ipv6.bindv6only=0`. The unit runs
+Vortex as a throwaway `DynamicUser` whose one privilege is
+`CAP_NET_BIND_SERVICE`, under a read-only filesystem except for
+`/var/lib/vortex`, where the blocklist cache lives so a reboot without network
+still starts with filtering.
+
+**Port 53 is usually taken already.** On Ubuntu, Fedora and anything else running
+systemd-resolved, its stub listener holds `127.0.0.53:53`, and a wildcard bind
+fails with `AddressInUse`; Vortex's log line says so. Either turn the stub off
+(this host then resolves through Vortex, or whatever `/etc/resolv.conf` names):
+
+```sh
+sudo mkdir -p /etc/systemd/resolved.conf.d
+printf '[Resolve]\nDNSStubListener=no\n' | sudo tee /etc/systemd/resolved.conf.d/vortex.conf
+sudo systemctl restart systemd-resolved
+```
+
+or set `VORTEX_LISTEN_HOST` to the specific LAN address you serve instead of
+`::`. That is IPv4 *or* IPv6, not both, since Vortex listens on one address.
+
+**Multihomed hosts should bind a specific address.** A UDP reply from a wildcard
+socket leaves from whichever address the kernel's route picks, which on a host
+with several addresses on one network may not be the one the client asked, and
+the client then discards it. Vortex does not yet pin the reply's source address
+(`IP_PKTINFO`).
+
+Config changes need `systemctl restart vortex`; there is no reload. Stopping is
+a plain SIGTERM with no drain (graceful shutdown is P2.4), so queries in flight
+at that moment are lost and their clients retry.
+
 ## How it works
 
 ```
@@ -213,8 +267,9 @@ daily by default — and a refresh that would empty a list which currently has
 entries is refused rather than installed, because that is what a 200 OK serving
 an error page looks like by the time it reaches the parser.
 
-The gap is everything around the datapath: graceful shutdown, metrics, rate
-limiting, and a deployment surface. EDNS0 and TCP landed 2026-09-28. [`docs/next_steps.md`](docs/next_steps.md) is the full
+The gap is everything around the datapath: graceful shutdown, metrics and rate
+limiting. EDNS0 and TCP landed 2026-09-28; a systemd unit and IPv6 listening
+(P2.6) on 2026-10-06. [`docs/next_steps.md`](docs/next_steps.md) is the full
 prioritized board.
 
 The testing gap that used to sit here is closed. The 147 unit tests are all over
@@ -224,8 +279,9 @@ real bugs lived. As of 2026-09-12 [`tests/`](tests/) spawns the real binary
 against a scratch config and a fake upstream and drives it over UDP: 16 cases,
 every one confirmed to fail when the behavior it covers is deliberately broken.
 
-`zig build test` runs both suites (206 tests: 173 unit, 33 integration, the
-integration cases now over TCP as well as UDP); `zig build test-integration` runs
+`zig build test` runs both suites (208 tests: 173 unit, 35 integration, the
+integration cases over TCP as well as UDP, and over IPv6 and a dual-stack `::`
+listener as well as IPv4); `zig build test-integration` runs
 just the harness, and `-Dtest-filter=<substr>` narrows it to a single case.
 
 What is *not* covered there is concurrency — every case is one query at a time —

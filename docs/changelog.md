@@ -9,6 +9,45 @@ Newest first. Open work lives in [next_steps.md](next_steps.md).
 
 ---
 
+## Landed 2026-10-06 — P2.6: deployment surface (Linux/systemd)
+
+**A unit, not just a port.** [deploy/systemd/vortex.service](../deploy/systemd/vortex.service)
+runs Vortex as a `DynamicUser` whose only capability, ambient and bounding, is
+`CAP_NET_BIND_SERVICE`. It runs under the usual sandbox (`ProtectSystem=strict` via DynamicUser,
+private devices, `@system-service` syscall filter minus `@privileged`, INET/UNIX sockets only),
+with `StateDirectory=vortex` holding the P2.2 blocklist cache so a boot without network still
+starts filtering. `Restart=on-failure` is capped at five tries in five minutes, because a
+fail-closed start against a dead list host fails identically every time.
+
+**Config stays in the env file.** The unit sets exactly one variable, `VORTEX_ENV_FILE`, which
+also makes the file mandatory. Anything else set with `Environment=` would silently override the
+operator's file, since the process environment wins. [vortex.env](../deploy/systemd/vortex.env)
+sets only what a service install has to change: `[::]:53`, an upstream other than the home-router
+default, the cache path and logfmt.
+
+**IPv6 with no new code path.** `VORTEX_LISTEN_HOST=::` already parsed; what was missing was
+evidence. In std 0.16, neither `bind` nor `listen` sets `IPV6_V6ONLY` unless asked, so both
+sockets take the kernel default, which on Linux (and macOS) is dual-stack. One `::` listener
+therefore serves IPv4 clients too, v4-mapped, over UDP and TCP alike. Two integration cases pin it,
+each down the blocked path, the **dispatcher** reply path (the client address saved in
+`PendingTable` has to round-trip in its own family) and TCP: one an IPv6 client on `::1`, and one an
+IPv4 client on `::`. The second is the one that breaks if anything ever sets V6ONLY. The harness
+gained `Options.listen` for this. Deliberately *not* passed: 0.16's `ip6_only = true` clears
+V6ONLY instead of setting it, and 0.17 changes the field's type.
+
+**Bind failures say which socket and why.** The old message was `Error: failed to create
+socket...`, for every socket and every cause. It now names the socket and address, plus a hint for
+the two failures a first port-53 deployment hits. `AddressInUse` points at systemd-resolved's stub
+listener. EACCES, which 0.16's bind reports as `Unexpected` because its error set has no
+`AccessDenied`, points at `CAP_NET_BIND_SERVICE` when the port is below 1024. The TCP `listen`
+gets the same treatment. The startup line prints addresses with `{f}`, so IPv6 reads `[::]:53`.
+
+**Not done here**, and listed under P2.6 in [next_steps.md](next_steps.md): validating the unit
+on a live systemd host, reply source-address pinning on multihomed hosts, multiple listen addresses,
+and sd_notify.
+
+---
+
 ## Landed 2026-09-28 — P3.5/P3.6: EDNS0 and TCP
 
 Phases 2 and 3 of the protocol plan, combined into one branch. Combining them removed the

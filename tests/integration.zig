@@ -1156,3 +1156,59 @@ test "a TCP connection that stalls mid-message is closed after the idle timeout"
     const elapsed_ms: u64 = @intCast(started.untilNow(testing.io, .boot).toMilliseconds());
     try testing.expect(elapsed_ms >= 9_000);
 }
+
+// ── Listener address family (P2.6) ────────────────────────────────────────
+
+/// One query down each path a listener's address family can break: a blocked
+/// name answered by the handler, a forwarded name answered by the *dispatcher*
+/// — which replies to the client address it saved in the pending table, so a
+/// family mix-up there loses the reply rather than failing loudly — and a
+/// blocked name over TCP, which is a separate socket bound by a separate call.
+fn expectAnsweredOnEveryPath(vortex: *Instance) !void {
+    var query_buf: [wire.max_message]u8 = undefined;
+    var buf: [wire.max_message]u8 = undefined;
+
+    try vortex.sendQuery(wire.query(&query_buf, 0x6001, "ads.example.com", .{}));
+    const blocked = try vortex.recvClient(&buf, harness.default_timeout_ms);
+    try testing.expectEqual(@as(u16, 0x6001), wire.id(blocked));
+    try testing.expectEqual(@as(u4, wire.RCode.name_error), wire.rcode(blocked));
+
+    try vortex.sendQuery(wire.query(&query_buf, 0x6002, "family.example.com", .{}));
+    var upstream_buf: [wire.max_message]u8 = undefined;
+    const forwarded = try vortex.recvUpstream(&upstream_buf, harness.default_timeout_ms);
+    var reply_buf: [wire.max_message]u8 = undefined;
+    try vortex.sendUpstreamReply(&forwarded.from, try wire.reply(&reply_buf, forwarded.data, .{
+        .addresses = &.{.{ 192, 0, 2, 60 }},
+    }));
+    const answer = try vortex.recvClient(&buf, harness.default_timeout_ms);
+    try testing.expectEqual(@as(u16, 0x6002), wire.id(answer));
+    try testing.expectEqual(@as(u16, 1), wire.ancount(answer));
+
+    const conn = try vortex.tcpConnect();
+    defer conn.close(testing.io);
+    try vortex.tcpSend(conn, wire.query(&query_buf, 0x6003, "ads.example.com", .{}));
+    const over_tcp = try vortex.tcpRecv(conn, &buf, harness.default_timeout_ms);
+    try testing.expectEqual(@as(u16, 0x6003), wire.id(over_tcp));
+    try testing.expectEqual(@as(u4, wire.RCode.name_error), wire.rcode(over_tcp));
+}
+
+test "an IPv6 listener answers an IPv6 client over UDP and TCP" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .listen = .ip6_loopback });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    try expectAnsweredOnEveryPath(&vortex);
+}
+
+test "listening on :: also answers IPv4 clients, over UDP and TCP" {
+    // What the shipped systemd configuration does: one socket per transport on
+    // the IPv6 wildcard, with IPv4 clients arriving v4-mapped. Relies on the
+    // kernel default (Linux `net.ipv6.bindv6only=0`, which macOS matches); if
+    // this fails on a host where it is 1, that host needs the listener on
+    // 0.0.0.0 instead.
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .listen = .dual_stack });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    try expectAnsweredOnEveryPath(&vortex);
+}
