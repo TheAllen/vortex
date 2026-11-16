@@ -1,12 +1,12 @@
 # Vortex
 
-A DNS forwarder with blocklist filtering, written in Zig 0.16 on the new `std.Io`
+A DNS forwarder with blocklist filtering, written in Zig 0.17 on the new `std.Io`
 async runtime. Point a resolver at it and ad/tracker domains come back NXDOMAIN;
 everything else is forwarded upstream.
 
 **Status: works, but it is a learning project, not a product.** The query path is
 complete and tested; the operational surface around it (config reload, metrics,
-rate limiting, service units) largely is not. See
+a client allowlist, graceful shutdown) largely is not. See
 [Where it actually stands](#where-it-actually-stands) before deploying it anywhere.
 
 ---
@@ -104,8 +104,10 @@ naming its replacement rather than a silent fall back to the default list.
 
 > [!WARNING]
 > Read the warning under [Where it actually stands](#where-it-actually-stands)
-> first. There is no per-client rate limiting yet (P2.7), so firewall port 53 to
-> the networks you serve; never expose it to the internet.
+> first. Vortex is meant for a home network and does not yet check where queries
+> come from (P2.7), so make sure port 53 is not reachable from the internet.
+> **Check IPv6 especially:** the host usually has a global IPv6 address that NAT
+> does not hide, so only the router's IPv6 firewall stands in the way.
 
 [`deploy/systemd/`](deploy/systemd/) has a unit and the config file it reads.
 Build a release binary (on the host, or cross-compile from anywhere with
@@ -149,6 +151,19 @@ socket leaves from whichever address the kernel's route picks, which on a host
 with several addresses on one network may not be the one the client asked, and
 the client then discards it. Vortex does not yet pin the reply's source address
 (`IP_PKTINFO`).
+
+### Pointing your network at Vortex
+
+Set the router's DHCP (IPv4) DNS server to Vortex's LAN address. Then **turn off
+the router's IPv6 DNS advertisement** (called RDNSS, DHCPv6 DNS, or just "IPv6 DNS"
+on the router's IPv6/LAN page), or leave that field empty. Many routers advertise
+themselves as an IPv6 DNS server automatically. Clients usually prefer that server,
+so while it is advertised, **devices skip Vortex and nothing gets blocked**. Clients
+keep using IPv6 for everything else; only DNS goes over IPv4.
+
+To see what a device was given (macOS: `scutil --dns | grep nameserver`; Linux:
+`resolvectl status`; Windows: `ipconfig /all`): only Vortex's IPv4 address should
+be listed.
 
 Config changes need `systemctl restart vortex`; there is no reload. Stopping is
 a plain SIGTERM with no drain (graceful shutdown is P2.4), so queries in flight
@@ -253,11 +268,13 @@ per RFC 2308, and OPT is excluded from every TTL computation, since TYPE 41
 reuses that field for flags rather than a duration.
 
 > [!WARNING]
-> **Do not bind this off localhost yet.** Queries awaiting upstream are capped
-> (`VORTEX_MAX_PENDING`) and so are TCP connections (`VORTEX_MAX_TCP_CONNS`), but
-> there is no per-client rate limiting, so a resolver reachable from outside can
-> still be conscripted into DNS amplification. The localhost default is
-> load-bearing as a security control, not a dev convenience.
+> **Serve your home network only, never the internet.** Queries awaiting upstream
+> are capped (`VORTEX_MAX_PENDING`) and so are TCP connections
+> (`VORTEX_MAX_TCP_CONNS`), but Vortex answers anyone who can reach it, and has no
+> rate limiting. A resolver reachable from the internet can be used for DNS
+> amplification. Behind a home router's NAT that cannot happen over IPv4. Over IPv6
+> it depends on the router's firewall. A client allowlist (P2.7) is next. Until
+> it lands, the localhost default is a security control, not a dev convenience.
 
 **The blocklists survive their sources.** A failed fetch is retried, then falls
 back to an on-disk copy written on the last success; if even that is missing,

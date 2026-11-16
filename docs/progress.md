@@ -11,6 +11,93 @@ are stated explicitly below so the number can be argued with rather than just qu
 
 ---
 
+## Snapshot — 2026-11-15
+
+> **≈ 71.8% complete** (62.4 → 71.8). The largest move since caching, made of five landings
+> between 09-15 and 10-06 plus the Zig 0.17 port. Nothing has landed since 10-06; this is the
+> catch-up snapshot.
+>
+> Source: 8,304 lines of Zig across 20 files in `src/` (+1,280, two new files:
+> `dns/edns.zig` and `utils/conn_table.zig`), plus 2,385 lines in `tests/` (+782). Built with
+> Zig 0.17.1. `zig build test` → **208/208 pass**, a 173-test unit suite plus **35
+> integration cases**. Debug only; ReleaseSafe was not re-run for this snapshot.
+>
+> What moved the number:
+> - **Protocol completeness, ~62% → ~85%** (+4.6). EDNS0 and TCP (P3.5/P3.6), plus the two
+>   cache fixes: TC=1 is never stored, and hits echo the client's casing.
+> - **Operability, ~42% → ~58%** (+4.0). The P1.5 pending cap, and P2.6: the systemd unit,
+>   the dual-stack listener and bind failures that name their cause.
+> - **Core datapath, ~98% → ~99%** (+0.3). The startup hang on hosts with three CPUs or fewer.
+> - **Sinkhole, ~5% → ~8%** (+0.45). P4.7's DNSSEC posture is decided and written down.
+> - **Tests + CI, ~93% → ~94%** (+0.1).
+>
+> **The sentence this retires is "P1.5 is the last code-level gate."** P1.5 is done, and P2.7
+> was rescoped on 11-15 for the deployment Vortex is actually meant for, a home network.
+> Behind NAT, the amplification threat that made rate limiting a gate does not apply. What is
+> left is a client allowlist, so that "home network only" does not depend on the router's
+> IPv6 firewall. See the cliff below.
+
+### Breakdown
+
+| Area | Weight | Done | Contribution | Notes |
+|---|---:|---:|---:|---|
+| Core query datapath | 30% | ~99% | 29.7 | **+1.** Background loops start on `concurrent` with their own reserved slots, so a small host no longer hangs at startup. What is left is the hard-coded 5 s deadline and 1 s sweep |
+| Operability | 25% | ~58% | 14.5 | **+16.** P1.5 bounds `PendingTable`; P2.6 ships a hardened unit, `[::]:53` dual-stack and bind diagnostics; `VORTEX_HANDLER_THREADS`. Open: the P2.7 client allowlist, the per-query event and counters, graceful shutdown, CLI flags, sd_notify, and running the unit on a real systemd host |
+| Protocol completeness | 20% | ~85% | 17.0 | **+23.** EDNS0 (FORMERR/BADVERS, the 1232 clamp, cache partitioned by EDNS class), a TCP listener with upstream TCP, and the two cache fixes. Open: P3.7 multi-upstream / DoT, planned together with P4.3 |
+| Sinkhole feature set | 15% | ~8% | 1.2 | **+3.** P4.7 decided: forwarded answers stay transparent to DNSSEC, and blocked answers are unsigned by nature. P4.1, P4.3–P4.6 untouched |
+| Tests + CI | 10% | ~94% | 9.4 | **+1.** 151 behavior tests (from 126) and 35 integration cases (from 16), each mutation-checked as it landed. The three gaps named on 09-12 are all still open; see below |
+| **Total** | **100%** | | **≈ 71.8** | |
+
+**Counted exactly: 173 = 151 behavior tests + 20 `refAllDecls` guards + 1 aggregator + 1
+no-op.** Regenerated from `grep '^test '` per file, not hand-edited.
+
+### Why the protocol band moved most
+
+EDNS0 and TCP were the residue the 09-05 snapshot named once caching shipped. They landed
+as one branch because together they removed an interim step. Clamping to 1232 produces more
+TC=1 replies, and TC=1 is only honest when there is a TCP listener for the client to retry
+against. So the clamp and the listener had to arrive together.
+
+**The structural win is `decide`.** `handleQuery` was split into one transport-agnostic
+function (header → question → OPT → policy → cache) plus the two things only a transport can
+do. Every rule about what gets blocked, cached or rejected now exists once, for both UDP and
+TCP. P2.7's allowlist needs one check at UDP ingress and one at TCP accept, both ahead of
+`decide`, so it does not have to be threaded through two code paths.
+
+### The finding worth keeping
+
+**The startup hang was found by reading the standard library, not by a test.** On any host
+with three or fewer CPUs, Vortex bound its socket and then answered nothing. `async` at its
+limit runs the task inline, a loop never returns, and so the ingress loop never started. The
+suite could not see this: it ran on a 10-CPU machine, where the limit was never reached.
+
+It was found while planning P1.5. The same reading corrected P1.5's own premise on 09-19: the
+runtime already bounds handlers, and the unbounded thing was `PendingTable`. **Two of this
+period's most important changes started as a wrong assumption about what the runtime
+promises.** `async` is *permitted* to run inline, so code that needs parallelism has to ask
+for it with `concurrent`. This is the same thing this file keeps learning in other forms: an
+assumption about what is checked or guaranteed, which nothing verified.
+
+### What did not move, and why
+
+**Tests + CI gained one point, not more.** The three gaps from 09-12 are all still open:
+
+- **No case runs two UDP queries at once.** The `Io.RwLock` that makes blocklist swaps safe
+  under readers is still verified only by the 09-13 hand run. TCP pipelining tests one
+  connection in order, which is not the same property.
+- **The supervisor is still unreachable from outside the process.**
+- **The harness still picks the listen port by binding port 0 and releasing it.** P2.6 was
+  named as the natural place to fix this and did not take it.
+
+**P2.6 shipped untested against its real target.** The unit was written against the systemd
+docs, and `systemd-analyze security` has never been run on it. The syscall filter is the
+likeliest part to need loosening.
+
+**The docs had drifted.** The `next_steps.md` header still said Zig 0.16.0, and is corrected
+in this pass. Its "Suggested order" section is still marked stale by its own note.
+
+---
+
 ## Snapshot — 2026-09-13
 
 > **≈ 62.4% complete** (60.0 → 62.4). One area moved, and for once it is the one weighted
@@ -452,6 +539,23 @@ than after the data has been written.
 
 The headline number smooths over a discontinuity that matters more than any percentage.
 
+> **Status 2026-11-15: the cliff is lower than this section describes.** P1.5 landed 09-28
+> and P2.6 landed 10-06. P2.7 was rescoped on 11-15, because the threat below assumes a
+> resolver the internet can reach. Vortex is meant for a home network. Behind a home router's
+> NAT, an off-path attacker cannot reach port 53 at all, and faking source addresses inside the
+> LAN needs an attacker already on it. Amplification is not the threat there.
+>
+> **What is still true is the edge case: IPv6.** The shipped
+> [deploy/systemd/vortex.env](../deploy/systemd/vortex.env) sets `VORTEX_LISTEN_HOST = "::"`,
+> and an IPv6 host normally has a globally routable address that NAT does not hide. Whether
+> port 53 is reachable from outside then depends only on the router's IPv6 firewall, and the
+> only guard in this repo is a comment telling the operator to check it. **A comment is not a
+> control.** P2.7 is now a client allowlist, defaulting to local ranges, which makes "home
+> network only" something Vortex enforces.
+>
+> The text below is the 08-09 original with its 09-19 correction, kept for the reasoning. Read
+> "bind off localhost" there as "reachable from the internet."
+
 **You cannot safely point a router at Vortex today** — and as of 08-09 that is a *policy*
 statement rather than a mechanical one, which makes it more dangerous, not less. Before P2.1
 the compile-time `127.0.0.1` was an accidental safety interlock. Now
@@ -556,9 +660,9 @@ Worth keeping as a reminder that a guard rail credited in advance is not a guard
 verified.
 
 ### → ~55%: make it deployable — the highest-value block on the board
-Six items, and together they're the difference between a toy and a tool. **Four are now
-done** — P2.1, the P1.1–P1.4/P4.2 datapath group, P2.5 and P2.2 — which leaves the three that
-are all about surviving contact with a real network:
+Eight items, and together they're the difference between a toy and a tool. **Six are now
+done**: P2.1, the P1.1–P1.4/P4.2 datapath group, P2.5, P2.2, P1.5 and P2.6. That leaves two,
+P2.7 and P2.4:
 
 | Item | Why it's on the critical path |
 |---|---|
@@ -566,10 +670,10 @@ are all about surviving contact with a real network:
 | ~~P1.1 / P1.2 / P1.3 / P1.4 / P4.2~~ ✅ 08-09 | Datapath closed out; P1.5 is the only P1 left |
 | ~~**P2.5 integration harness**~~ ✅ 09-12 | Topped this list for one pass and came off it. 12 end-to-end cases, all mutation-checked. It was here because both of the last two real bugs were found only by driving sockets; everything below now ships with it in place, which was the point |
 | ~~**P2.2 blocklist cache + refresh**~~ ✅ 09-13 | Topped this list for one pass and came off it, like the harness before it. The 404 that proved it was fixed by swapping in another hard-coded URL, which re-armed the same trap against a different host — one that rate-limits; that class is now closed by retry + cache + a fail policy, not by picking a better URL |
-| **P1.5 in-flight cap** | Now the top of this list. Gate for leaving localhost. Scope corrected 09-19: the bound belongs on `PendingTable` occupancy, not on spawned handlers — the runtime already caps those |
-| P2.7 rate limiting | Gate for leaving localhost |
-| P2.6 bind + service unit | `0.0.0.0:53`, privileged port, launchd/systemd |
-| P2.4 graceful shutdown | Currently the only exit is a crash or Ctrl-C mid-write |
+| ~~**P1.5 in-flight cap**~~ ✅ 09-28 | `VORTEX_MAX_PENDING`, drop past it. Scope corrected 09-19: the bound belongs on `PendingTable` occupancy, not on spawned handlers, because the runtime already caps those. Its startup-hang prerequisite landed 09-27 |
+| ~~P2.6 bind + service unit~~ ✅ 10-06 | Linux/systemd. Hardened unit, `[::]:53` dual-stack, bind errors that name the cause. Not yet run on a real systemd host; launchd not done |
+| **P2.7 client allowlist** | **Now the top of this list.** Rescoped 11-15 from rate limiting: behind home NAT, amplification does not apply, but the shipped `::` listener is reachable over IPv6 if the router's firewall lets it through. Rate limiting is deferred unless Vortex is ever meant to serve beyond a LAN |
+| P2.4 graceful shutdown | Currently the only exit is a crash or Ctrl-C mid-write. Also unblocks SIGHUP refresh and pairs with sd_notify |
 
 Note the shape of this: it moves completion by ~20 points but moves **utility from zero to
 most of the way there**. It is the single most underweighted block if you judge by the
@@ -595,36 +699,46 @@ DNS" — the branch [next_steps.md](next_steps.md) flags at the end of its Sugge
 
 ## Where the code actually is
 
-Regenerated from `wc -l` on 2026-09-12. Test counts exclude each file's `refAllDecls`
-guard, so this column is **behavior tests only** and will not sum to the 131 the unit runner
-reports.
+Regenerated from `wc -l` and `grep '^test '` on 2026-11-15. Test counts exclude each
+file's `refAllDecls` guard, so this column is **behavior tests only**: it sums to 151, not
+the 173 the unit runner reports.
 
 ```
-src/ — 5,902 lines of Zig, 16 files
+src/ — 8,304 lines of Zig, 20 files
 
-src/dns/cache.zig                1215  key + context, entry, map, TTL policy         31 tests
-src/main.zig                      737  ingress, handleQuery, dispatcher, supervisor   1 test   <- +1 no-op, +1 aggregator
-src/settings.zig                  682  runtime config: .env parse, precedence, Source 8 tests
-src/dns/resource_record.zig       624  RR walk, iterator, rdata types                17 tests
+src/dns/cache.zig                1362  key + context, entry, map, TTL policy         35 tests
+src/main.zig                     1264  ingress, decide, dispatcher, TCP, supervisor   2 tests  <- +1 no-op, +1 aggregator
+src/settings.zig                  887  runtime config: .env parse, precedence, Source 11 tests
+src/dns/resource_record.zig       623  RR walk, iterator, rdata types                17 tests
 src/obs/log.zig                   494  logfmt logFn, escaping writer, level + format  8 tests
+src/blocklist/acquire.zig         457  fetch, retry, on-disk list cache               5 tests
+src/utils/pending_table.zig       448  proxy-ID table, cap, sweeper, question hash    8 tests
 src/dns/header.zig                412  parse, validateQuery, reply builders           9 tests
-src/dns/name_reader.zig           378  name reading, pointer following               17 tests
-src/utils/pending_table.zig       370  proxy-ID table, sweeper, question hashing      7 tests
-src/blocklist/domain_blocklist.zig 228 exact-match list, URL or file + shared read    3 tests
-src/dns/blocked_response.zig      187  pure NXDOMAIN+SOA assembly                     3 tests
-src/blocklist/suffix_blocklist.zig 181 parent-label walk, URL or file                 4 tests
+src/dns/name_reader.zig           377  name reading, pointer following               17 tests
+src/blocklist/policy.zig          347  generations behind an RwLock, decide chain     6 tests
+src/dns/blocked_response.zig      258  NXDOMAIN+SOA(+OPT) assembly, BADVERS           6 tests
+src/dns/edns.zig                  254  OPT find/parse, clamp, cache class             9 tests  <- new 09-28
+src/blocklist/domain_blocklist.zig 230 exact-match list, URL or file                  3 tests
+src/utils/conn_table.zig          229  TCP connection slots, idle cancel              4 tests  <- new 09-28
+src/blocklist/suffix_blocklist.zig 180 parent-label walk, URL or file                 4 tests
 src/dns/question.zig              119  QName parse, lowercasing                       4 tests
+src/utility.zig                   103  Context, Refresher, Tcp                        0 tests
 src/blocklist/allowlist.zig        99  comptime allowlist                             1 test
+src/utils/backoff.zig              92  shared backoff schedule                        2 tests
 src/dns/authority.zig              69  34-byte synthetic SOA                          0 tests
-src/utility.zig                    57  Context                                        0 tests
-src/blocklist/policy.zig           50  allow -> exact -> suffix chain                 0 tests  <- logic, no tests
 
-tests/ — 1,130 lines of Zig, 3 files                                            <- new 09-12
+tests/ — 2,385 lines of Zig, 3 files
 
-tests/integration.zig             455  the 12 end-to-end cases                       12 tests
-tests/harness.zig                 395  child process, fake upstream, scratch config   0 tests
-tests/wire.zig                    280  independent DNS encode/decode for assertions   0 tests
+tests/integration.zig            1214  the 35 end-to-end cases                       35 tests
+tests/harness.zig                 833  child process, fake upstream, scratch config   0 tests
+tests/wire.zig                    338  independent DNS encode/decode for assertions   0 tests
 ```
+
+*Since 09-12, `policy.zig` has gone from 50 lines and zero tests to 347 lines and six. It is
+off the "logic with no tests" list, which leaves only `utility.zig` and `authority.zig`.
+Both carry very little. `main.zig` has nearly doubled and is now level with `cache.zig`,
+mostly from TCP. Putting P2.7's limiter in its own module would keep `main.zig` from growing
+further.*
 
 `tests/` is a second artifact with its own root, and it must be: it deliberately does **not**
 link `main`. `wire.zig` shares no code with `src/dns` for the same reason the golden-bytes
@@ -693,6 +807,8 @@ P2.5's harness would look.
 | 2026-08-13 | ~47.1% | P3.1 compression pointer following: [name_reader.zig](../src/dns/name_reader.zig) with a strictly-backwards rule *plus* a 64-jump cap (the cap turned out to be load-bearing, not decorative), the project's first fuzz target, and `DomainName` deleted along with its allocator. Tests → 59/59 (58 real). Shipped with no datapath caller by design |
 | 2026-09-05 (pm) | ~57.4% | **P3.3 TTL-aware response caching** — [cache.zig](../src/dns/cache.zig), keyed on `(qname, qtype, qclass)` with a hand-written hash context, TTLs aged on the way out per RFC 2181 §5.2, RFC 2308 negative caching, OPT excluded throughout. Tests → 101/101 (98 real), 69 → 101. Closes the compression → parsing → caching chain and the largest single feature on the board. Two bugs caught during the build (an overlapping `@memcpy`, a get/age race), and **four vacuous tests found by mutation** — each because the fixture was built to be realistic rather than to discriminate. First module to carry `refAllDecls` |
 | 2026-09-12 | ~60.0% | **P2.5 integration harness.** [tests/](../tests/) spawns the real binary against a scratch `.env` and a fake upstream it owns both ends of, and drives it over UDP: 12 cases covering forwarding, exact and suffix blocking, all three ingress rejections, both oversize paths, the upstream timeout, a forged reply, and a cache hit. `zig build test` → 143/143; `-Dtest-filter` narrows to one case in ~0.4 s. **No `src/` behavior changed** — the pass adds evidence, not capability, which is why only Tests + CI moved. All 12 cases mutation-checked, and the one mutation that failed to *compile* was rewritten rather than counted. Findings: the mutation run caught no bug in `src/` and one deadlock in the harness's own diagnostic path — `Child.kill` closes and nulls `child.stderr`, so a drain must detach the pipe *before* the kill and read it *after* |
+| 2026-09-13 | ~62.4% | **P2.2 blocklist resilience**: retry, on-disk list cache, fail-open/closed policy, periodic refresh with generations swapped behind an `Io.RwLock`. Tests → 162/162. Finding: two new integration cases passed before the feature worked, because they never waited long enough for the refresh timer |
+| 2026-11-15 | ~71.8% | Catch-up across five landings, 09-15 → 10-06: the cache reclaims expired entries on read; background loops get their own threads (a **startup hang on ≤ 3 CPUs**, found by reading std rather than by a test); **P1.5** pending cap; TC=1 never cached and hits echo client casing; **P3.5/P3.6 EDNS0 + TCP**; **P2.6** systemd unit and dual-stack. Then the Zig 0.17 port. Tests → 208/208 (173 unit, 35 integration). **P2.7 rescoped** from rate limiting to a client allowlist: behind home NAT amplification does not apply, but the shipped `::` listener can be reached over IPv6 |
 | 2026-09-11 | ~58.8% | **P2.1 local-file blocklist source.** `VORTEX_BLOCKLIST_SOURCE` / `VORTEX_SUFFIX_BLOCKLIST_SOURCE` take a URL *or* a path, resolved by scheme through a new `Source` union; the old `_URL` names are a fatal error naming the replacement, not a silent fall back to the default list. Acquisition split from parsing in both blocklists (`load` / `build`), which gave two zero-coverage logic files their first tests. Tests → 131/131, 104 → 113 behavior tests, four mutation-checked. **The point of the pass is a precondition removed, not a feature added:** P2.5's harness has been the largest gap for five snapshots and was blocked on exactly this. Findings: the `*.`-prefix footgun was documented in three files and verified in none (now a test), and `Writer.Allocating.initOwnedSlice` silently yields an empty `written()` — a third independent route to "loads clean, blocks nothing" |
 | 2026-09-08 | ~57.9% | Housekeeping sweep: `parseRdata` fixed + 7 tests, `refAllDecls` guards on all 16 modules, `root.zig` and its module deleted. Tests → 122/122. Bought one new property — `zig build test` now type-checks `main` — and correctly moved the number very little, because compiling is not testing |
 | 2026-09-05 | ~50.2% | P3.2 upstream record parsing: [resource_record.zig](../src/dns/resource_record.zig), a pull-based iterator wired into `dispatcherLoop` as a read-only observer — the name reader's first datapath caller. Tests → 69/69 (66 real), second fuzz target. **Two guards from the plan were not built** (TC=1 and QDCOUNT≠1 skips). The pass's real value was again a *finding*: **`parseRdata` does not compile** and four merged PRs plus CI never noticed, because nothing calls it. Lazy analysis, round two — and this time `zig build` does not catch it either |

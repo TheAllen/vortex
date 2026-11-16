@@ -3,6 +3,17 @@
 Reviewed **2026-09-15** against the current source (Zig 0.16.0, `zig build test` →
 **163/163 pass** — 147 unit tests, of which 127 are real behavior tests, plus **16
 integration cases**). *Updated 2026-09-27: 166/166 — 149 unit, 17 integration.*
+*Updated 2026-11-15: builds on Zig 0.17.1 (ported 10-06); 208/208 — 173 unit, 35 integration.*
+
+**2026-11-15: P2.7 rescoped to the deployment Vortex is meant for, a home network.**
+Behind a home router's NAT, nothing on the internet can reach port 53 unless the port is
+forwarded. Faking source addresses from inside the LAN needs an attacker already on it. So
+the amplification threat that made per-client rate limiting a gate does not apply. **What
+does apply is IPv6.** The shipped unit listens on `::`, the host usually has a globally
+routable address, and whether port 53 is reachable from outside then depends only on the
+router's IPv6 firewall. P2.7 is now a **client allowlist**, which makes "home network only"
+something Vortex enforces itself rather than something the router config happens to
+provide. Rate limiting is deferred. See [P2.7](#p2--production-operability).
 
 **2026-09-27: background loops now get threads of their own.** Spawning them with
 `group.async` made Vortex hang at startup on any host with ≤ 3 CPUs, and serialized every
@@ -396,10 +407,69 @@ process itself.
    - **sd_notify readiness** (`Type=notify`), so dependants wait for loaded lists rather
      than for `exec`. Small, and pairs with P2.4's shutdown work.
    - **launchd**, if macOS ever becomes a target.
-7. **Rate limiting / abuse controls.** Any resolver reachable beyond localhost needs
-   per-client rate limiting (and ideally Response Rate Limiting) so it can't be conscripted
-   into DNS amplification. Pairs with, but is separate from, the process-level backpressure
-   in P1.5.
+7. **Client allowlist — rescoped 2026-11-15** from "rate limiting / abuse controls". The
+   original entry read: *"Any resolver reachable beyond localhost needs per-client rate
+   limiting (and ideally Response Rate Limiting) so it can't be conscripted into DNS
+   amplification."* That holds for a resolver the internet can reach. Vortex is meant for a
+   home network, where the router's NAT already blocks it.
+
+   **The threat that remains is accidental exposure.** Either a port forward, or, more
+   likely, IPv6. The shipped [vortex.env](../deploy/systemd/vortex.env) listens on `::`. On
+   IPv6 the host normally has a globally routable address that NAT does not hide, so port 53
+   is reachable from outside whenever the router's IPv6 firewall allows inbound traffic. Most
+   consumer routers block it by default; some ISP-supplied ones do not. Today "home only"
+   holds because of router config, and the only guard in this repo is a comment in the env
+   file.
+
+   **Plan:**
+   - `VORTEX_ALLOW_CLIENTS`, a comma-separated list of address ranges. The default is
+     `local`: loopback, RFC 1918, link-local (169.254/16, fe80::/10), CGNAT (100.64/10) and
+     ULA (fc00::/7). `any` turns the check off.
+   - **Checked in the ingress loop, first,** before the oversize FORMERR and before the dupe.
+     For TCP it is checked at accept, and the connection is closed before it takes a
+     `ConnTable` slot.
+   - **A client outside the list is dropped, not answered REFUSED.** No reply reaches an
+     address we have not agreed to talk to, which is the same rule P1.5 follows. Dropped
+     datagrams are counted and logged by the sweeper at most once a second, like `takeShed`.
+   - **IPv4-mapped addresses are unwrapped before matching.** A `::` listener sees IPv4
+     clients as `::ffff:a.b.c.d`, and those must match the IPv4 ranges.
+   - **The matching is pure** (parse the list, test an address), so it is unit-tested without
+     an `Io`. Integration cases: with the list set to `10.0.0.0/8`, a loopback UDP query gets
+     no reply and a TCP connection is closed; under the default, loopback is still served.
+     Mutation-check each rule.
+
+   **Decided 2026-11-15: DNS is advertised over IPv4 only, so `local` stays as specified.**
+   The question was what happens to clients that query from a global IPv6 address. If the
+   router advertises Vortex by its global address, clients use their own global addresses as
+   the source, and the `local` default drops them.
+
+   The target network was checked. DHCPv4 hands out the router (`192.168.1.1`). Router
+   advertisements hand out the router again, by a *global* IPv6 address, and that one is
+   listed first. Clients have only link-local and global IPv6 addresses, with no ULA. So
+   there is no private IPv6 address Vortex could be advertised under.
+
+   **The deployment therefore points DHCPv4 at Vortex's LAN address and turns off the
+   router's IPv6 DNS advertisement.** Clients keep IPv6 for everything else and resolve over
+   IPv4, which the `local` default covers, and nothing depends on the ISP's prefix. This is
+   also required for blocking to work at all. While the router advertises its own IPv6 DNS,
+   clients prefer it and bypass Vortex entirely. That is documented in the README under
+   "Pointing your network at Vortex."
+
+   **Not taken, and the follow-up if ever needed:** advertising Vortex's global IPv6 address.
+   That means adding the delegated prefix to the list by hand, which silently breaks DNS when
+   the ISP changes the prefix. The robust version has `local` include the prefixes of the
+   host's own interfaces, which needs interface enumeration that `std.Io.net` may not
+   expose.
+
+   **Deferred: per-client rate limiting.** Inside a LAN, its only job would be fairness, so
+   one buggy or compromised device cannot crowd out the rest. The process itself is already
+   protected by the P1.5 pending cap and the TCP connection cap. Worth building only if
+   Vortex is ever meant to serve beyond a home network. The design sketched on 2026-11-15
+   would then still apply:
+   - a fixed-size table of per-client token buckets, owned by the ingress thread, so it
+     needs no lock
+   - clients keyed by IPv4 /32 or IPv6 /64, with IPv4-mapped addresses unwrapped first
+   - drop over the limit, with an optional TC=1 "slip" reply to send real clients to TCP
 
 ---
 
