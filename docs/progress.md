@@ -11,6 +11,84 @@ are stated explicitly below so the number can be argued with rather than just qu
 
 ---
 
+## Snapshot — 2026-11-22
+
+> **≈ 73.3% complete** (71.8 → 73.3). One landing: P2.7, the client allowlist, merged to
+> `main` as PR #15.
+>
+> Source: 8,779 lines of Zig across 21 files in `src/` (+475, one new file:
+> `utils/allowed_clients.zig`), plus 2,506 lines in `tests/` (+121). `zig build test` →
+> **222/222 pass**, a 184-test unit suite plus **38 integration cases**, on both Zig 0.17.1
+> and 0.16.0 (the CI pin). Debug only; ReleaseSafe was not re-run for this snapshot.
+>
+> **`main` is not in that state.** PR #15 merged at `25871fb`. Two fixes found after it went
+> up are in `daf2c4e` on `feat/client-allowlist` and not yet on `main`: a malformed
+> `VORTEX_ALLOW_CLIENTS` fell back to `local` instead of refusing to start, and
+> `allowed_clients.zig` failed `zig fmt --check`. On `main`, the fail-to-start integration
+> case hangs rather than fails, and CI's fmt step fails. The figures above are for
+> `daf2c4e`.
+>
+> What moved the number:
+> - **Operability, ~58% → ~64%** (+1.5). `VORTEX_ALLOW_CLIENTS`, defaulting to `local`,
+>   checked first at UDP ingress and at TCP accept, before a connection takes a slot.
+> - **Tests + CI, unchanged at ~94%.** Ten more unit tests and three more integration cases,
+>   but this pass also found two gaps in the suite itself; see below.
+>
+> **The sentence this retires is "P2.7 is the only thing between Vortex and a bind off
+> localhost."** Nothing on the board now blocks serving a home network. What is left before
+> doing it for real is closing P2.7 out (mutation checks, changelog) and running the unit on
+> an actual systemd host.
+
+### Breakdown
+
+| Area | Weight | Done | Contribution | Notes |
+|---|---:|---:|---:|---|
+| Core query datapath | 30% | ~99% | 29.7 | Unchanged. Still the hard-coded 5 s deadline and 1 s sweep |
+| Operability | 25% | ~64% | 16.0 | **+6.** P2.7 client allowlist, with IPv4-mapped addresses unwrapped so a `::` listener matches IPv4 ranges, and denials counted and logged once a tick. Open: the per-query event and counters, graceful shutdown, CLI flags, sd_notify, and running the unit on a real systemd host |
+| Protocol completeness | 20% | ~85% | 17.0 | Unchanged. Open: P3.7 multi-upstream / DoT, planned together with P4.3 |
+| Sinkhole feature set | 15% | ~8% | 1.2 | Unchanged. P4.1, P4.3–P4.6 untouched. Now the area that holds the total down most |
+| Tests + CI | 10% | ~94% | 9.4 | Unchanged. 161 behavior tests (from 151) and 38 integration cases (from 35), but P2.7's rules are not mutation-checked yet, and the two harness gaps below are open |
+| **Total** | **100%** | | **≈ 73.3** | |
+
+**Counted exactly: 184 = 161 behavior tests + 21 `refAllDecls` guards + 1 aggregator + 1
+no-op.** Regenerated from `grep '^test '` per file, not hand-edited.
+
+### The finding worth keeping
+
+**A fail-loud regression showed up as a hang, not a failure.** The bug was one line:
+`envAllowedClients` logged the bad item and then returned the default, so Vortex started
+under `local` instead of refusing to. The integration case written for exactly that rule
+should have caught it. Instead it hung the whole suite, because `harness.runUntilExit` reads
+the child's stderr to EOF *before* its 15 s bounded wait. A child that does not exit never
+closes stderr, so the read blocks forever and the bound never applies.
+
+The hang had been there since 11-15. A filtered run of that very case from that day was
+still alive a week later, with its `vortex` child still bound. **"The suite did not finish"
+had been read as "the suite is slow."** That is the same trap `waitBounded` was written to
+close, met at a different point in the same function. It matters most for mutation runs: a
+mutation that breaks a fail-to-start rule hangs instead of failing, so it confirms nothing.
+
+### What did not move, and why
+
+**Tests + CI stayed at ~94%** because this pass found two new gaps for every one it closed:
+
+- **`runUntilExit` has no bound on its stderr drain.** Every fail-to-start case (this one
+  and P2.2's fail-closed) hangs rather than fails on regression. The fix is a deadline on
+  the drain that kills the child once it passes. Not done.
+- **Local `zig fmt` is not CI's `zig fmt`.** 0.17.1's formatter rewrites
+  `@intFromEnum`/`@enumFromInt` into `@backingInt`/`@fromBackingInt`, which 0.16.0 does not
+  have. So a local check flags seven files that are fine, and `zig fmt .` would break the
+  CI build. The one real failure only shows under 0.16.0. Either check with a 0.16 toolchain,
+  or move CI and `minimum_zig_version` to 0.17 and drop the dual-version `build.zig` shim.
+- **The three gaps from 09-12 are still open:** no case runs two UDP queries at once, the
+  supervisor is unreachable from outside the process, and the harness still picks the listen
+  port by binding port 0 and releasing it.
+
+**The docs caught up.** The "Suggested order" section in `next_steps.md`, stale since
+September, was rewritten against the current board.
+
+---
+
 ## Snapshot — 2026-11-15
 
 > **≈ 71.8% complete** (62.4 → 71.8). The largest move since caching, made of five landings
@@ -553,6 +631,11 @@ The headline number smooths over a discontinuity that matters more than any perc
 > control.** P2.7 is now a client allowlist, defaulting to local ranges, which makes "home
 > network only" something Vortex enforces.
 >
+> **Status 2026-11-22: the allowlist landed** (PR #15). With the default `local`, a client
+> outside loopback, RFC 1918, link-local, CGNAT and ULA gets no reply over UDP, and its TCP
+> connection is closed at accept. The IPv6 edge case above is now covered by Vortex itself
+> rather than by the router.
+>
 > The text below is the 08-09 original with its 09-19 correction, kept for the reasoning. Read
 > "bind off localhost" there as "reachable from the internet."
 
@@ -660,9 +743,9 @@ Worth keeping as a reminder that a guard rail credited in advance is not a guard
 verified.
 
 ### → ~55%: make it deployable — the highest-value block on the board
-Eight items, and together they're the difference between a toy and a tool. **Six are now
-done**: P2.1, the P1.1–P1.4/P4.2 datapath group, P2.5, P2.2, P1.5 and P2.6. That leaves two,
-P2.7 and P2.4:
+Eight items, and together they're the difference between a toy and a tool. **Seven are now
+done**: P2.1, the P1.1–P1.4/P4.2 datapath group, P2.5, P2.2, P1.5, P2.6 and P2.7. That
+leaves one, P2.4:
 
 | Item | Why it's on the critical path |
 |---|---|
@@ -672,7 +755,7 @@ P2.7 and P2.4:
 | ~~**P2.2 blocklist cache + refresh**~~ ✅ 09-13 | Topped this list for one pass and came off it, like the harness before it. The 404 that proved it was fixed by swapping in another hard-coded URL, which re-armed the same trap against a different host — one that rate-limits; that class is now closed by retry + cache + a fail policy, not by picking a better URL |
 | ~~**P1.5 in-flight cap**~~ ✅ 09-28 | `VORTEX_MAX_PENDING`, drop past it. Scope corrected 09-19: the bound belongs on `PendingTable` occupancy, not on spawned handlers, because the runtime already caps those. Its startup-hang prerequisite landed 09-27 |
 | ~~P2.6 bind + service unit~~ ✅ 10-06 | Linux/systemd. Hardened unit, `[::]:53` dual-stack, bind errors that name the cause. Not yet run on a real systemd host; launchd not done |
-| **P2.7 client allowlist** | **Now the top of this list.** Rescoped 11-15 from rate limiting: behind home NAT, amplification does not apply, but the shipped `::` listener is reachable over IPv6 if the router's firewall lets it through. Rate limiting is deferred unless Vortex is ever meant to serve beyond a LAN |
+| ~~**P2.7 client allowlist**~~ ✅ 11-22 | `VORTEX_ALLOW_CLIENTS`, default `local`, checked at UDP ingress and TCP accept. Rescoped 11-15 from rate limiting: behind home NAT, amplification does not apply, but the shipped `::` listener is reachable over IPv6 if the router's firewall lets it through. Rate limiting is deferred unless Vortex is ever meant to serve beyond a LAN |
 | P2.4 graceful shutdown | Currently the only exit is a crash or Ctrl-C mid-write. Also unblocks SIGHUP refresh and pairs with sd_notify |
 
 Note the shape of this: it moves completion by ~20 points but moves **utility from zero to
