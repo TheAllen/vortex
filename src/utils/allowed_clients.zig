@@ -304,6 +304,16 @@ test "parse expands local, adds ranges after it, and masks host bits" {
     // `192.0.2.7/24` is stored as `192.0.2.0/24`.
     try testing.expect(a.allows(ip("192.0.2.200")));
     try testing.expect(!a.allows(ip("192.0.3.1")));
+
+    // The case where masking is load-bearing: a boundary *inside* a byte that
+    // carries host bits. Above, the host byte lies wholly past the prefix and
+    // is never compared, so an unmasked range would still match. Here
+    // `198.51.100.7/20` must be stored as `198.51.96.0/20`, or the partial-byte
+    // compare (`addr & 0xF0` against an unmasked 100) fails for every client.
+    const b = try AllowedClients.parse("198.51.100.7/20", null);
+    try testing.expect(b.allows(ip("198.51.96.0")));
+    try testing.expect(b.allows(ip("198.51.100.7")));
+    try testing.expect(!b.allows(ip("198.51.112.0")));
 }
 
 test "a bare address is one host, and a prefix that is not a byte boundary still works" {

@@ -585,26 +585,50 @@ pub fn runUntilExit(io: Io, gpa: std.mem.Allocator, opts: Options) !ExitResult {
     });
     errdefer child.kill(io);
 
-    // Drained before the wait, not after. The child's stderr is a pipe, and
-    // waiting on a process that is still writing into a pipe nobody is reading
-    // deadlocks once the buffer fills — the same trap `stopChild` documents,
-    // arrived at from the other direction. This drain also *is* the exit
-    // signal: the read hits EOF when the child's last stderr handle closes.
+    // Drained *while* waiting, on a task of its own. The child's stderr is a
+    // pipe, and waiting on a process that is still writing into a pipe nobody
+    // is reading deadlocks once the buffer fills — the same trap `stopChild`
+    // documents, arrived at from the other direction. But draining *before*
+    // the wait, as this once did, is unbounded the other way: a child that
+    // never exits never closes stderr, so the read blocks forever and
+    // `waitBounded` is never reached. That is how a broken fail-loud rule
+    // (P2.7, 2026-11-22) hung the suite instead of failing it. Concurrently,
+    // the timeout kills the child, the kill closes the pipe, and the drain
+    // ends on EOF.
     var stderr: std.ArrayList(u8) = .empty;
     errdefer stderr.deinit(gpa);
-    if (child.stderr) |file| {
-        var chunk: [4096]u8 = undefined;
-        while (true) {
-            const n = file.readStreaming(io, &.{&chunk}) catch break;
-            if (n == 0) break;
-            try stderr.appendSlice(gpa, chunk[0..n]);
-        }
+    var drain: ?Io.Future(DrainError!void) = if (child.stderr) |file|
+        try io.concurrent(drainInto, .{ io, gpa, file, &stderr })
+    else
+        null;
+    errdefer if (drain) |*f| f.cancel(io) catch {};
+
+    const term = try waitBounded(io, &child);
+    if (drain) |f| {
+        // Taken by value and the optional cleared first, so the errdefer
+        // above cannot cancel a future that has already been awaited.
+        var future = f;
+        drain = null;
+        try future.await(io);
     }
 
     return .{
-        .term = try waitBounded(io, &child),
+        .term = term,
         .stderr = try stderr.toOwnedSlice(gpa),
     };
+}
+
+const DrainError = std.mem.Allocator.Error;
+
+/// Reads `file` to EOF into `out`. A read error ends the drain like EOF does:
+/// whatever was captured is still the best evidence of why the child died.
+fn drainInto(io: Io, gpa: std.mem.Allocator, file: Io.File, out: *std.ArrayList(u8)) DrainError!void {
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = file.readStreaming(io, &.{&chunk}) catch return;
+        if (n == 0) return;
+        try out.appendSlice(gpa, chunk[0..n]);
+    }
 }
 
 /// Longest `runUntilExit` waits for a child that is supposed to be dying.
