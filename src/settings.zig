@@ -29,6 +29,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 const obs_log = @import("obs/log.zig");
+const AllowedClients = @import("utils/allowed_clients.zig").AllowedClients;
 
 const Environ = std.process.Environ;
 
@@ -200,6 +201,16 @@ pub const Settings = struct {
     /// honest answer when there is a TCP listener to retry against.
     max_tcp_conns: usize,
 
+    /// Which clients are answered at all (P2.7); see
+    /// [utils/allowed_clients.zig](utils/allowed_clients.zig). A datagram from
+    /// anywhere else is dropped unanswered, and a TCP connection is closed
+    /// before it takes a slot.
+    ///
+    /// Defaults to `local` (loopback, RFC 1918, link-local, CGNAT, ULA), so a
+    /// listener that is reachable from the internet by accident, typically
+    /// over IPv6, still answers no one there.
+    allowed_clients: AllowedClients,
+
     pub const defaults: Settings = .{
         .listen_host = "127.0.0.1",
         .listen_port = 5354,
@@ -244,6 +255,8 @@ pub const Settings = struct {
         // Comfortably more than a home network's resolvers will hold open at
         // once — TCP is the fallback path for truncated answers, not the norm.
         .max_tcp_conns = 64,
+
+        .allowed_clients = AllowedClients.local,
     };
 
     /// Environment file consulted when `VORTEX_ENV_FILE` is unset. Missing is
@@ -275,6 +288,9 @@ pub const Settings = struct {
         InvalidMaxPending,
         /// `VORTEX_BLOCKLIST_ON_FAILURE` was set to something that isn't a policy.
         InvalidFailurePolicy,
+        /// `VORTEX_ALLOW_CLIENTS` had an item that isn't `local`, `any`, an
+        /// address or `address/len`, held too many ranges, or held none.
+        InvalidAllowClients,
         /// A variable that no longer exists under that name is still set. See
         /// `renamed`.
         RenamedSetting,
@@ -360,6 +376,7 @@ pub const Settings = struct {
                 defaults.handler_threads,
             .max_pending = try envMaxPending(environ),
             .max_tcp_conns = try envCount(environ, "VORTEX_MAX_TCP_CONNS", defaults.max_tcp_conns),
+            .allowed_clients = try envAllowedClients(environ),
         };
     }
 
@@ -379,6 +396,30 @@ pub const Settings = struct {
             return error.InvalidMaxPending;
         }
         return n;
+    }
+
+    /// Fail-loud like every other setting, and naming the one item at fault:
+    /// a list that silently fell back to `local` would be fine, but one that
+    /// fell back to *nothing* would lock every client out with no clue why.
+    fn envAllowedClients(environ: *const Environ.Map) ParseError!AllowedClients {
+        const key = "VORTEX_ALLOW_CLIENTS";
+        const raw = environ.get(key) orelse return defaults.allowed_clients;
+        if (raw.len == 0) return defaults.allowed_clients;
+        var bad: []const u8 = raw;
+        return AllowedClients.parse(raw, &bad) catch |err| {
+            switch (err) {
+                error.InvalidRange => log.err(
+                    "{s}: '{s}' is not local, any, an address, or address/prefix-length",
+                    .{ key, bad },
+                ),
+                error.TooManyRanges => log.err(
+                    "{s}: more than {d} ranges (local counts as {d})",
+                    .{ key, AllowedClients.max_ranges, AllowedClients.local_ranges.len },
+                ),
+                error.EmptyList => log.err("{s}: '{s}' lists no clients at all", .{ key, raw }),
+            }
+            return defaults.allowed_clients;
+        };
     }
 
     /// Same fail-loud contract as `envPort`: silently falling back to the
@@ -874,6 +915,29 @@ test "fromEnviron rejects the pre-rename blocklist variables" {
     // empty the load succeeds.
     try map.put("VORTEX_SUFFIX_BLOCKLIST_URL", "");
     _ = try Settings.fromEnviron(&map);
+}
+
+test "fromEnviron reads allowed_clients, defaulting to local" {
+    var map = Environ.Map.init(testing.allocator);
+    defer map.deinit();
+    const ip = std.Io.net.IpAddress;
+
+    // Unset and explicitly empty both mean the default.
+    const unset = (try Settings.fromEnviron(&map)).allowed_clients;
+    try testing.expect(unset.allows(try ip.parse("192.168.1.2", 0)));
+    try testing.expect(!unset.allows(try ip.parse("1.1.1.1", 0)));
+    try map.put("VORTEX_ALLOW_CLIENTS", "");
+    try testing.expect(!(try Settings.fromEnviron(&map)).allowed_clients.allows(try ip.parse("1.1.1.1", 0)));
+
+    try map.put("VORTEX_ALLOW_CLIENTS", "10.0.0.0/8");
+    const custom = (try Settings.fromEnviron(&map)).allowed_clients;
+    try testing.expect(custom.allows(try ip.parse("10.1.1.1", 0)));
+    try testing.expect(!custom.allows(try ip.parse("192.168.1.2", 0)));
+
+    try map.put("VORTEX_ALLOW_CLIENTS", "local,10.0.0.0/40");
+    try testing.expectError(error.InvalidAllowClients, Settings.fromEnviron(&map));
+    try map.put("VORTEX_ALLOW_CLIENTS", ",");
+    try testing.expectError(error.InvalidAllowClients, Settings.fromEnviron(&map));
 }
 
 // One line of guard per container. `refAllDecls` is shallow and 0.16.0 has no

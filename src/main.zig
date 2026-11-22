@@ -24,6 +24,7 @@ const SuffixBlockList = @import("blocklist/suffix_blocklist.zig").SuffixBlockLis
 const Question = @import("dns/question.zig").Question;
 const edns = @import("dns/edns.zig");
 const ConnTable = @import("utils/conn_table.zig").ConnTable;
+const Gate = @import("utils/allowed_clients.zig").Gate;
 
 /// Every `std.log.*` call in the process — ours and the standard library's —
 /// renders through [obs/log.zig](obs/log.zig).
@@ -480,6 +481,13 @@ fn tcpAcceptLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
             },
         };
 
+        // P2.7: before the connection takes a slot, so clients we do not
+        // serve cannot fill the table and lock out the ones we do.
+        if (!ctx.client_gate.admit(io, stream.socket.address)) {
+            stream.close(io);
+            continue;
+        }
+
         const slot = tcp.conns.claim(io) orelse {
             std.log.debug("refusing tcp connection: {d} already open (VORTEX_MAX_TCP_CONNS)", .{tcp.conns.slots.len});
             stream.close(io);
@@ -632,6 +640,15 @@ fn sweeperLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
             shed,
             ctx.pending_table.max_pending,
         });
+
+        // Same once-a-tick shape as the shed count, for the same reason. The
+        // address is there so an operator can spot a LAN client the list
+        // misses, such as one querying from a global IPv6 address.
+        const denied = ctx.client_gate.takeDenied(io);
+        if (denied.count > 0) if (denied.last) |last| std.log.warn(
+            "denied {d} queries or connections from outside VORTEX_ALLOW_CLIENTS, most recently from {f}",
+            .{ denied.count, last },
+        );
 
         // TCP connections ride the same tick: a connection that has not
         // completed a message in `tcp_idle_ns` is cancelled, which is the only
@@ -1094,6 +1111,9 @@ pub fn main(init: std.process.Init) !void {
         .{ .http_client = &http_client, .cfg = &cfg };
     if (refresher == null) std.log.info("blocklist refresh disabled (VORTEX_BLOCKLIST_REFRESH_SECS=0)", .{});
 
+    var client_gate = Gate.init(cfg.allowed_clients);
+    if (cfg.allowed_clients.any) std.log.warn("VORTEX_ALLOW_CLIENTS includes any: answering every client that can reach this host", .{});
+
     var ctx = Context.init(
         &client_socket,
         &upstream_socket,
@@ -1106,6 +1126,7 @@ pub fn main(init: std.process.Init) !void {
         if (refresher) |*r| r else null,
     );
     ctx.tcp = if (tcp) |*t| t else null;
+    ctx.client_gate = &client_gate;
     // 1232 only when there is a TCP listener to retry against; see
     // `Context.edns_udp_size`.
     ctx.edns_udp_size = if (tcp_enabled) edns.advertised_udp_size else edns.no_tcp_udp_size;
@@ -1140,6 +1161,11 @@ pub fn main(init: std.process.Init) !void {
         };
 
         const incoming_addr: std.Io.net.IpAddress = incoming.from;
+
+        // P2.7: first, before anything below can send. A client outside the
+        // list gets no reply of any kind, not even the oversize FORMERR, since
+        // its source address may be forged and nothing should reach it.
+        if (!client_gate.admit(io, incoming_addr)) continue;
 
         // The query was larger than `buffer` and its tail is gone. Parsing the
         // prefix would mean acting on a question we only half received, so this
@@ -1204,6 +1230,7 @@ test {
     _ = @import("blocklist/policy.zig");
     _ = @import("utils/pending_table.zig");
     _ = @import("utils/conn_table.zig");
+    _ = @import("utils/allowed_clients.zig");
     _ = @import("utility.zig");
     _ = @import("obs/log.zig");
     _ = @import("settings.zig");

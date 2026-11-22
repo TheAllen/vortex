@@ -101,6 +101,11 @@ pub const Options = struct {
 
     /// Which address Vortex listens on, and which a case reaches it over.
     listen: Listen = .ip4_loopback,
+
+    /// `VORTEX_ALLOW_CLIENTS`. Null leaves the binary's default, `local`, which
+    /// covers loopback, so every case that is not about the allowlist runs
+    /// under the shipped default.
+    allow_clients: ?[]const u8 = null,
 };
 
 /// The listening address a case runs Vortex on (P2.6).
@@ -157,6 +162,11 @@ pub const Readiness = enum {
     /// Query any name; ready when it shows up at the fake upstream. For a child
     /// running with an empty blocklist, where nothing is answered locally.
     forwarded_probe,
+    /// `blocked_probe`, sent from `::1` instead of the case's own family. For
+    /// a P2.7 case whose client is deliberately outside the allowlist, so the
+    /// probe has to come from an address that is inside it. Needs a listener
+    /// that `::1` can reach: `ip6_loopback` or `dual_stack`.
+    ip6_blocked_probe,
 };
 
 pub const Instance = struct {
@@ -465,13 +475,16 @@ pub const Instance = struct {
         // readiness was already established — lands here and is discarded with
         // the socket, rather than sitting in the case's client socket waiting
         // to be mistaken for the reply it is asserting on.
-        const probe_bind = self.listen.clientBind();
+        const probe_bind: Io.net.IpAddress, const probe_target: Io.net.IpAddress = switch (readiness) {
+            .blocked_probe, .forwarded_probe => .{ self.listen.clientBind(), self.listen_addr },
+            .ip6_blocked_probe => .{ .{ .ip6 = .loopback(0) }, .{ .ip6 = .loopback(self.listen_addr.getPort()) } },
+        };
         const probe = try probe_bind.bind(self.io, .{ .mode = .dgram, .protocol = .udp });
         defer probe.close(self.io);
 
         var out: [wire.max_message]u8 = undefined;
         const name = switch (readiness) {
-            .blocked_probe => ready_probe_name,
+            .blocked_probe, .ip6_blocked_probe => ready_probe_name,
             .forwarded_probe => forwarded_probe_name,
         };
         const msg = wire.query(&out, 0x0BEE, name, .{});
@@ -484,10 +497,10 @@ pub const Instance = struct {
             // the probe is *resent* each round rather than sent once and waited
             // on, which is also why this loop cannot be replaced by one long
             // receive.
-            probe.send(self.io, &self.listen_addr, msg) catch {};
+            probe.send(self.io, &probe_target, msg) catch {};
 
             switch (readiness) {
-                .blocked_probe => {
+                .blocked_probe, .ip6_blocked_probe => {
                     const got = probe.receiveTimeout(self.io, &in, durationTimeout(probe_interval_ms)) catch |err| switch (err) {
                         error.Timeout => continue,
                         // Nothing is bound on that port yet and the kernel bounced the
@@ -748,6 +761,9 @@ fn writeEnvFile(io: Io, gpa: std.mem.Allocator, tmp: *testing.TmpDir, fields: En
     }
     if (fields.opts.max_tcp_conns) |n| {
         try body.print(gpa, "VORTEX_MAX_TCP_CONNS={d}\n", .{n});
+    }
+    if (fields.opts.allow_clients) |list| {
+        try body.print(gpa, "VORTEX_ALLOW_CLIENTS={s}\n", .{list});
     }
 
     try tmp.dir.writeFile(io, .{ .sub_path = "vortex.env", .data = body.items });
