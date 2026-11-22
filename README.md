@@ -5,8 +5,8 @@ async runtime. Point a resolver at it and ad/tracker domains come back as
 `0.0.0.0` / `::`; everything else is forwarded upstream.
 
 **Status: works, but it is a learning project, not a product.** The query path is
-complete and tested; the operational surface around it (config reload, metrics,
-graceful shutdown) largely is not. See
+complete and tested; the operational surface around it (config reload, metrics)
+largely is not. See
 [Where it actually stands](#where-it-actually-stands) before deploying it anywhere.
 
 ---
@@ -178,9 +178,11 @@ To see what a device was given (macOS: `scutil --dns | grep nameserver`; Linux:
 `resolvectl status`; Windows: `ipconfig /all`): only Vortex's IPv4 address should
 be listed.
 
-Config changes need `systemctl restart vortex`; there is no reload. Stopping is
-a plain SIGTERM with no drain (graceful shutdown is P2.4), so queries in flight
-at that moment are lost and their clients retry.
+Config changes need `systemctl restart vortex`. `systemctl reload vortex` (or
+`kill -HUP`) refreshes the blocklists right away without restarting, but does not
+re-read the config. Stopping (SIGTERM or SIGINT) is clean: every loop is
+cancelled, everything is freed, the process exits 0 and logs `stopped` last.
+Queries in flight at that moment are dropped and their clients retry.
 
 ## How it works
 
@@ -298,7 +300,7 @@ daily by default — and a refresh that would empty a list which currently has
 entries is refused rather than installed, because that is what a 200 OK serving
 an error page looks like by the time it reaches the parser.
 
-The gap is everything around the datapath: graceful shutdown, metrics and rate
+The gap is everything around the datapath: metrics, config reload and rate
 limiting. EDNS0 and TCP landed 2026-09-28; a systemd unit and IPv6 listening
 (P2.6) on 2026-10-06; the client allowlist (P2.7) on 2026-11-22. [`docs/next_steps.md`](docs/next_steps.md) is the full
 prioritized board.

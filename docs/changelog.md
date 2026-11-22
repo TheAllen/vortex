@@ -9,6 +9,76 @@ Newest first. Open work lives in [next_steps.md](next_steps.md).
 
 ---
 
+## Landed 2026-11-22 — P2.4: graceful shutdown and SIGHUP refresh
+
+**SIGTERM and SIGINT now shut Vortex down cleanly.** Before this, the only exit was a crash or
+a signal's default action, which ends the process mid-write. Now the process logs
+`shutting down signal=TERM`, cancels every loop and connection, frees everything, logs
+`stopped`, and exits 0. `stopped` comes from the first `defer` in `main`, so it is written only
+after every other deferred cleanup has run.
+
+**SIGHUP refreshes the blocklists at once.** `systemctl reload vortex` sends it, through a new
+`ExecReload` in the unit. It does not re-read settings, which still need a restart. With refresh
+disabled (`VORTEX_BLOCKLIST_REFRESH_SECS=0`), SIGHUP is logged and ignored. Before this,
+SIGHUP's default action killed the process.
+
+**Shape.** [signals.zig](../src/utils/signals.zig) installs one handler for all three signals.
+**The handler only stores to atomics**, because a signal can land on any thread mid-anything,
+including inside a `std.Io` call that holds a lock. Logging, cancelling and waking the refresher
+all happen on the main thread, which `main` gave a new job: the UDP ingress loop, formerly the
+tail of `main`, is now a task in the group like every other loop. The main thread polls the
+signal flags every 100 ms. On stop it returns, and the existing deferred `group.cancel` ends the
+blocked `receive` along with everything else. The handler is installed before the blocklist
+fetch, so a SIGHUP during a slow startup no longer kills it. A SIGTERM there is held until the
+first poll.
+
+**Queries in flight are dropped, not drained.** A client retries a lost datagram in about a
+second, and a restart stays instant. Decided 2026-11-22.
+
+**The 0.16 trap.** The refresher first waited on an `Io.Event` with a timeout, which SIGHUP set.
+The suite passed under 0.17.1 and hung under 0.16.0, the CI pin. Under 0.16,
+`Event.waitTimeout` honoured neither its timeout nor cancellation, so `group.cancel` waited for
+the refresher forever. The refresher now sleeps in 250 ms steps against an atomic flag, and
+`io.sleep` is cancellable on both. **Run the suite under the CI toolchain, not only the local
+one:** this would have shipped green.
+
+**The harness trap.** `Child.kill`, which every case's teardown used, sends SIGTERM and then
+waits. Until now that was a kill. After P2.4 it is a request Vortex handles, so a broken
+shutdown would hang every case's teardown, not just the shutdown cases: the mutation that
+ignores a stop request hung the whole suite exactly this way. `stopChild` now sends SIGKILL by
+pid first. Shutdown is tested by `signalAndWait`, which is bounded, not by teardown.
+
+**Tests:** 2 unit tests in `signals.zig` (calling the handler directly, since a real SIGTERM to
+the test runner would kill it) and 4 integration cases, which signal a real child:
+- SIGTERM with a TCP connection open: exit 0, both lines, in order
+- SIGINT: exit 0
+- SIGHUP with an hour-long interval: the new list is live within the poll, and the process is
+  still there to stop
+- SIGHUP with refresh disabled: logged, ignored, still serving
+
+The harness gained `signal`, `signalAndWait` (drains stderr while it waits, bounded like
+`runUntilExit`), a per-case `log_level`, and a SIGKILL in teardown (below). *239/239 — 193 unit, 46 integration*, on Zig
+0.16.0 and 0.17.1.
+
+**Mutation-checked: 10 mutations, all killed**, each run against the full suite and reverted:
+
+| Rule broken | Killed by |
+|---|---|
+| The handler is never installed | all four signal cases (SIGTERM and SIGINT end the process by their default action, SIGHUP kills it) |
+| The main loop ignores a stop request | all four signal cases, once `stopChild` stopped relying on SIGTERM; before that fix, this mutation hung the suite |
+| SIGHUP not recorded | both SIGHUP cases and the `signals` unit test |
+| SIGINT not mapped to stop | the SIGINT case and the `signals` unit test |
+| A stop request is not sticky | both shutdown cases and the `signals` unit test |
+| The main thread never raises the reload flag / the refresher ignores it | the SIGHUP-refresh case |
+| `stopped` is never logged | the SIGTERM case |
+| Shutdown exits non-zero | all four signal cases |
+| The shutdown line names no signal | the SIGTERM case and the `signals` unit test |
+
+**Not done here:** draining queries in flight, re-reading settings on SIGHUP, and sd_notify,
+which still pairs with running the unit on a real host (P2.6).
+
+---
+
 ## Landed 2026-11-22 — P4.1: blocked-response strategy
 
 **A blocked name now gets an answer chosen by query type.** `VORTEX_BLOCK_RESPONSE` picks
