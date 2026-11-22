@@ -24,8 +24,7 @@ are stated explicitly below so the number can be argued with rather than just qu
 > both Zig 0.17.1 and 0.16.0 (the CI pin). Debug only; ReleaseSafe was not re-run for this
 > snapshot.
 >
-> P4.1 and P2.4 are on `main` (PRs #18, #19). **P2.3 phase 2 is not yet**: it and this
-> snapshot are on `feat/query-log`, and the figures above are for that branch.
+> All three are on `main`: P4.1, P2.4 and P2.3 phase 2 as PRs #18, #19 and #20.
 >
 > What moved the number:
 > - **Sinkhole, ~8% → ~28%** (+3.0). P4.1: a blocked A gets `0.0.0.0` and a blocked AAAA
@@ -50,12 +49,12 @@ are stated explicitly below so the number can be argued with rather than just qu
 | Operability | 25% | ~80% | 19.9 | **+16.** P2.4: SIGTERM/SIGINT exit 0 after full cleanup, SIGHUP refreshes the lists, `ExecReload` in the unit. P2.3: one `debug` record per query with real fields, and a `stats` line a minute at `info`. Open: running the unit on a real systemd host, sd_notify, CLI flags, a metrics endpoint, orphan/eviction counters, config reload |
 | Protocol completeness | 20% | ~85% | 17.0 | Unchanged. Open: P3.7 multi-upstream / DoT, planned together with P4.3 |
 | Sinkhole feature set | 15% | ~28% | 4.2 | **+20.** P4.1, the blocked-response strategy per qtype. Open: P4.3 failover, P4.4 local records, P4.5 list footprint, P4.6 the observability surface, which P2.3 is now the base for |
-| Tests + CI | 10% | ~95% | 9.5 | **+1.** 177 behavior tests (from 161) and 50 integration cases (from 38). 54 mutations across the four landings, all killed but one equivalent. The three 09-12 gaps are still open; see below |
+| Tests + CI | 10% | ~95% | 9.5 | **+1.** 176 behavior tests (from 161) and 50 integration cases (from 38). 54 mutations across the four landings, all killed but one equivalent. The three 09-12 gaps are still open; see below |
 | **Total** | **100%** | | **≈ 80.3** | |
 
-**Counted exactly: 201 = 177 behavior tests + 23 `refAllDecls` guards + 1 aggregator.**
-Recounted by what each guard calls, not by test name: some guards carry a doc comment, and a
-name-only count misses them. The 11-22 split above (21 guards + 1 no-op) was one guard short.
+**Counted exactly: 201 = 176 behavior tests + 23 `refAllDecls` guards + 1 aggregator + 1
+no-op** (`main.zig`'s "initialize sockets", whose only check is a `debug.assert`). Regenerated
+per file in [Where the code actually is](#where-the-code-actually-is).
 
 ### The finding worth keeping
 
@@ -858,46 +857,51 @@ DNS" — the branch [next_steps.md](next_steps.md) flags at the end of its Sugge
 
 ## Where the code actually is
 
-Regenerated from `wc -l` and `grep '^test '` on 2026-11-15. Test counts exclude each
-file's `refAllDecls` guard, so this column is **behavior tests only**: it sums to 151, not
-the 173 the unit runner reports.
+Regenerated from `wc -l` and `grep '^test '` on 2026-11-22. Test counts exclude each
+file's `refAllDecls` guard, `main.zig`'s aggregator and its one no-op, so this column is
+**behavior tests only**: it sums to 176, not the 201 the unit runner reports.
 
 ```
-src/ — 8,304 lines of Zig, 20 files
+src/ — 9,765 lines of Zig, 23 files
 
-src/dns/cache.zig                1362  key + context, entry, map, TTL policy         35 tests
-src/main.zig                     1264  ingress, decide, dispatcher, TCP, supervisor   2 tests  <- +1 no-op, +1 aggregator
-src/settings.zig                  887  runtime config: .env parse, precedence, Source 11 tests
-src/dns/resource_record.zig       623  RR walk, iterator, rdata types                17 tests
-src/obs/log.zig                   494  logfmt logFn, escaping writer, level + format  8 tests
-src/blocklist/acquire.zig         457  fetch, retry, on-disk list cache               5 tests
-src/utils/pending_table.zig       448  proxy-ID table, cap, sweeper, question hash    8 tests
-src/dns/header.zig                412  parse, validateQuery, reply builders           9 tests
-src/dns/name_reader.zig           377  name reading, pointer following               17 tests
-src/blocklist/policy.zig          347  generations behind an RwLock, decide chain     6 tests
-src/dns/blocked_response.zig      258  NXDOMAIN+SOA(+OPT) assembly, BADVERS           6 tests
-src/dns/edns.zig                  254  OPT find/parse, clamp, cache class             9 tests  <- new 09-28
-src/blocklist/domain_blocklist.zig 230 exact-match list, URL or file                  3 tests
-src/utils/conn_table.zig          229  TCP connection slots, idle cancel              4 tests  <- new 09-28
-src/blocklist/suffix_blocklist.zig 180 parent-label walk, URL or file                 4 tests
-src/dns/question.zig              119  QName parse, lowercasing                       4 tests
-src/utility.zig                   103  Context, Refresher, Tcp                        0 tests
-src/blocklist/allowlist.zig        99  comptime allowlist                             1 test
-src/utils/backoff.zig              92  shared backoff schedule                        2 tests
-src/dns/authority.zig              69  34-byte synthetic SOA                          0 tests
+src/main.zig                      1488  ingress, decide, dispatcher, TCP, signals      2 tests  <- +1 no-op, +1 aggregator
+src/dns/cache.zig                 1362  key + context, entry, map, TTL policy         35 tests
+src/settings.zig                   983  runtime config: .env parse, precedence, Source 13 tests
+src/obs/log.zig                    652  logfmt logFn, escaping writer, level + format 12 tests
+src/dns/resource_record.zig        623  RR walk, iterator, rdata types                17 tests
+src/dns/blocked_response.zig       482  null-IP/NODATA/NXDOMAIN plan + assembly       11 tests
+src/blocklist/acquire.zig          457  fetch, retry, on-disk list cache               5 tests
+src/utils/pending_table.zig        455  proxy-ID table, cap, sweeper, question hash    8 tests
+src/dns/header.zig                 412  parse, validateQuery, reply builders           9 tests
+src/utils/allowed_clients.zig      389  client allowlist: ranges, parse, Gate          9 tests  <- new 11-22
+src/dns/name_reader.zig            377  name reading, pointer following               17 tests
+src/blocklist/policy.zig           347  generations behind an RwLock, decide chain     6 tests
+src/dns/edns.zig                   254  OPT find/parse, clamp, cache class             9 tests
+src/blocklist/domain_blocklist.zig 230  exact-match list, URL or file                  3 tests
+src/utils/conn_table.zig           229  TCP connection slots, idle cancel              4 tests
+src/obs/query_event.zig            225  per-query record, verdicts, counters           3 tests  <- new 11-22
+src/blocklist/suffix_blocklist.zig 180  parent-label walk, URL or file                 4 tests
+src/utils/signals.zig              125  SIGINT/SIGTERM/SIGHUP to atomic flags          2 tests  <- new 11-22
+src/dns/question.zig               119  QName parse, lowercasing                       4 tests
+src/utility.zig                    116  Context, Refresher, Tcp                        0 tests
+src/blocklist/allowlist.zig         99  comptime allowlist                             1 test
+src/utils/backoff.zig               92  shared backoff schedule                        2 tests
+src/dns/authority.zig               69  34-byte synthetic SOA                          0 tests
 
-tests/ — 2,385 lines of Zig, 3 files
+tests/ — 2,916 lines of Zig, 3 files
 
-tests/integration.zig            1214  the 35 end-to-end cases                       35 tests
-tests/harness.zig                 833  child process, fake upstream, scratch config   0 tests
-tests/wire.zig                    338  independent DNS encode/decode for assertions   0 tests
+tests/integration.zig             1629  the 50 end-to-end cases                       50 tests
+tests/harness.zig                  938  child process, fake upstream, scratch config   0 tests
+tests/wire.zig                     349  independent DNS encode/decode for assertions   0 tests
 ```
 
-*Since 09-12, `policy.zig` has gone from 50 lines and zero tests to 347 lines and six. It is
-off the "logic with no tests" list, which leaves only `utility.zig` and `authority.zig`.
-Both carry very little. `main.zig` has nearly doubled and is now level with `cache.zig`,
-mostly from TCP. Putting P2.7's limiter in its own module would keep `main.zig` from growing
-further.*
+*11-22: `main.zig` is the largest file again, at 1,488 lines, past `cache.zig`. P2.4 moved
+the ingress loop into a function of its own, and P2.3 threaded a `Meta` through `decide` and a
+record into each place a query completes. What it did not gain is the logic: the allowlist,
+the signal flags and the record format each went into a module of their own, pure-first and
+tested there (`allowed_clients.zig`, `signals.zig`, `query_event.zig`), which is what the
+11-15 note asked of P2.7. `utility.zig` and `authority.zig` are still the only files with no
+behavior tests, and both still carry very little.*
 
 `tests/` is a second artifact with its own root, and it must be: it deliberately does **not**
 link `main`. `wire.zig` shares no code with `src/dns` for the same reason the golden-bytes
