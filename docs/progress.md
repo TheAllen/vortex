@@ -11,6 +11,83 @@ are stated explicitly below so the number can be argued with rather than just qu
 
 ---
 
+## Snapshot — 2026-11-22 (pm)
+
+> **≈ 80.3% complete** (73.3 → 80.3). The largest single-day move on this board: the P2.7
+> closeout and three landings, P4.1, P2.4 and P2.3 phase 2, each mutation-checked as it
+> landed. The per-item targets were fixed in the morning, before any of the work, so this
+> number was not scored after the fact.
+>
+> Source: 9,765 lines of Zig across 23 files in `src/` (+986, two new files:
+> `utils/signals.zig` and `obs/query_event.zig`), plus 2,916 lines in `tests/` (+410).
+> `zig build test` → **251/251 pass**, a 201-test unit suite plus **50 integration cases**, on
+> both Zig 0.17.1 and 0.16.0 (the CI pin). Debug only; ReleaseSafe was not re-run for this
+> snapshot.
+>
+> P4.1 and P2.4 are on `main` (PRs #18, #19). **P2.3 phase 2 is not yet**: it and this
+> snapshot are on `feat/query-log`, and the figures above are for that branch.
+>
+> What moved the number:
+> - **Sinkhole, ~8% → ~28%** (+3.0). P4.1: a blocked A gets `0.0.0.0` and a blocked AAAA
+>   gets `::` (60 s TTL), every other type NODATA, and `VORTEX_BLOCK_RESPONSE` picks
+>   `nodata` or `nxdomain` instead.
+> - **Operability, ~64% → ~80%** (+3.9). P2.4, graceful shutdown and SIGHUP refresh (+2.0).
+>   P2.3 phase 2, the per-query record (+1.6) and once-a-minute counters (+0.3 of a planned
+>   +0.5: logged only, with no orphan or eviction counts and no endpoint to read them from).
+> - **Tests + CI, ~94% → ~95%** (+0.1). The P2.7 closeout: its 16 mutations, and the
+>   `runUntilExit` hang fixed.
+>
+> **The sentence this retires is "the sinkhole band is the area that holds the total down
+> most."** It still does, at ~28%, but it now has the feature that makes Vortex a sinkhole
+> rather than a forwarder that says NXDOMAIN. And the deployability block is done: all eight
+> items, with P2.4 the last.
+
+### Breakdown
+
+| Area | Weight | Done | Contribution | Notes |
+|---|---:|---:|---:|---|
+| Core query datapath | 30% | ~99% | 29.7 | Unchanged. Still the hard-coded 5 s deadline and 1 s sweep |
+| Operability | 25% | ~80% | 19.9 | **+16.** P2.4: SIGTERM/SIGINT exit 0 after full cleanup, SIGHUP refreshes the lists, `ExecReload` in the unit. P2.3: one `debug` record per query with real fields, and a `stats` line a minute at `info`. Open: running the unit on a real systemd host, sd_notify, CLI flags, a metrics endpoint, orphan/eviction counters, config reload |
+| Protocol completeness | 20% | ~85% | 17.0 | Unchanged. Open: P3.7 multi-upstream / DoT, planned together with P4.3 |
+| Sinkhole feature set | 15% | ~28% | 4.2 | **+20.** P4.1, the blocked-response strategy per qtype. Open: P4.3 failover, P4.4 local records, P4.5 list footprint, P4.6 the observability surface, which P2.3 is now the base for |
+| Tests + CI | 10% | ~95% | 9.5 | **+1.** 177 behavior tests (from 161) and 50 integration cases (from 38). 54 mutations across the four landings, all killed but one equivalent. The three 09-12 gaps are still open; see below |
+| **Total** | **100%** | | **≈ 80.3** | |
+
+**Counted exactly: 201 = 177 behavior tests + 23 `refAllDecls` guards + 1 aggregator.**
+Recounted by what each guard calls, not by test name: some guards carry a doc comment, and a
+name-only count misses them. The 11-22 split above (21 guards + 1 no-op) was one guard short.
+
+### The finding worth keeping
+
+**Run the suite under the CI toolchain, not just the local one.** P2.4 passed 239/239 on
+0.17.1 and hung on 0.16.0. Under 0.16, `Io.Event.waitTimeout` honours neither its timeout nor
+cancellation, so a refresher waiting on it could never be cancelled, and every shutdown hung.
+Nothing about the code looked wrong; only the other toolchain showed it. The same day turned
+up three more 0.16/0.17 differences, all in std: the formatter rewrites builtins that 0.16
+lacks, `std.meta.fields` is a compile error in 0.17, and `std.builtin.Type.Struct` changed
+shape. **Supporting two toolchains is a cost paid on every change**, which strengthens the
+11-22 case for moving CI to 0.17.
+
+**A shutdown feature changes what teardown means.** `Child.kill`, which every case used to
+clean up, sends SIGTERM. Until P2.4 that was a kill. After it, SIGTERM is a request Vortex can
+fail to honour, and the mutation that ignored it hung the whole suite rather than failing four
+cases. The fix was a SIGKILL in teardown, with shutdown tested only where it is meant to be,
+under a bound. It is the third time this board has met the same trap, a wait with no bound
+(after `waitBounded` on 09-12 and the stderr drain this morning).
+
+### What did not move, and why
+
+**Nothing has run on a real network yet.** Step 1 of the suggested order, the systemd unit
+on a live host, is still undone, and P4.1's `null_ip` default was chosen without real traffic
+to test it against. Both are cheap in points and worth more than they score.
+
+**Tests + CI gained one point, not more.** The three gaps from 09-12 are still open: no case
+runs two UDP queries at once, the supervisor is unreachable from outside the process, and the
+harness still picks the listen port by binding port 0 and releasing it. The `stats` event is
+tested in parts, not end to end, because its one-minute window is too long for a case.
+
+---
+
 ## Snapshot — 2026-11-22
 
 > **≈ 73.3% complete** (71.8 → 73.3). One landing: P2.7, the client allowlist, merged to
@@ -743,9 +820,8 @@ Worth keeping as a reminder that a guard rail credited in advance is not a guard
 verified.
 
 ### → ~55%: make it deployable — the highest-value block on the board
-Eight items, and together they're the difference between a toy and a tool. **Seven are now
-done**: P2.1, the P1.1–P1.4/P4.2 datapath group, P2.5, P2.2, P1.5, P2.6 and P2.7. That
-leaves one, P2.4:
+Eight items, and together they're the difference between a toy and a tool. **All eight are
+done** as of 2026-11-22, P2.4 last:
 
 | Item | Why it's on the critical path |
 |---|---|
@@ -756,7 +832,7 @@ leaves one, P2.4:
 | ~~**P1.5 in-flight cap**~~ ✅ 09-28 | `VORTEX_MAX_PENDING`, drop past it. Scope corrected 09-19: the bound belongs on `PendingTable` occupancy, not on spawned handlers, because the runtime already caps those. Its startup-hang prerequisite landed 09-27 |
 | ~~P2.6 bind + service unit~~ ✅ 10-06 | Linux/systemd. Hardened unit, `[::]:53` dual-stack, bind errors that name the cause. Not yet run on a real systemd host; launchd not done |
 | ~~**P2.7 client allowlist**~~ ✅ 11-22 | `VORTEX_ALLOW_CLIENTS`, default `local`, checked at UDP ingress and TCP accept. Rescoped 11-15 from rate limiting: behind home NAT, amplification does not apply, but the shipped `::` listener is reachable over IPv6 if the router's firewall lets it through. Rate limiting is deferred unless Vortex is ever meant to serve beyond a LAN |
-| P2.4 graceful shutdown | Currently the only exit is a crash or Ctrl-C mid-write. Also unblocks SIGHUP refresh and pairs with sd_notify |
+| ~~P2.4 graceful shutdown~~ ✅ 11-22 | SIGTERM/SIGINT exit 0 after full cleanup; SIGHUP refreshes the lists. sd_notify, which it pairs with, is still open under P2.6 |
 
 Note the shape of this: it moves completion by ~20 points but moves **utility from zero to
 most of the way there**. It is the single most underweighted block if you judge by the
@@ -774,7 +850,7 @@ is the deployability block below plus the sinkhole band — which is a better po
 percentage suggests, because that block moves *utility* far more than it moves this number.
 
 ### → beyond: the sinkhole band
-P4.1 (per-qtype strategy), P4.4 (local records / conditional forwarding), P4.6 (observability
+~~P4.1 (per-qtype strategy)~~ ✅ 2026-11-22, P4.4 (local records / conditional forwarding), P4.6 (observability
 surface). Optional depending on whether the goal is "a real blackhole" or "keep learning
 DNS" — the branch [next_steps.md](next_steps.md) flags at the end of its Suggested order.
 

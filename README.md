@@ -5,8 +5,8 @@ async runtime. Point a resolver at it and ad/tracker domains come back as
 `0.0.0.0` / `::`; everything else is forwarded upstream.
 
 **Status: works, but it is a learning project, not a product.** The query path is
-complete and tested; the operational surface around it (config reload, metrics)
-largely is not. See
+complete and tested; the operational surface around it (config reload, a
+metrics endpoint) largely is not. See
 [Where it actually stands](#where-it-actually-stands) before deploying it anywhere.
 
 ---
@@ -184,6 +184,25 @@ re-read the config. Stopping (SIGTERM or SIGINT) is clean: every loop is
 cancelled, everything is freed, the process exits 0 and logs `stopped` last.
 Queries in flight at that moment are dropped and their clients retry.
 
+### Seeing what it does
+
+At the shipped `info` level, Vortex logs a summary once a minute, with no
+per-device data:
+
+```
+ts=… level=info scope=stats window_s=60 queries=812 block=97 hit=430 forward=281 reject=0 timeout=4 servfail=0 dropped=0 shed=0
+```
+
+Set `VORTEX_LOG_LEVEL=debug` and every query also gets one record, with the
+client, name, type, verdict, rcode and latency as separate fields:
+
+```
+ts=… level=debug scope=query client="192.168.1.20:51734" transport=udp qname="ads.example.com" qtype=1 verdict=block rcode=0 latency_us=41
+```
+
+Those records say which device looked up which site. Turn them on when you need
+them, and off again.
+
 ## How it works
 
 ```
@@ -300,8 +319,8 @@ daily by default — and a refresh that would empty a list which currently has
 entries is refused rather than installed, because that is what a 200 OK serving
 an error page looks like by the time it reaches the parser.
 
-The gap is everything around the datapath: metrics, config reload and rate
-limiting. EDNS0 and TCP landed 2026-09-28; a systemd unit and IPv6 listening
+The gap is everything around the datapath: config reload, a metrics endpoint
+and rate limiting. EDNS0 and TCP landed 2026-09-28; a systemd unit and IPv6 listening
 (P2.6) on 2026-10-06; the client allowlist (P2.7) on 2026-11-22. [`docs/next_steps.md`](docs/next_steps.md) is the full
 prioritized board.
 

@@ -9,6 +9,76 @@ Newest first. Open work lives in [next_steps.md](next_steps.md).
 
 ---
 
+## Landed 2026-11-22 — P2.3 phase 2: the per-query record and counters
+
+**Every query now gets exactly one record, with real fields.**
+
+```
+ts=… level=debug scope=query client="192.168.1.20:51734" transport=udp qname="ads.example.com" qtype=1 verdict=block rcode=0 latency_us=41
+```
+
+`verdict` is `block`, `hit`, `forward`, `reject`, `timeout` or `servfail`. Before this, the
+`query` scope carried `verdict=… qname=…` as text inside `msg`, with no client, type or latency,
+and an allowed name logged twice (once at the policy, again at the cache).
+
+**At `debug`, because it is personal data.** The record says which device looked up which
+site. Under the shipped `info` it is never written. What `info` gets instead is a `stats` event
+once a minute, skipped when idle, with no per-device data: `queries`, then one count per
+verdict, plus `dropped` (datagrams that got neither a reply nor a record) and `shed` (forwards
+refused at the pending cap). Decided 2026-11-22.
+
+**Written where a query's fate is known, once.** A local answer (block, cache hit, rejection)
+is recorded in `decide`, which now takes a `Meta` with the client and the receive time. A
+forward carries its qname, qtype and start time in `Forward`, and over UDP in `PendingQuery`.
+Its record is written by whatever completes it: the dispatcher (`forward`), the sweeper's
+deadline (`timeout`), or the TCP path (`forward` or `servfail`). A shed forward gets a count and
+no record. One line per refused datagram is exactly what P1.5 avoids during a flood.
+
+**`log.zig` gained events.** `event(.debug, .query, .{ … })` writes each field of a struct
+literal as a logfmt pair. Integers and enum tags are written bare. Strings and anything with a
+`format` method, such as an `IpAddress`, are quoted and go through the same `EscapingWriter` as
+`msg`, so a hostile qname still cannot forge a record or a field. The text format writes the
+same pairs after `level(scope):`. `scope=query` now means only these records: the one other
+line in that scope, an upstream record dump, moved to `scope=upstream`.
+
+**Two 0.16/0.17 differences, both at compile time.** `std.meta.fields` is a compile error in
+0.17, and `std.builtin.Type.Struct` changed shape, so `@typeInfo(T).@"struct".fields` fails
+there. `std.meta.fieldNames` is the spelling both accept.
+
+**Tests:** 7 unit tests (exact event bytes; a hostile qname rendered to the exact escaped
+bytes; an address quoted; the text form; every counter and `take`; latency clamped; `rcodeOf`)
+and 4 integration cases against a real child at `debug`:
+- a blocked, a forwarded and a cached query get exactly one record each, with every field
+  present, none as `msg`, and the forward's latency the round trip rather than the uptime
+- an unanswered forward is recorded as `timeout` with rcode 2
+- a blocked and a forwarded TCP query are each recorded with `transport=tcp`
+- at `info`, no `scope=query` line is written at all
+
+*251/251 — 201 unit, 50 integration*, on Zig 0.16.0 and 0.17.1.
+
+**Mutation-checked: 14 mutations, 13 killed, 1 equivalent**, each run against the full suite
+and reverted:
+
+| Rule broken | Killed by |
+|---|---|
+| The block record / the cache-hit record is not written | the three-query case (and the TCP case, for the block) |
+| A forward recorded under the wrong verdict, or with an rcode not read from the reply | the three-query case |
+| A timeout recorded as a forward | the timeout case |
+| A TCP forward recorded as UDP | **survived at first.** The TCP case only sent a blocked query, which `decide` records, never reaching the TCP handler's own record. It now forwards one too |
+| Records written at `info` | the `info`-level case |
+| Strings written unescaped | the hostile-qname unit test |
+| Numbers quoted | the exact-bytes unit test, and every integration case that matches `qtype=1` |
+| A hit counted as a block / `take` not resetting | the counters unit test |
+| The start time / the qname not carried into the pending entry | the three-query case (latency bound, qname match) and the timeout case |
+| Latency clamp `<=` → `<` | **equivalent**: at equal times the subtraction already gives 0, so no test can tell them apart |
+
+**Not done here:** counters for orphan replies and cache evictions, a separate upstream-latency
+figure, and any way to read the counters other than the log (a metrics endpoint). The
+`stats` event itself is checked by the unit tests on its parts, not end to end, since its
+one-minute window is too long for an integration case.
+
+---
+
 ## Landed 2026-11-22 — P2.4: graceful shutdown and SIGHUP refresh
 
 **SIGTERM and SIGINT now shut Vortex down cleanly.** Before this, the only exit was a crash or

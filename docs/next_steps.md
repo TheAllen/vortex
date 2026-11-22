@@ -58,6 +58,11 @@ last), and SIGHUP refreshes the blocklists at once; `systemctl reload vortex` se
 [changelog.md](changelog.md#landed-2026-11-22--p24-graceful-shutdown-and-sighup-refresh).
 *239/239 — 193 unit, 46 integration*, on Zig 0.16.0 and 0.17.1.
 
+**2026-11-22: P2.3 phase 2 landed** — one `debug` record per query with real fields, and
+once-a-minute counters at `info`; see
+[changelog.md](changelog.md#landed-2026-11-22--p23-phase-2-the-per-query-record-and-counters).
+*251/251 — 201 unit, 50 integration*, on Zig 0.16.0 and 0.17.1.
+
 **P2.2 blocklist resilience landed 2026-09-13**, and with it the last of the two
 deployability blockers that were not about load. A failed fetch is retried, falls back to an
 on-disk copy, and — if even that is missing — resolves against a configurable
@@ -285,11 +290,12 @@ process itself.
    renders as a logfmt record with escaping that no call site can bypass, and level/format
    are runtime knobs ([obs/log.zig](../src/obs/log.zig); see
    [changelog.md](changelog.md#landed-2026-08-10--p23-structured-logging-phase-1)).
-   **Still open:** the per-query event carrying ts, client, qname, qtype, verdict, rcode and
-   latency as *real fields* rather than a formatted `msg` body, and counters — total /
-   blocked / forwarded / orphan responses / sweep evictions / upstream latency. The choke
-   points already exist: `Policy.decide`, `appendQuery`/`complete`, the orphan branch in
-   `dispatcherLoop`.
+   ~~**Still open:** the per-query event and counters.~~ **Phase 2 done 2026-11-22**: one
+   `debug` record per query with client, transport, qname, qtype, verdict, rcode and latency
+   as real fields, and once-a-minute counters at `info`; see
+   [changelog.md](changelog.md#landed-2026-11-22--p23-phase-2-the-per-query-record-and-counters).
+   Not done: orphan replies and cache evictions as counters, and upstream latency as its own
+   figure rather than per record. P4.6 builds on this.
 4. ~~**Graceful shutdown.**~~ **Done 2026-11-22**, with SIGHUP refresh; see
    [changelog.md](changelog.md#landed-2026-11-22--p24-graceful-shutdown-and-sighup-refresh).
    The original entry: *"No signal handling; the only exit is a crash or Ctrl-C mid-write.
@@ -752,10 +758,8 @@ expect it to find something.
 **2. ~~Graceful shutdown (P2.4).~~** ✅ 2026-11-22, with the SIGHUP-triggered blocklist
 refresh. Step 1 now has a `systemctl reload` to check as well as `stop`.
 
-**3. P2.3 phase 2: the per-query event and counters.** One record per query with client,
-qname, qtype, verdict, rcode and latency as real fields, plus total / blocked / forwarded /
-orphan / eviction counters. Once Vortex is serving a real network this is how you find out
-what it is doing, and it is the base P4.6 builds on.
+**3. ~~P2.3 phase 2: the per-query event and counters.~~** ✅ 2026-11-22. Step 1's real
+traffic can now be read from the log: `scope=stats` at `info`, `scope=query` at `debug`.
 
 **4. ~~P4.1 blocked-response strategy.~~** ✅ 2026-11-22, done ahead of steps 1–3. The
 default is `null_ip`, decided without step 1's real traffic. If devices misbehave on

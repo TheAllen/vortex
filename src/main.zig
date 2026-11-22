@@ -26,6 +26,8 @@ const edns = @import("dns/edns.zig");
 const ConnTable = @import("utils/conn_table.zig").ConnTable;
 const Gate = @import("utils/allowed_clients.zig").Gate;
 const signals = @import("utils/signals.zig");
+const query_event = @import("obs/query_event.zig");
+const Name = @import("dns/name_reader.zig").Name;
 
 /// Every `std.log.*` call in the process — ours and the standard library's —
 /// renders through [obs/log.zig](obs/log.zig).
@@ -39,11 +41,10 @@ pub const std_options: std.Options = .{
     .logFn = obs_log.logFn,
 };
 
-/// Per-query verdicts, scoped so they can be filtered apart from operational
-/// diagnostics. `debug` because this is one record per DNS query on the
-/// network; P2.3's query log is what will carry these as real fields
-/// (client, qtype, latency) on a level an operator can leave on.
-const query_log = std.log.scoped(.query);
+/// Detail about upstream answers, at `debug`. Its own scope so `scope=query`
+/// means exactly one thing: the per-query records from
+/// [obs/query_event.zig](obs/query_event.zig) (P2.3).
+const upstream_log = std.log.scoped(.upstream);
 
 fn addrBind(io: std.Io, addr: *const std.Io.net.IpAddress, what: []const u8) !std.Io.net.Socket {
     return addr.bind(io, .{ .mode = .dgram, .protocol = .udp }) catch |err| {
@@ -95,7 +96,7 @@ fn initSockets(io: std.Io, cfg: Settings) !struct {
 
 /// How a query arrived, which decides how large a reply it can take: over UDP,
 /// what its OPT advertises (512 without one); over TCP, a full 64 KiB.
-const Transport = enum { udp, tcp };
+const Transport = query_event.Transport;
 
 /// What the datapath decided to do with one query. Shared by both transports,
 /// which differ only in how they carry the bytes and how they forward.
@@ -109,13 +110,45 @@ const Outcome = union(enum) {
     forward: Forward,
 };
 
+/// Who asked, and when: what a query's record needs that the bytes do not
+/// carry (P2.3).
+const Meta = struct {
+    transport: Transport,
+    client: std.Io.net.IpAddress,
+    /// On the `boot` clock, as soon as the query was in hand.
+    started_ns: i96,
+};
+
 const Forward = struct {
     client_id: u16,
     /// One past the question section, as `parseQuestion` returned it.
     q_end: usize,
     /// The requester's EDNS class — the cache partition its answer belongs to.
     class: edns.Class,
+    /// For the record written when the forward completes (P2.3). Copied, since
+    /// the parsed question does not outlive `decide`.
+    qname: Name,
+    qtype: u16,
+    started_ns: i96,
 };
+
+/// Writes the record for a query answered locally.
+fn emitLocal(io: std.Io, meta: Meta, qname: []const u8, qtype: u16, verdict: query_event.Verdict, reply: []const u8) void {
+    query_event.emit(io, .{
+        .client = meta.client,
+        .transport = meta.transport,
+        .qname = qname,
+        .qtype = qtype,
+        .verdict = verdict,
+        .rcode = query_event.rcodeOf(reply),
+        .started_ns = meta.started_ns,
+    });
+}
+
+/// The current `boot` time, which every latency is measured on.
+fn bootNow(io: std.Io) i96 {
+    return std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds;
+}
 
 /// Validates a query and decides its fate: drop, answer locally, or forward.
 ///
@@ -138,9 +171,12 @@ fn decide(
     ctx: *const Context,
     data: []u8,
     out: []u8,
-    transport: Transport,
+    meta: Meta,
 ) std.Io.Cancelable!Outcome {
-    if (data.len < 12) return .drop;
+    if (data.len < 12) {
+        query_event.countDropped();
+        return .drop;
+    }
 
     var header = Header{};
     header.parseHeader(data[0..12]);
@@ -152,14 +188,19 @@ fn decide(
         // they get an answer — header-only, since their question section is
         // exactly what we could not trust.
         std.log.debug("rejecting query: {s}", .{@tagName(rejection)});
-        const rcode = rejection.rcode() orelse return .drop;
+        const rcode = rejection.rcode() orelse {
+            query_event.countDropped();
+            return .drop;
+        };
         out[0..12].* = Header.headerOnlyReply(data, rcode);
+        emitLocal(io, meta, "", 0, .reject, out[0..12]);
         return .{ .reply = out[0..12] };
     }
 
     var question = Question{};
     const q_end = question.parseQuestion(data, 12) catch |err| {
         std.log.debug("dropping malformed query: {s}", .{@errorName(err)});
+        query_event.countDropped();
         return .drop;
     };
 
@@ -172,6 +213,7 @@ fn decide(
         // locate with confidence. Header-only, like every other FORMERR.
         std.log.debug("FORMERR for {s}: {s}", .{ domain, @errorName(err) });
         out[0..12].* = Header.headerOnlyReply(data, .format_error);
+        emitLocal(io, meta, domain, question.qtype, .reject, out[0..12]);
         return .{ .reply = out[0..12] };
     };
     const our_opt: ?blocked_response.Opt = if (opt) |o|
@@ -188,14 +230,19 @@ fn decide(
         const reply = blocked_response.buildInto(out, data, q_end, .no_error, .{
             .soa = false,
             .opt = badvers,
-        }) catch return .drop;
+        }) catch {
+            query_event.countDropped();
+            return .drop;
+        };
+        emitLocal(io, meta, domain, question.qtype, .reject, reply);
         return .{ .reply = reply };
     };
 
     switch (try ctx.policy.decide(io, domain)) {
-        .allow => query_log.debug("verdict=allow qname={s}", .{domain}),
+        // Neither is final: an allowed or unlisted name still goes on to the
+        // cache and upstream, and its record is written where that ends.
+        .allow, .pass => {},
         .block => {
-            query_log.debug("verdict=block qname={s}", .{domain});
             // P4.1: a null-IP answer, NODATA or NXDOMAIN, by strategy and
             // qtype. The negative forms carry a synthetic SOA so the client can
             // cache the block. Our OPT goes on any of them if the query carried
@@ -207,11 +254,12 @@ fn decide(
                 .opt = our_opt,
             }) catch {
                 std.log.warn("dropping blocked reply for {s}: reply buffer too small", .{domain});
+                query_event.countDropped();
                 return .drop;
             };
+            emitLocal(io, meta, domain, question.qtype, .block, reply);
             return .{ .reply = reply };
         },
-        .pass => query_log.debug("verdict=pass qname={s}", .{domain}),
     }
 
     const class = edns.class(opt);
@@ -224,7 +272,7 @@ fn decide(
         // is the size check: an answer fetched over TCP, or for a client with a
         // larger EDNS buffer, is never squeezed down to — or silently cut to
         // fit — one that cannot take it.
-        const limit = switch (transport) {
+        const limit = switch (meta.transport) {
             .udp => @min(edns.replyLimit(opt), out.len),
             .tcp => out.len,
         };
@@ -240,7 +288,7 @@ fn decide(
             std.log.warn("cache hit for {s} unusable: {s}", .{ domain, @errorName(err) });
             break :serve;
         };
-        query_log.debug("verdict=hit qname={s} age={d}s", .{ domain, hit.age_secs });
+        emitLocal(io, meta, domain, question.qtype, .hit, served);
         return .{ .reply = served };
     }
 
@@ -249,7 +297,14 @@ fn decide(
     // unfragmented (1232) — or, with no TCP listener, within our buffer.
     if (opt) |o| edns.clampInPlace(data, o, ctx.edns_udp_size);
 
-    return .{ .forward = .{ .client_id = header.id, .q_end = q_end, .class = class } };
+    return .{ .forward = .{
+        .client_id = header.id,
+        .q_end = q_end,
+        .class = class,
+        .qname = question.qname,
+        .qtype = question.qtype,
+        .started_ns = meta.started_ns,
+    } };
 }
 
 /// Per-datagram task: decide, then answer or hand the query to upstream.
@@ -267,7 +322,8 @@ fn handleQuery(
     // a local answer never takes a pending slot.
     var out: [4096]u8 = undefined;
 
-    switch (try decide(io, ctx, data, &out, .udp)) {
+    const meta: Meta = .{ .transport = .udp, .client = incoming_addr, .started_ns = bootNow(io) };
+    switch (try decide(io, ctx, data, &out, meta)) {
         .drop => {},
         .reply => |reply| ctx.client_socket.send(io, &incoming_addr, reply) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
@@ -298,6 +354,9 @@ fn forwardUdp(
         .question_len = question_len,
         .edns = f.class,
         .expires_at = @intCast(std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds + 5 * std.time.ns_per_s),
+        .started_ns = f.started_ns,
+        .qname = f.qname,
+        .qtype = f.qtype,
     }) catch |err| switch (err) {
         // P1.5: at the cap, drop without a reply. Deliberately silent in both
         // directions — no log line per refusal (the sweeper reports a count),
@@ -305,7 +364,10 @@ fn forwardUdp(
         // and answering each packet reflects traffic at someone else, even
         // with no amplification. Local answers returned from `decide` before
         // this, so they are still given while the table is full.
-        error.TableFull => return,
+        error.TableFull => {
+            query_event.countShed();
+            return;
+        },
         else => {
             std.log.err("Failed to append query to Pending table: {s}", .{@errorName(err)});
             return;
@@ -318,6 +380,7 @@ fn forwardUdp(
         else => {
             _ = ctx.pending_table.complete(proxy_id);
             std.log.err("upstream send query failed: {s}", .{@errorName(err)});
+            query_event.countDropped();
         },
     };
 }
@@ -368,7 +431,7 @@ fn storeReply(
         walk_log: while (true) {
             const next = it.next() catch break :walk_log;
             const record = next orelse break :walk_log;
-            query_log.debug("record name={s} type={d} ttl={d}", .{ record.name.slice(), record.type, record.ttl });
+            upstream_log.debug("record name={s} type={d} ttl={d}", .{ record.name.slice(), record.type, record.ttl });
         }
     }
 
@@ -455,9 +518,19 @@ fn dispatcherLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
             error.Canceled => return error.Canceled,
             else => {
                 std.log.warn("client send failed: {s}", .{@errorName(err)});
+                query_event.countDropped();
                 continue;
             },
         };
+        query_event.emit(io, .{
+            .client = entry.client_addr,
+            .transport = .udp,
+            .qname = entry.qname.slice(),
+            .qtype = entry.qtype,
+            .verdict = .forward,
+            .rcode = query_event.rcodeOf(reply_msg.data),
+            .started_ns = entry.started_ns,
+        });
     }
 }
 
@@ -542,18 +615,33 @@ fn tcpConnection(io: std.Io, ctx: *const Context, stream: std.Io.net.Stream, slo
         slot.touch(io);
 
         const out = reply_buf[2..];
-        const reply: []const u8 = switch (decide(io, ctx, query, out, .tcp) catch return) {
+        const meta: Meta = .{ .transport = .tcp, .client = stream.socket.address, .started_ns = bootNow(io) };
+        const reply: []const u8 = switch (decide(io, ctx, query, out, meta) catch return) {
             // Over TCP a drop leaves the client waiting on a stream it owns, so
             // close it instead: that is an answer it can act on.
             .drop => return,
             .reply => |r| r,
-            .forward => |f| tcpForward(io, ctx, query, out, f) catch |err| switch (err) {
-                error.Canceled => return,
-                else => blk: {
-                    std.log.warn("tcp upstream: {s}", .{@errorName(err)});
-                    out[0..12].* = Header.synthesizedReply(f.client_id, .server_failure);
-                    break :blk out[0..12];
-                },
+            .forward => |*f| fwd: {
+                var verdict: query_event.Verdict = .forward;
+                const r = tcpForward(io, ctx, query, out, f.*) catch |err| switch (err) {
+                    error.Canceled => return,
+                    else => blk: {
+                        std.log.warn("tcp upstream: {s}", .{@errorName(err)});
+                        verdict = .servfail;
+                        out[0..12].* = Header.synthesizedReply(f.client_id, .server_failure);
+                        break :blk out[0..12];
+                    },
+                };
+                query_event.emit(io, .{
+                    .client = meta.client,
+                    .transport = .tcp,
+                    .qname = f.qname.slice(),
+                    .qtype = f.qtype,
+                    .verdict = verdict,
+                    .rcode = query_event.rcodeOf(r),
+                    .started_ns = f.started_ns,
+                });
+                break :fwd r;
             },
         };
 
@@ -623,6 +711,8 @@ fn sweeperLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
     // reclaiming memory. Every 30th tick keeps a full walk of a 10k-entry map
     // off the once-a-second path.
     const cache_sweep_ticks = 30;
+    // The P2.3 counters, once a minute, at `info`.
+    const stats_ticks = 60;
     var tick: usize = 0;
 
     while (true) {
@@ -632,6 +722,7 @@ fn sweeperLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
         try io.sleep(std.Io.Duration.fromSeconds(1), std.Io.Clock.boot);
 
         tick +%= 1;
+        if (tick % stats_ticks == 0) query_event.logSnapshot(query_event.take(), stats_ticks);
         if (tick % cache_sweep_ticks == 0) {
             if (ctx.cache) |cache| {
                 const now: i64 = @intCast(std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds);
@@ -673,7 +764,16 @@ fn sweeperLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
         // got nothing at all and had to wait out its own timeout; SERVFAIL lets
         // it fail fast and move to its next configured resolver.
         std.log.debug("sweeping {d} timed-out queries", .{evicted.items.len});
-        for (evicted.items) |entry| {
+        for (evicted.items) |*entry| {
+            query_event.emit(io, .{
+                .client = entry.client_addr,
+                .transport = .udp,
+                .qname = entry.qname.slice(),
+                .qtype = entry.qtype,
+                .verdict = .timeout,
+                .rcode = 2, // SERVFAIL, the reply below
+                .started_ns = entry.started_ns,
+            });
             const reply = Header.synthesizedReply(entry.client_id, .server_failure);
             ctx.client_socket.send(io, &entry.client_addr, &reply) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
@@ -1327,6 +1427,7 @@ test {
     _ = @import("utils/conn_table.zig");
     _ = @import("utils/allowed_clients.zig");
     _ = @import("utils/signals.zig");
+    _ = @import("obs/query_event.zig");
     _ = @import("utility.zig");
     _ = @import("obs/log.zig");
     _ = @import("settings.zig");
