@@ -8,6 +8,7 @@ const Settings = @import("settings.zig").Settings;
 const ConnTable = @import("utils/conn_table.zig").ConnTable;
 const edns = @import("dns/edns.zig");
 const Gate = @import("utils/allowed_clients.zig").Gate;
+const BlockResponse = @import("dns/blocked_response.zig").Strategy;
 
 /// The TCP listener and its connection table (P3.6), or absent when
 /// `VORTEX_MAX_TCP_CONNS=0`.
@@ -70,6 +71,9 @@ pub const Context = struct {
     /// Which clients are answered (P2.7). Checked by the UDP ingress loop and
     /// the TCP accept loop, and drained by the sweeper for its log line.
     client_gate: *Gate = undefined,
+
+    /// How a blocked name is answered (P4.1), from `VORTEX_BLOCK_RESPONSE`.
+    block_response: BlockResponse = .null_ip,
 
     pub fn init(
         client_socket: *const std.Io.net.Socket,

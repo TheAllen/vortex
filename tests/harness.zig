@@ -106,6 +106,9 @@ pub const Options = struct {
     /// covers loopback, so every case that is not about the allowlist runs
     /// under the shipped default.
     allow_clients: ?[]const u8 = null,
+
+    /// `VORTEX_BLOCK_RESPONSE`. Null leaves the binary's default, `null_ip`.
+    block_response: ?[]const u8 = null,
 };
 
 /// The listening address a case runs Vortex on (P2.6).
@@ -788,6 +791,9 @@ fn writeEnvFile(io: Io, gpa: std.mem.Allocator, tmp: *testing.TmpDir, fields: En
     }
     if (fields.opts.allow_clients) |list| {
         try body.print(gpa, "VORTEX_ALLOW_CLIENTS={s}\n", .{list});
+    }
+    if (fields.opts.block_response) |strategy| {
+        try body.print(gpa, "VORTEX_BLOCK_RESPONSE={s}\n", .{strategy});
     }
 
     try tmp.dir.writeFile(io, .{ .sub_path = "vortex.env", .data = body.items });

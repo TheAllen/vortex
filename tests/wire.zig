@@ -331,6 +331,17 @@ pub fn firstAnswerAddress(msg: []const u8, records_start: usize) ParseError![4]u
     return msg[records_start + 12 ..][0..4].*;
 }
 
+/// True when `msg` is Vortex's default reply for a blocked A query (P4.1):
+/// NOERROR, exactly one answer, `0.0.0.0`, and no SOA. What every case that
+/// only needs "this name was blocked" asserts, so a change of default is one
+/// edit here rather than one per case.
+pub fn isNullIpBlock(msg: []const u8) bool {
+    if (rcode(msg) != RCode.no_error or ancount(msg) != 1 or nscount(msg) != 0) return false;
+    const q_end = questionEnd(msg) catch return false;
+    const addr = firstAnswerAddress(msg, q_end) catch return false;
+    return std.mem.eql(u8, &addr, &[_]u8{ 0, 0, 0, 0 });
+}
+
 /// The A record's TTL, read out of the first answer at `records_start`.
 pub fn firstAnswerTtl(msg: []const u8, records_start: usize) ParseError!u32 {
     if (records_start + 16 > msg.len) return error.Malformed;

@@ -48,6 +48,11 @@ integration.* **Nothing on the board now blocks serving a home network.** What i
 doing it for real is running the unit on an actual systemd host (step 1 of the
 [suggested order](#suggested-order)).
 
+**2026-11-22: P4.1 landed** — a blocked A gets `0.0.0.0` and a blocked AAAA gets `::` (60 s
+TTL), every other type NODATA; `VORTEX_BLOCK_RESPONSE` picks `nodata` or `nxdomain` instead.
+See [changelog.md](changelog.md#landed-2026-11-22--p41-blocked-response-strategy).
+*232/232 — 190 unit, 42 integration.*
+
 **P2.2 blocklist resilience landed 2026-09-13**, and with it the last of the two
 deployability blockers that were not about load. A failed fetch is retried, falls back to an
 on-disk copy, and — if even that is missing — resolves against a configurable
@@ -599,7 +604,13 @@ real sinkhole (the Pi-hole / AdGuard Home / Unbound-`local-zone` feature class).
 **P4.2 (QDCOUNT/opcode validation) landed 2026-08-09** — see
 [changelog.md](changelog.md#p42--qdcount--opcode-validation-landed-2026-08-09).
 
-- **P4.1 — blocked-response strategy per qtype.** Today every block is NXDOMAIN regardless of
+- ~~**P4.1 — blocked-response strategy per qtype.**~~ **Done 2026-11-22**: `null_ip` by default
+  (`0.0.0.0` / `::` for A / AAAA, 60 s TTL, NODATA for every other type), `nodata` and
+  `nxdomain` by `VORTEX_BLOCK_RESPONSE`. See
+  [changelog.md](changelog.md#landed-2026-11-22--p41-blocked-response-strategy). The
+  original entry, which framed the choice:
+
+  Every block was NXDOMAIN regardless of
   query type. That is one legitimate strategy, but it has real downsides and a
   production sinkhole makes this a *choice*:
   - **NXDOMAIN** — "domain doesn't exist." Simple, but some apps interpret it as a hard
@@ -740,10 +751,9 @@ qname, qtype, verdict, rcode and latency as real fields, plus total / blocked / 
 orphan / eviction counters. Once Vortex is serving a real network this is how you find out
 what it is doing, and it is the base P4.6 builds on.
 
-**4. P4.1 blocked-response strategy.** The biggest remaining feature for "a real
-blackhole": NXDOMAIN, NODATA or a null-IP answer, chosen per qtype and configurable. The
-`rcode` parameter on `blocked_response.build` is the door in. Real traffic from step 1 is
-the best evidence for which default to pick.
+**4. ~~P4.1 blocked-response strategy.~~** ✅ 2026-11-22, done ahead of steps 1–3. The
+default is `null_ip`, decided without step 1's real traffic. If devices misbehave on
+`0.0.0.0`, `VORTEX_BLOCK_RESPONSE=nodata` is the first thing to try.
 
 **5. P4.3 upstream timeout and failover.** A per-query timeout and a second upstream, so
 one bad upstream does not take DNS down for the house. Leads naturally toward P3.7

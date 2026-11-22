@@ -1,8 +1,8 @@
 # Vortex
 
 A DNS forwarder with blocklist filtering, written in Zig 0.17 on the new `std.Io`
-async runtime. Point a resolver at it and ad/tracker domains come back NXDOMAIN;
-everything else is forwarded upstream.
+async runtime. Point a resolver at it and ad/tracker domains come back as
+`0.0.0.0` / `::`; everything else is forwarded upstream.
 
 **Status: works, but it is a learning project, not a product.** The query path is
 complete and tested; the operational surface around it (config reload, metrics,
@@ -30,17 +30,21 @@ By default it listens on `127.0.0.1:5354` and forwards to `192.168.1.1:53`.
 # forwarded
 dig @127.0.0.1 -p 5354 example.com A +short
 
-# blocked — NXDOMAIN with a cacheable SOA in the authority section
+# blocked — an unroutable address, so the app fails at once
 dig @127.0.0.1 -p 5354 doubleclick.net A
 ```
 
 ```
-;; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 55996
-;; flags: qr rd ra; QUERY: 1, ANSWER: 0, AUTHORITY: 1, ADDITIONAL: 0
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 55996
+;; flags: qr rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0
 
-;; AUTHORITY SECTION:
-doubleclick.net.  3600  IN  SOA  . . 1 3600 600 86400 3600
+;; ANSWER SECTION:
+doubleclick.net.  60  IN  A  0.0.0.0
 ```
+
+A blocked AAAA gets `::`. Any other type (HTTPS, MX, TXT…) gets NODATA: NOERROR
+with no answer and an SOA, so the client caches it. `VORTEX_BLOCK_RESPONSE`
+switches every block to `nodata` or `nxdomain` instead.
 
 Run the tests with `zig build test --summary all`.
 
@@ -67,6 +71,7 @@ and edit. Running with no `.env` at all is a supported mode.
 | `VORTEX_MAX_PENDING` | `4096` (1–65536; queries forwarded and awaiting a reply — past it, forwarded queries are dropped) |
 | `VORTEX_MAX_TCP_CONNS` | `64` (`0` disables the TCP listener) |
 | `VORTEX_HANDLER_THREADS` | CPU count − 1 (`0` handles every query on the ingress thread) |
+| `VORTEX_BLOCK_RESPONSE` | `null_ip`: `0.0.0.0` / `::` for A / AAAA with a 60 s TTL, NODATA otherwise (or `nodata`, `nxdomain` for every type) |
 | `VORTEX_ALLOW_CLIENTS` | `local`: loopback, RFC 1918, link-local, CGNAT, ULA (comma-separated `local`, `any`, addresses and `addr/len` ranges; anyone else gets no reply) |
 | `VORTEX_ENV_FILE` | `.env` |
 
@@ -189,7 +194,7 @@ at that moment are lost and their clients retry.
                     │    ├─ edns.find          (edns.zig)      │  bad OPT → FORMERR/BADVERS
                     │    └─ Policy.decide      (policy.zig)    │
                     │         allow → forward                  │
-                    │         block → NXDOMAIN + SOA ──────────┼──▶ client
+                    │         block → 0.0.0.0 / :: / NODATA ───┼──▶ client
                     │         pass  → forward                  │
                     │                    │                     │
                     │              PendingTable                │
@@ -259,7 +264,8 @@ that the expensive-to-reverse architectural decisions are the ones already made.
 actually move it.
 
 **The query datapath is complete and tested.** Header validation (QR, opcode,
-QDCOUNT), QName case normalization, cacheable SOA on blocked answers, replies
+QDCOUNT), QName case normalization, a choice of blocked answer per query type
+(null IP, NODATA or NXDOMAIN), replies
 verified against the question that provoked them, SERVFAIL on upstream timeout,
 and TC=1 rather than silent corruption when a reply overflows the receive buffer.
 Every one of those is now asserted end to end against the running binary, not just
