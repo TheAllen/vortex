@@ -41,6 +41,13 @@ failures that name their cause; see
 off localhost.** **No open P0s, and no open P1 bugs** — all three P0s are pinned by
 regression tests that fail under mutation.
 
+**2026-11-22: P2.7 landed** — `VORTEX_ALLOW_CLIENTS`, defaulting to `local`, checked first at
+UDP ingress and at TCP accept; see
+[changelog.md](changelog.md#landed-2026-11-22--p27-client-allowlist). *222/222 — 184 unit, 38
+integration.* **Nothing on the board now blocks serving a home network.** What is left before
+doing it for real is running the unit on an actual systemd host (step 1 of the
+[suggested order](#suggested-order)).
+
 **P2.2 blocklist resilience landed 2026-09-13**, and with it the last of the two
 deployability blockers that were not about load. A failed fetch is retried, falls back to an
 on-disk copy, and — if even that is missing — resolves against a configurable
@@ -407,7 +414,13 @@ process itself.
    - **sd_notify readiness** (`Type=notify`), so dependants wait for loaded lists rather
      than for `exec`. Small, and pairs with P2.4's shutdown work.
    - **launchd**, if macOS ever becomes a target.
-7. **Client allowlist — rescoped 2026-11-15** from "rate limiting / abuse controls". The
+7. ~~**Client allowlist.**~~ **Done 2026-11-22** — `VORTEX_ALLOW_CLIENTS`, default `local`,
+   built as planned below; see
+   [changelog.md](changelog.md#landed-2026-11-22--p27-client-allowlist). What is left is the
+   two follow-ups at the end of this entry: advertising Vortex by a global IPv6 address
+   (needs interface enumeration), and per-client rate limiting (deferred).
+
+   **Rescoped 2026-11-15** from "rate limiting / abuse controls". The
    original entry read: *"Any resolver reachable beyond localhost needs per-client rate
    limiting (and ideally Response Rate Limiting) so it can't be conscripted into DNS
    amplification."* That holds for a resolver the internet can reach. Vortex is meant for a
@@ -706,13 +719,9 @@ while every item it named shipped; it is in git history before this date. What f
 ordered by what stands between Vortex and running as the resolver for a home network
 first, then by value per unit of effort.
 
-**0. Close out P2.7.** The client allowlist is implemented and committed on
-`feat/client-allowlist`. What is left is the pass that makes it count as landed:
-mutation-check each rule (the `local` ranges, IPv4-mapped unwrapping, the UDP drop, the TCP
-close at accept), confirm the test count, and write it up — a changelog entry, the P2.7
-entry above marked done, and `VORTEX_ALLOW_CLIENTS` in the README and
-[vortex.env](../deploy/systemd/vortex.env). After this, nothing on the board blocks a bind
-off localhost.
+**0. ~~Close out P2.7.~~** ✅ 2026-11-22. Mutation-checked, written up, and documented in the
+README, `.env.example` and [vortex.env](../deploy/systemd/vortex.env). The same pass bounded
+the harness's stderr drain, so a fail-to-start regression now fails instead of hanging.
 
 **1. Run it for real (P2.6 remainder).** Deploy the unit on an actual systemd host, run
 `systemd-analyze security`, and loosen whatever the syscall filter breaks. Add

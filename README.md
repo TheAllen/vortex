@@ -6,7 +6,7 @@ everything else is forwarded upstream.
 
 **Status: works, but it is a learning project, not a product.** The query path is
 complete and tested; the operational surface around it (config reload, metrics,
-a client allowlist, graceful shutdown) largely is not. See
+graceful shutdown) largely is not. See
 [Where it actually stands](#where-it-actually-stands) before deploying it anywhere.
 
 ---
@@ -67,6 +67,7 @@ and edit. Running with no `.env` at all is a supported mode.
 | `VORTEX_MAX_PENDING` | `4096` (1–65536; queries forwarded and awaiting a reply — past it, forwarded queries are dropped) |
 | `VORTEX_MAX_TCP_CONNS` | `64` (`0` disables the TCP listener) |
 | `VORTEX_HANDLER_THREADS` | CPU count − 1 (`0` handles every query on the ingress thread) |
+| `VORTEX_ALLOW_CLIENTS` | `local`: loopback, RFC 1918, link-local, CGNAT, ULA (comma-separated `local`, `any`, addresses and `addr/len` ranges; anyone else gets no reply) |
 | `VORTEX_ENV_FILE` | `.env` |
 
 A missing `.env` is fine; a file named explicitly via `VORTEX_ENV_FILE` that
@@ -104,10 +105,11 @@ naming its replacement rather than a silent fall back to the default list.
 
 > [!WARNING]
 > Read the warning under [Where it actually stands](#where-it-actually-stands)
-> first. Vortex is meant for a home network and does not yet check where queries
-> come from (P2.7), so make sure port 53 is not reachable from the internet.
-> **Check IPv6 especially:** the host usually has a global IPv6 address that NAT
-> does not hide, so only the router's IPv6 firewall stands in the way.
+> first. Vortex is meant for a home network. By default it answers only
+> home-network addresses (`VORTEX_ALLOW_CLIENTS=local`), which covers you if
+> port 53 turns out to be reachable from the internet, as it can be over IPv6:
+> the host usually has a global IPv6 address that NAT does not hide. Keep the
+> router's IPv6 firewall closed to it anyway.
 
 [`deploy/systemd/`](deploy/systemd/) has a unit and the config file it reads.
 Build a release binary (on the host, or cross-compile from anywhere with
@@ -160,6 +162,12 @@ on the router's IPv6/LAN page), or leave that field empty. Many routers advertis
 themselves as an IPv6 DNS server automatically. Clients usually prefer that server,
 so while it is advertised, **devices skip Vortex and nothing gets blocked**. Clients
 keep using IPv6 for everything else; only DNS goes over IPv4.
+
+This is also what the default allowlist expects. Advertising Vortex by its global
+IPv6 address instead makes clients query from their own global addresses, which
+`local` does not cover, so they get no answer. The log says so, once a second,
+naming the latest address it dropped. If you do want IPv6 DNS, add your delegated
+prefix to `VORTEX_ALLOW_CLIENTS`, and update it whenever your ISP changes it.
 
 To see what a device was given (macOS: `scutil --dns | grep nameserver`; Linux:
 `resolvectl status`; Windows: `ipconfig /all`): only Vortex's IPv4 address should
@@ -270,11 +278,11 @@ reuses that field for flags rather than a duration.
 > [!WARNING]
 > **Serve your home network only, never the internet.** Queries awaiting upstream
 > are capped (`VORTEX_MAX_PENDING`) and so are TCP connections
-> (`VORTEX_MAX_TCP_CONNS`), but Vortex answers anyone who can reach it, and has no
-> rate limiting. A resolver reachable from the internet can be used for DNS
-> amplification. Behind a home router's NAT that cannot happen over IPv4. Over IPv6
-> it depends on the router's firewall. A client allowlist (P2.7) is next. Until
-> it lands, the localhost default is a security control, not a dev convenience.
+> (`VORTEX_MAX_TCP_CONNS`). By default Vortex answers only home-network addresses
+> (`VORTEX_ALLOW_CLIENTS=local`), so a listener the internet can reach by accident,
+> typically over IPv6, still answers no one there. It has no rate limiting, so
+> do not widen the list to `any` or to public ranges: a resolver that answers the
+> internet can be used for DNS amplification.
 
 **The blocklists survive their sources.** A failed fetch is retried, then falls
 back to an on-disk copy written on the last success; if even that is missing,
@@ -286,7 +294,7 @@ an error page looks like by the time it reaches the parser.
 
 The gap is everything around the datapath: graceful shutdown, metrics and rate
 limiting. EDNS0 and TCP landed 2026-09-28; a systemd unit and IPv6 listening
-(P2.6) on 2026-10-06. [`docs/next_steps.md`](docs/next_steps.md) is the full
+(P2.6) on 2026-10-06; the client allowlist (P2.7) on 2026-11-22. [`docs/next_steps.md`](docs/next_steps.md) is the full
 prioritized board.
 
 The testing gap that used to sit here is closed. The 147 unit tests are all over

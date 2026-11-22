@@ -9,6 +9,75 @@ Newest first. Open work lives in [next_steps.md](next_steps.md).
 
 ---
 
+## Landed 2026-11-22 — P2.7: client allowlist
+
+**Vortex now enforces "home network only" itself.** `VORTEX_ALLOW_CLIENTS` is a
+comma-separated list of `local`, `any`, addresses and `address/prefix-length` ranges. The
+default, `local`, is loopback, RFC 1918, link-local (169.254/16, fe80::/10), CGNAT (100.64/10)
+and ULA (fc00::/7). Before this, the only guard against a listener reachable from the internet,
+most likely over IPv6 where NAT hides nothing, was a comment in the env file. Merged as PR #15,
+with two fixes in PR #16.
+
+**One address space.** [allowed_clients.zig](../src/utils/allowed_clients.zig) stores every
+range as an IPv6 prefix, with IPv4 ranges held IPv4-mapped (`::ffff:a.b.c.d`, prefix + 96), and
+maps an IPv4 client the same way before matching. A dual-stack `::` listener already sees IPv4
+clients as `::ffff:a.b.c.d`, so they match the IPv4 ranges with no special case. Parsing and
+matching are pure, so they are unit-tested without an `Io`.
+
+**Checked first, and dropped rather than refused.** The UDP check runs in the ingress loop
+before anything that can send, including the oversize FORMERR, so no reply of any kind reaches
+an address outside the list. Its source may be forged, the same rule P1.5 follows. Over TCP the
+check runs at accept, and the connection is closed before it takes a `ConnTable` slot, so
+clients outside the list cannot fill the table and lock out the ones inside it. Denials are not
+logged one by one. `Gate` counts them and keeps the latest address, and the sweeper logs one
+line a second. The address is there so an operator can spot a LAN client the list misses, such
+as one querying from a global IPv6 address.
+
+**Fail loud.** A malformed item is a startup error naming that item. `any` logs a warning at
+startup. As first merged, the error path logged the item and then *returned the default*, so
+Vortex started under `local` instead of refusing to. PR #16 fixed it.
+
+**The harness could not see that bug: it hung instead.** `runUntilExit` read the child's
+stderr to EOF before its bounded wait, and a child that never exits never closes stderr. So
+the case written for exactly this rule blocked the suite forever, and a filtered run of it from
+11-15 was still alive a week later. The drain now runs on a task of its own, concurrently with
+`waitBounded`. On timeout the kill closes the pipe and the drain ends. This covers P2.2's
+fail-closed case too, which had the same exposure.
+
+**Tests:** 9 unit tests in `allowed_clients.zig`, one in `settings.zig`, and three integration
+cases:
+- a client outside the list gets nothing over UDP (blocked name, forwarded name, oversized
+  query) and its TCP connection is closed, while `::1` is still served
+- an IPv4 range matches an IPv4 client on `::`, and `::1` does not
+- a malformed list refuses to start, naming the bad item
+
+Readiness for the first case is probed from `::1` (`Readiness.ip6_blocked_probe`), because the
+case's own client is deliberately outside the list. *222/222 — 184 unit, 38 integration*, on
+Zig 0.17.1 and 0.16.0.
+
+**Mutation-checked: 16 mutations, all killed**, each run against the full suite and reverted:
+
+| Rule broken | Killed by |
+|---|---|
+| A bad value falls back to `local` (the merged bug) | settings unit test; the malformed-list integration case, which now fails in ~60 s instead of hanging |
+| `local` narrowed or missing a range: 172.16/12 → /16, CGNAT dropped, ULA /7 → /8, fe80::/10 → /16 | `local allows every home-network range and nothing public` (each separately) |
+| IPv4 clients not mapped into `::ffff:` | four unit tests, and every IPv4 integration case at readiness |
+| UDP check removed / moved after the oversize FORMERR | the outside-the-list case (its oversized-query step catches the reordering) |
+| TCP check at accept removed | the outside-the-list case |
+| Partial-byte bits ignored in `contains` | four unit tests |
+| `any` ignored | its unit test and the outside-the-list case |
+| `Gate` stops counting | the `Gate` unit test |
+| Over-long prefix accepted | parse, settings and malformed-list tests |
+| Host bits not masked | **survived at first.** The masking test used `/24`, where the host byte is never compared, so masking made no difference. A `198.51.100.7/20` case, with the boundary inside a byte that carries host bits, now kills it |
+| A list without `local` still allows local | four tests, unit and integration |
+| An empty list accepted | parse and settings tests |
+
+**Not done here**, and listed under P2.7 in [next_steps.md](next_steps.md): advertising Vortex
+by a global IPv6 address, which needs `local` to include the host's own prefixes, and per-client
+rate limiting, deferred because inside a LAN it would only be about fairness.
+
+---
+
 ## Landed 2026-10-06 — P2.6: deployment surface (Linux/systemd)
 
 **A unit, not just a port.** [deploy/systemd/vortex.service](../deploy/systemd/vortex.service)
