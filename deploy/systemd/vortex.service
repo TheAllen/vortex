@@ -38,9 +38,13 @@ Environment=VORTEX_ENV_FILE=/etc/vortex/vortex.env
 Restart=on-failure
 RestartSec=5s
 
-# No graceful shutdown yet (P2.4): SIGTERM ends the process where it stands.
-# In-flight queries are lost and their clients retry, which is what a DNS
-# client does anyway.
+# SIGTERM (systemd's stop signal) shuts down cleanly: every loop is cancelled,
+# everything is freed, and the process exits 0, logging `stopped` last. Queries
+# in flight are dropped rather than drained; their clients retry in about a
+# second. `systemctl reload vortex` refreshes the blocklists now instead of at
+# the next interval. It does not re-read this file's settings: those still need
+# a restart.
+ExecReload=/bin/kill -HUP $MAINPID
 
 # ---- Identity and state ------------------------------------------------
 # A throwaway user allocated at start. Vortex needs no persistent identity —

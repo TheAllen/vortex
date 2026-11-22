@@ -25,6 +25,7 @@ const Question = @import("dns/question.zig").Question;
 const edns = @import("dns/edns.zig");
 const ConnTable = @import("utils/conn_table.zig").ConnTable;
 const Gate = @import("utils/allowed_clients.zig").Gate;
+const signals = @import("utils/signals.zig");
 
 /// Every `std.log.*` call in the process — ours and the standard library's —
 /// renders through [obs/log.zig](obs/log.zig).
@@ -809,7 +810,12 @@ fn refresherLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
         else
             configured;
 
-        try io.sleep(std.Io.Duration.fromSeconds(delay_s), std.Io.Clock.boot);
+        // A SIGHUP (P2.4) ends the wait early. Waking here rather than
+        // refreshing from the signal path keeps every refresh on this thread,
+        // so two can never overlap.
+        if (try waitForReload(io, ctx.reload, delay_s)) {
+            std.log.info("blocklist refresh requested by SIGHUP", .{});
+        }
 
         const before = try ctx.policy.entryCounts(io);
         const started = std.Io.Timestamp.now(io, std.Io.Clock.boot).nanoseconds;
@@ -858,6 +864,34 @@ fn refresherLoop(io: std.Io, ctx: *const Context) std.Io.Cancelable!void {
 /// For a supervised loop that has nothing to do: returning would be read as a
 /// crash and restarted, so the only way to "stop" while staying under the
 /// supervisor is to wait forever and honour cancellation.
+/// Sleeps `delay_s`, or less if `reload` is raised first. True when it was
+/// the reload. Clears the flag, so one SIGHUP is one refresh.
+///
+/// Sleeps in `reload_poll_ms` steps against a flag rather than waiting on an
+/// `Io.Event` with a timeout. Under 0.16, the CI pin, `Event.waitTimeout`
+/// honoured neither its timeout nor cancellation, so shutdown hung on this
+/// loop forever. `io.sleep` is cancellable on both toolchains. Found by
+/// running the suite under 0.16: the harness's teardown sent SIGTERM, so every
+/// case ended in a graceful shutdown, and every one hung.
+fn waitForReload(io: std.Io, reload: ?*std.atomic.Value(bool), delay_s: i64) std.Io.Cancelable!bool {
+    const total_ms: i64 = delay_s * std.time.ms_per_s;
+    const flag = reload orelse {
+        try io.sleep(std.Io.Duration.fromMilliseconds(total_ms), std.Io.Clock.boot);
+        return false;
+    };
+    var slept_ms: i64 = 0;
+    while (slept_ms < total_ms) {
+        if (flag.swap(false, .acq_rel)) return true;
+        const step = @min(reload_poll_ms, total_ms - slept_ms);
+        try io.sleep(std.Io.Duration.fromMilliseconds(step), std.Io.Clock.boot);
+        slept_ms += step;
+    }
+    return flag.swap(false, .acq_rel);
+}
+
+/// How often a waiting refresher checks for a SIGHUP.
+const reload_poll_ms = 250;
+
 fn parkForever(io: std.Io) std.Io.Cancelable!void {
     while (true) {
         try io.sleep(std.Io.Duration.fromSeconds(3600), std.Io.Clock.boot);
@@ -1019,13 +1053,26 @@ pub fn main(init: std.process.Init) !void {
     // including `Settings.load`'s own diagnostics — used the bootstrap defaults.
     obs_log.configure(io, cfg.log_level, cfg.log_format);
 
+    // Declared before every resource below, so this `defer` runs after all of
+    // theirs: the line means every loop was cancelled and everything freed.
+    // Only on a signalled shutdown, not on a startup error, which has already
+    // said why it is exiting.
+    var clean_shutdown = false;
+    defer if (clean_shutdown) std.log.info("stopped", .{});
+
+    // Before the blocklist fetch, which can take tens of seconds: without the
+    // handler, SIGHUP's default action is to kill the process. A SIGTERM that
+    // arrives during startup is held, and acted on at the first poll below.
+    signals.install();
+
     // Before the first `async` anywhere — `buildSnapshot` below is one — so no
     // task is ever admitted under the old limit. The refresher and the TCP
     // accept loop only exist when enabled, and the count has to agree with
     // what is spawned.
     const handler_threads = cfg.handler_threads orelse defaultHandlerThreads();
     const tcp_enabled = cfg.max_tcp_conns > 0;
-    const loops: usize = 2 + @as(usize, @intFromBool(cfg.blocklist_refresh_secs != 0)) + @intFromBool(tcp_enabled);
+    // 3: the dispatcher, the sweeper, and (since P2.4) the UDP ingress loop.
+    const loops: usize = 3 + @as(usize, @intFromBool(cfg.blocklist_refresh_secs != 0)) + @intFromBool(tcp_enabled);
     threaded.setAsyncLimit(asyncLimit(handler_threads, loops + cfg.max_tcp_conns));
 
     const client_socket, const upstream_socket = try initSockets(io, cfg);
@@ -1133,6 +1180,9 @@ pub fn main(init: std.process.Init) !void {
     ctx.tcp = if (tcp) |*t| t else null;
     ctx.client_gate = &client_gate;
     ctx.block_response = cfg.block_response;
+    // Raised by the main thread on SIGHUP, polled by the refresher.
+    var reload_flag: std.atomic.Value(bool) = .init(false);
+    ctx.reload = if (refresher != null) &reload_flag else null;
     // 1232 only when there is a TCP listener to retry against; see
     // `Context.edns_udp_size`.
     ctx.edns_udp_size = if (tcp_enabled) edns.advertised_udp_size else edns.no_tcp_udp_size;
@@ -1157,9 +1207,47 @@ pub fn main(init: std.process.Init) !void {
         ctx.edns_udp_size,
         @tagName(cfg.block_response),
     });
+    // P2.4: the main thread's only job from here is signals. The ingress loop
+    // runs as a task of `group` like every other loop, so returning from
+    // `main` runs the deferred `group.cancel` above, which ends the blocked
+    // receive along with everything else, and then frees what they used.
+    group.concurrent(io, ingressLoop, .{ io, &ctx, &group }) catch |err| {
+        std.log.err("cannot start ingress loop on its own thread: {s}", .{@errorName(err)});
+        return err;
+    };
+
+    while (true) {
+        switch (signals.poll()) {
+            .none => {},
+            .reload => if (ctx.reload) |flag| flag.store(true, .release) else std.log.warn(
+                "SIGHUP ignored: blocklist refresh is disabled (VORTEX_BLOCKLIST_REFRESH_SECS=0)",
+                .{},
+            ),
+            .stop => break,
+        }
+        io.sleep(std.Io.Duration.fromMilliseconds(signal_poll_ms), std.Io.Clock.boot) catch break;
+    }
+
+    // Queries in flight are dropped, not drained: a client retries a lost
+    // datagram in about a second, and a restart stays instant. Decided
+    // 2026-11-22.
+    std.log.info("shutting down signal={s}", .{signals.stopSignalName()});
+    clean_shutdown = true;
+}
+
+/// How often the main thread checks for a signal. The only latency a signal
+/// has, and far below anything an operator or systemd would notice.
+const signal_poll_ms = 100;
+
+/// Receives client datagrams and hands each to a handler. Was the tail of
+/// `main` until P2.4 moved the main thread to signal handling.
+///
+/// Not supervised, unlike the other loops: it returns only when cancelled, and
+/// it needs `group` to spawn handlers into.
+fn ingressLoop(io: std.Io, ctx: *const Context, group: *std.Io.Group) void {
     var buffer: [4096]u8 = undefined;
     while (true) {
-        const incoming: std.Io.net.IncomingMessage = client_socket.receive(io, &buffer) catch |err| switch (err) {
+        const incoming: std.Io.net.IncomingMessage = ctx.client_socket.receive(io, &buffer) catch |err| switch (err) {
             error.Canceled => return,
             else => {
                 std.log.warn("ingress receive: {s}", .{@errorName(err)});
@@ -1172,7 +1260,7 @@ pub fn main(init: std.process.Init) !void {
         // P2.7: first, before anything below can send. A client outside the
         // list gets no reply of any kind, not even the oversize FORMERR, since
         // its source address may be forged and nothing should reach it.
-        if (!client_gate.admit(io, incoming_addr)) continue;
+        if (!ctx.client_gate.admit(io, incoming_addr)) continue;
 
         // The query was larger than `buffer` and its tail is gone. Parsing the
         // prefix would mean acting on a question we only half received, so this
@@ -1187,7 +1275,7 @@ pub fn main(init: std.process.Init) !void {
             });
             if (incoming.data.len >= 12) {
                 const reply = Header.headerOnlyReply(incoming.data, .format_error);
-                client_socket.send(io, &incoming_addr, &reply) catch |err| switch (err) {
+                ctx.client_socket.send(io, &incoming_addr, &reply) catch |err| switch (err) {
                     error.Canceled => return,
                     else => {},
                 };
@@ -1198,15 +1286,15 @@ pub fn main(init: std.process.Init) !void {
         // `buffer` is reused by the next receive, so the handler needs its own copy.
         // Ownership transfers to `handleQuery`, whose `defer gpa.free(data)` releases
         // it on every exit path — do not dupe again below, and do not free here.
-        const data_owned: []u8 = gpa.dupe(u8, incoming.data) catch {
+        const data_owned: []u8 = ctx.gpa.dupe(u8, incoming.data) catch {
             std.log.warn("shedding datagram from {f}: out of memory", .{incoming.from});
             continue;
         };
 
         group.async(io, handleQuery, .{
             io,
-            gpa,
-            &ctx,
+            ctx.gpa,
+            ctx,
             incoming_addr,
             data_owned,
         });
@@ -1238,6 +1326,7 @@ test {
     _ = @import("utils/pending_table.zig");
     _ = @import("utils/conn_table.zig");
     _ = @import("utils/allowed_clients.zig");
+    _ = @import("utils/signals.zig");
     _ = @import("utility.zig");
     _ = @import("obs/log.zig");
     _ = @import("settings.zig");

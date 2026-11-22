@@ -638,6 +638,56 @@ test "P2.2 refresh swaps the live list without a restart" {
     try expectForwarded(&vortex, "alpha.test", 0x0A02);
 }
 
+test "P2.4 SIGHUP refreshes the blocklist at once, long before the interval" {
+    const gpa = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "hosts", .data = "0.0.0.0 alpha.test\n" });
+    const hosts_path = try tmp.dir.realPathFileAlloc(testing.io, "hosts", gpa);
+    defer gpa.free(hosts_path);
+
+    // An hour between refreshes, so only the signal can explain a swap within
+    // the case's ten-second poll.
+    var vortex = try Instance.start(testing.io, gpa, .{
+        .blocklist_source = hosts_path,
+        .refresh_secs = 3600,
+        .readiness = .forwarded_probe,
+        .log_level = "info",
+    });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    try expectBlocked(&vortex, "alpha.test", 0x0E01);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "hosts", .data = "0.0.0.0 beta.test\n" });
+    try vortex.signal(.HUP);
+
+    try waitUntilBlocked(&vortex, "beta.test");
+    try expectForwarded(&vortex, "alpha.test", 0x0E02);
+
+    // And SIGHUP did not do what its default action would: the process is
+    // still here to be stopped cleanly.
+    const term = try vortex.signalAndWait(.TERM);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    try testing.expect(std.mem.indexOf(u8, vortex.childLog(), "refresh requested by SIGHUP") != null);
+}
+
+test "P2.4 SIGHUP with refresh disabled is logged and ignored, not fatal" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .log_level = "info" });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    try vortex.signal(.HUP);
+
+    // Still serving after the signal had time to land.
+    try sleepMs(300);
+    try expectBlocked(&vortex, "ads.example.com", 0x0E11);
+
+    const term = try vortex.signalAndWait(.TERM);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    try testing.expect(std.mem.indexOf(u8, vortex.childLog(), "SIGHUP ignored") != null);
+}
+
 test "P2.2 refresh refuses to install an empty list" {
     const gpa = testing.allocator;
 
@@ -1395,4 +1445,36 @@ test "a malformed VORTEX_ALLOW_CLIENTS refuses to start, naming the bad item" {
 
     try testing.expect(result.failed());
     try testing.expect(std.mem.indexOf(u8, result.stderr, "192.168.1.0/33") != null);
+}
+
+test "P2.4 SIGTERM shuts down cleanly: exit 0, and the cleanup ran to the end" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .log_level = "info" });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    // Serving first, with a TCP connection held open, so the shutdown has a
+    // connection thread to cancel as well as the loops.
+    try expectBlocked(&vortex, "ads.example.com", 0x0F11);
+    const conn = try vortex.tcpConnect();
+    defer conn.close(testing.io);
+
+    const term = try vortex.signalAndWait(.TERM);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+
+    // Both lines, in order. "stopped" is logged by the first `defer` in
+    // `main`, so it appears only once every other deferred cleanup has run.
+    const log = vortex.childLog();
+    const shutting = std.mem.indexOf(u8, log, "shutting down signal=TERM") orelse return error.MissingShutdownLine;
+    const stopped = std.mem.indexOf(u8, log, "msg=\"stopped\"") orelse return error.MissingStoppedLine;
+    try testing.expect(shutting < stopped);
+}
+
+test "P2.4 SIGINT shuts down cleanly too" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .log_level = "info" });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    const term = try vortex.signalAndWait(.INT);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    try testing.expect(std.mem.indexOf(u8, vortex.childLog(), "shutting down signal=INT") != null);
 }

@@ -53,6 +53,11 @@ TTL), every other type NODATA; `VORTEX_BLOCK_RESPONSE` picks `nodata` or `nxdoma
 See [changelog.md](changelog.md#landed-2026-11-22--p41-blocked-response-strategy).
 *232/232 — 190 unit, 42 integration.*
 
+**2026-11-22: P2.4 landed** — SIGTERM and SIGINT shut down cleanly (exit 0, `stopped` logged
+last), and SIGHUP refreshes the blocklists at once; `systemctl reload vortex` sends it. See
+[changelog.md](changelog.md#landed-2026-11-22--p24-graceful-shutdown-and-sighup-refresh).
+*239/239 — 193 unit, 46 integration*, on Zig 0.16.0 and 0.17.1.
+
 **P2.2 blocklist resilience landed 2026-09-13**, and with it the last of the two
 deployability blockers that were not about load. A failed fetch is retried, falls back to an
 on-disk copy, and — if even that is missing — resolves against a configurable
@@ -272,8 +277,8 @@ process itself.
    [changelog.md](changelog.md#landed-2026-09-13--p22-blocklist-resilience).
 
    **Two things this left open**, both small and both deliberately out of that pass:
-   - **SIGHUP-triggered refresh.** Needs the signal handling P2.4 will add; the refresh
-     mechanism itself is already a function call away.
+   - ~~**SIGHUP-triggered refresh.**~~ **Done 2026-11-22** with P2.4. `systemctl reload
+     vortex` sends it.
    - **Retry counts, the degraded interval and the attempt schedule are constants**, not
      settings. They are one `Settings` field each if an operator ever needs them; nobody has.
 3. **Structured logging + metrics — phase 1 landed 2026-08-10.** Every `std.log` call now
@@ -285,8 +290,12 @@ process itself.
    blocked / forwarded / orphan responses / sweep evictions / upstream latency. The choke
    points already exist: `Policy.decide`, `appendQuery`/`complete`, the orphan branch in
    `dispatcherLoop`.
-4. **Graceful shutdown.** No signal handling; the only exit is a crash or Ctrl-C mid-write.
-   Catch SIGINT/SIGTERM, `group.cancel`, flush the log, run the deferred deinits.
+4. ~~**Graceful shutdown.**~~ **Done 2026-11-22**, with SIGHUP refresh; see
+   [changelog.md](changelog.md#landed-2026-11-22--p24-graceful-shutdown-and-sighup-refresh).
+   The original entry: *"No signal handling; the only exit is a crash or Ctrl-C mid-write.
+   Catch SIGINT/SIGTERM, `group.cancel`, flush the log, run the deferred deinits."* Not done:
+   draining queries in flight (decided against: clients retry), and re-reading settings on
+   SIGHUP, which only refreshes the lists.
 5. **Test coverage — the harness landed 2026-09-12; what is left is listed below.**
    `zig build test` → **163/163**: the 147-test unit suite plus **16 integration cases**
    ([tests/](../tests/), see
@@ -740,11 +749,8 @@ the harness's stderr drain, so a fail-to-start regression now fails instead of h
 testable there. This is the first time Vortex serves a network rather than a harness, so
 expect it to find something.
 
-**2. Graceful shutdown (P2.4).** Catch SIGINT/SIGTERM, cancel the group, flush the log, run
-the deferred deinits. A resolver under systemd gets stopped on every restart and upgrade,
-so this matters as soon as step 1 does. The same signal handling unlocks the
-**SIGHUP-triggered blocklist refresh** left open by P2.2 — one function call once signals
-exist.
+**2. ~~Graceful shutdown (P2.4).~~** ✅ 2026-11-22, with the SIGHUP-triggered blocklist
+refresh. Step 1 now has a `systemctl reload` to check as well as `stop`.
 
 **3. P2.3 phase 2: the per-query event and counters.** One record per query with client,
 qname, qtype, verdict, rcode and latency as real fields, plus total / blocked / forwarded /

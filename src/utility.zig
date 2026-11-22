@@ -59,6 +59,10 @@ pub const Context = struct {
     /// coroutine sees it in — nothing on the datapath reads this.
     refresh: ?*const Refresher = null,
 
+    /// Raised by the main thread on SIGHUP (P2.4), polled by `refresherLoop`
+    /// while it waits. Null exactly when `refresh` is.
+    reload: ?*std.atomic.Value(bool) = null,
+
     /// Null when TCP is disabled. The accept loop reads the server; the
     /// sweeper reads the table, to end idle connections.
     tcp: ?*const Tcp = null,

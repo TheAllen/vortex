@@ -109,6 +109,11 @@ pub const Options = struct {
 
     /// `VORTEX_BLOCK_RESPONSE`. Null leaves the binary's default, `null_ip`.
     block_response: ?[]const u8 = null,
+
+    /// `VORTEX_LOG_LEVEL`, over `child_log_level`. For the P2.4 cases, which
+    /// assert on `info` lines. `info` logs a few lines per run, not one per
+    /// query, so it cannot fill the pipe the way `debug` could.
+    log_level: ?[]const u8 = null,
 };
 
 /// The listening address a case runs Vortex on (P2.6).
@@ -179,6 +184,9 @@ pub const Instance = struct {
     child: std.process.Child,
     /// Everything the child wrote to stderr, read at `deinit`. Empty until then.
     child_stderr: std.ArrayList(u8),
+    /// How the child ended, once `signalAndWait` has reaped it. `stopChild`
+    /// then has nothing left to kill or drain.
+    exited: ?std.process.Child.Term = null,
 
     /// The socket a case queries Vortex from. Bound to an ephemeral port, so
     /// replies come back here and nowhere else.
@@ -410,6 +418,48 @@ pub const Instance = struct {
         from: Io.net.IpAddress,
     };
 
+    // ── Signals (P2.4) ────────────────────────────────────────────────────
+
+    /// Sends `sig` to the child and returns at once. For SIGHUP, whose effect
+    /// a case observes through the datapath.
+    pub fn signal(self: *Instance, sig: std.posix.SIG) !void {
+        const pid = self.child.id orelse return error.ChildAlreadyReaped;
+        try std.posix.kill(pid, sig);
+    }
+
+    /// Sends `sig`, then waits for the child to exit, bounded like
+    /// `runUntilExit`. Its stderr is drained concurrently into
+    /// `child_stderr`, for the same reason as there: a child that ignores the
+    /// signal never closes the pipe, and draining first would hang. On
+    /// timeout the child is killed, so a broken shutdown fails the case.
+    pub fn signalAndWait(self: *Instance, sig: std.posix.SIG) !std.process.Child.Term {
+        const stderr_file = self.child.stderr;
+        self.child.stderr = null;
+        defer if (stderr_file) |file| file.close(self.io);
+
+        try self.signal(sig);
+
+        var drain: ?Io.Future(DrainError!void) = if (stderr_file) |file|
+            try self.io.concurrent(drainInto, .{ self.io, self.gpa, file, &self.child_stderr })
+        else
+            null;
+        errdefer if (drain) |*f| f.cancel(self.io) catch {};
+
+        const term = try waitBounded(self.io, &self.child);
+        if (drain) |f| {
+            var future = f;
+            drain = null;
+            try future.await(self.io);
+        }
+        self.exited = term;
+        return term;
+    }
+
+    /// The child's log so far. Complete only once the child has exited.
+    pub fn childLog(self: *const Instance) []const u8 {
+        return self.child_stderr.items;
+    }
+
     // ── Diagnostics ───────────────────────────────────────────────────────
 
     /// Prints whatever the child logged. Call this when an assertion fails:
@@ -444,9 +494,18 @@ pub const Instance = struct {
     /// A harness whose diagnostic path deadlocks is worse than one with no
     /// diagnostics at all, because the symptom looks like a slow test.
     fn stopChild(self: *Instance) void {
+        if (self.exited != null) return;
         const stderr_file = self.child.stderr;
         self.child.stderr = null;
 
+        // SIGKILL first, by pid. `Child.kill` sends SIGTERM and then waits,
+        // which was a kill until P2.4 made SIGTERM a request Vortex handles.
+        // A child whose shutdown is broken would then never exit, and every
+        // case's teardown would hang on it: the mutation that ignores a stop
+        // request hung the suite exactly this way. Teardown is not the place
+        // to test shutdown, `signalAndWait` is. `Child.kill` still does the
+        // reaping, and its SIGTERM to an already-dead child is harmless.
+        if (self.child.id) |pid| std.posix.kill(pid, .KILL) catch {};
         self.child.kill(self.io);
 
         if (stderr_file) |file| {
@@ -769,7 +828,7 @@ fn writeEnvFile(io: Io, gpa: std.mem.Allocator, tmp: *testing.TmpDir, fields: En
         fields.upstream_port,
         fields.opts.blocklist_source orelse build_options.blocklist_path,
         fields.opts.suffix_blocklist_source orelse build_options.suffix_blocklist_path,
-        child_log_level,
+        fields.opts.log_level orelse child_log_level,
         fields.opts.cache_max_entries,
         fields.opts.cache_dir,
         fields.opts.refresh_secs,
