@@ -1478,3 +1478,152 @@ test "P2.4 SIGINT shuts down cleanly too" {
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
     try testing.expect(std.mem.indexOf(u8, vortex.childLog(), "shutting down signal=INT") != null);
 }
+
+// ── P2.3: the per-query record ────────────────────────────────────────────
+
+/// Lines of `log` that contain every one of `parts`.
+fn countLines(log: []const u8, parts: []const []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, log, '\n');
+    while (it.next()) |line| {
+        for (parts) |part| {
+            if (std.mem.indexOf(u8, line, part) == null) break;
+        } else n += 1;
+    }
+    return n;
+}
+
+test "P2.3 a blocked, a forwarded and a cached query each get exactly one record, in real fields" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{
+        .cache_max_entries = 100,
+        .log_level = "debug",
+    });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    var buf: [wire.max_message]u8 = undefined;
+
+    // Blocked, answered locally.
+    try vortex.sendQuery(wire.query(&query_buf, 0x5101, "ads.example.com", .{}));
+    _ = try vortex.recvClient(&buf, harness.default_timeout_ms);
+
+    // Forwarded, with a cacheable answer...
+    try vortex.sendQuery(wire.query(&query_buf, 0x5102, "fwd.example.com", .{}));
+    var upstream_buf: [wire.max_message]u8 = undefined;
+    const forwarded = try vortex.recvUpstream(&upstream_buf, harness.default_timeout_ms);
+    var reply_buf: [wire.max_message]u8 = undefined;
+    const reply = try wire.reply(&reply_buf, forwarded.data, .{ .addresses = &.{.{ 192, 0, 2, 1 }} });
+    try vortex.sendUpstreamReply(&forwarded.from, reply);
+    _ = try vortex.recvClient(&buf, harness.default_timeout_ms);
+
+    // ...so asking again is a hit, with no second trip upstream.
+    try vortex.sendQuery(wire.query(&query_buf, 0x5103, "fwd.example.com", .{}));
+    _ = try vortex.recvClient(&buf, harness.default_timeout_ms);
+    try vortex.expectNoUpstreamQuery(200);
+
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try vortex.signalAndWait(.TERM));
+    const log = vortex.childLog();
+
+    // One record each, every field present and top-level.
+    const common = [_][]const u8{ "scope=query", "client=\"127.0.0.1:", "transport=udp", "qtype=1", "rcode=0", "latency_us=" };
+    try testing.expectEqual(@as(usize, 1), countLines(log, &(common ++ [_][]const u8{ "qname=\"ads.example.com\"", "verdict=block" })));
+    try testing.expectEqual(@as(usize, 1), countLines(log, &(common ++ [_][]const u8{ "qname=\"fwd.example.com\"", "verdict=forward" })));
+    try testing.expectEqual(@as(usize, 1), countLines(log, &(common ++ [_][]const u8{ "qname=\"fwd.example.com\"", "verdict=hit" })));
+    // And no query record is a formatted `msg`: the fields are the record.
+    try testing.expectEqual(@as(usize, 0), countLines(log, &.{ "scope=query", "msg=" }));
+
+    // The forward's latency is measured from when the query arrived, carried
+    // through the pending table, so it is the round trip and not the uptime.
+    const latency = try fieldInt(log, &.{ "qname=\"fwd.example.com\"", "verdict=forward" }, "latency_us=");
+    try testing.expect(latency < 5 * std.time.us_per_s);
+}
+
+/// The integer value of `key` on the one line of `log` matching `parts`.
+fn fieldInt(log: []const u8, parts: []const []const u8, key: []const u8) !u64 {
+    var it = std.mem.splitScalar(u8, log, '\n');
+    while (it.next()) |line| {
+        for (parts) |part| {
+            if (std.mem.indexOf(u8, line, part) == null) break;
+        } else {
+            const at = (std.mem.indexOf(u8, line, key) orelse return error.MissingField) + key.len;
+            var end = at;
+            while (end < line.len and std.ascii.isDigit(line[end])) end += 1;
+            return std.fmt.parseInt(u64, line[at..end], 10);
+        }
+    }
+    return error.MissingRecord;
+}
+
+test "P2.3 a forward with no reply is recorded as a timeout, with SERVFAIL" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .log_level = "debug" });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    var buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&query_buf, 0x5201, "slow.example.com", .{ .qtype = wire.Type.aaaa }));
+    var upstream_buf: [wire.max_message]u8 = undefined;
+    _ = try vortex.recvUpstream(&upstream_buf, harness.default_timeout_ms);
+
+    // Unanswered: the sweeper SERVFAILs it once the 5 s deadline passes.
+    const answer = try vortex.recvClient(&buf, 8_000);
+    try testing.expectEqual(@as(u4, wire.RCode.server_failure), wire.rcode(answer));
+
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try vortex.signalAndWait(.TERM));
+    try testing.expectEqual(@as(usize, 1), countLines(vortex.childLog(), &.{
+        "scope=query", "qname=\"slow.example.com\"", "qtype=28", "verdict=timeout", "rcode=2",
+    }));
+}
+
+test "P2.3 queries over TCP are recorded with transport=tcp, blocked and forwarded" {
+    // Both paths, because they are recorded in different places: a block in
+    // `decide`, a forward in the TCP connection handler once upstream answers.
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .log_level = "debug" });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    var buf: [wire.max_message]u8 = undefined;
+    const conn = try vortex.tcpConnect();
+    defer conn.close(testing.io);
+    try vortex.tcpSend(conn, wire.query(&query_buf, 0x5301, "ads.example.com", .{}));
+    _ = try vortex.tcpRecv(conn, &buf, harness.default_timeout_ms);
+
+    try vortex.tcpSend(conn, wire.query(&query_buf, 0x5302, "tcpfwd.example.com", .{}));
+    const up = try vortex.acceptUpstreamTcp(harness.default_timeout_ms);
+    defer up.close(testing.io);
+    var up_buf: [wire.max_message]u8 = undefined;
+    const forwarded = try vortex.tcpRecv(up, &up_buf, harness.default_timeout_ms);
+    var reply_buf: [wire.max_message]u8 = undefined;
+    try vortex.tcpSend(up, try wire.reply(&reply_buf, forwarded, .{ .addresses = &.{.{ 192, 0, 2, 12 }} }));
+    _ = try vortex.tcpRecv(conn, &buf, harness.default_timeout_ms);
+
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try vortex.signalAndWait(.TERM));
+    const log = vortex.childLog();
+    try testing.expectEqual(@as(usize, 1), countLines(log, &.{
+        "scope=query", "transport=tcp", "qname=\"ads.example.com\"", "verdict=block",
+    }));
+    try testing.expectEqual(@as(usize, 1), countLines(log, &.{
+        "scope=query", "transport=tcp", "qname=\"tcpfwd.example.com\"", "verdict=forward", "rcode=0",
+    }));
+}
+
+test "P2.3 at the default info level no per-query record is written" {
+    // The record names which device asked for which site. It must not reach
+    // the journal unless the operator turns it on.
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .log_level = "info" });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    var buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&query_buf, 0x5401, "ads.example.com", .{}));
+    _ = try vortex.recvClient(&buf, harness.default_timeout_ms);
+
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try vortex.signalAndWait(.TERM));
+    const log = vortex.childLog();
+    // The level really was info, so the absence below means something.
+    try testing.expect(std.mem.indexOf(u8, log, "shutting down signal=TERM") != null);
+    try testing.expectEqual(@as(usize, 0), countLines(log, &.{"scope=query"}));
+}

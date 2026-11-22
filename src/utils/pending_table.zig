@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const edns = @import("../dns/edns.zig");
+const Name = @import("../dns/name_reader.zig").Name;
 
 pub const PendingQuery = struct {
     client_id: u16,
@@ -36,6 +37,12 @@ pub const PendingQuery = struct {
     /// spends suspended, so a query outstanding across a laptop sleep is
     /// correctly treated as long dead.
     expires_at: i64,
+
+    /// For the query's record, written when the reply arrives or the deadline
+    /// passes (P2.3). Defaulted, so a test building an entry need not care.
+    started_ns: i96 = 0,
+    qname: Name = .{},
+    qtype: u16 = 0,
 };
 
 /// Hashes a DNS message's question section — the `question_len` bytes starting

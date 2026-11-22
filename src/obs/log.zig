@@ -24,8 +24,12 @@
 //! `VORTEX_LOG_FORMAT` — resolved by [settings.zig](../settings.zig) and applied
 //! through `configure`.
 //!
-//! Not yet here (see next_steps.md P2.3): the per-query event log carrying
-//! client, qtype and latency as real fields, and counters.
+//! **Events** (P2.3 phase 2) are records whose fields are real logfmt pairs
+//! rather than text inside `msg`: `event(.debug, .query, .{ .qname = …, … })`.
+//! The per-query record and the periodic counters use it, from
+//! [query_event.zig](query_event.zig). String and address values still pass
+//! through `EscapingWriter`, quoted, so the forgery guarantee above holds for
+//! them too. Numbers and enum tags are written bare.
 
 const std = @import("std");
 
@@ -198,6 +202,107 @@ pub fn logFn(
         ) catch {},
         .auto => unreachable, // `configure` resolves it; the atomic never holds it.
     }
+}
+
+/// Writes one event: a record whose `fields` (a struct literal) become logfmt
+/// pairs, in declaration order. Same level filter, lock and cancel protection
+/// as `logFn`. See `writeEvent` for how each value is rendered.
+pub fn event(
+    comptime message_level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    fields: anytype,
+) void {
+    if (!current_level.load(.monotonic).enables(message_level)) return;
+
+    const io = app_io orelse std.Options.debug_io;
+    const prev = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(prev);
+
+    const now = std.Io.Timestamp.now(io, .real);
+
+    var buffer: [512]u8 = undefined;
+    const locked = io.lockStderr(&buffer, null) catch |err| switch (err) {
+        error.Canceled => unreachable, // Cancel protection enabled above.
+    };
+    defer io.unlockStderr();
+
+    const out = &locked.file_writer.interface;
+    switch (current_format.load(.monotonic)) {
+        .logfmt => writeEvent(out, now.nanoseconds, message_level, scope, fields) catch {},
+        .text => writeEventText(out, message_level, scope, fields) catch {},
+        .auto => unreachable, // `configure` resolves it; the atomic never holds it.
+    }
+}
+
+/// Renders one event, newline included. Pure, like `writeRecord`.
+///
+/// No `msg` field: the fields are the message. Each value is rendered by
+/// type. Integers and enum tags bare, since neither can contain a space, a
+/// quote or a newline. Everything else (strings, and anything with a `format`
+/// method, such as an `IpAddress`) quoted and escaped.
+fn writeEvent(
+    out: *std.Io.Writer,
+    epoch_ns: i96,
+    comptime message_level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    fields: anytype,
+) std.Io.Writer.Error!void {
+    try out.writeAll("ts=");
+    try writeTimestamp(out, epoch_ns);
+    try out.print(" level={s} scope={t}", .{ levelText(message_level), scope });
+    try writeFields(out, fields);
+    try out.writeAll("\n");
+}
+
+/// The text-format rendering of an event: the same pairs after a short
+/// `level(scope):` prefix, for a person at a terminal.
+fn writeEventText(
+    out: *std.Io.Writer,
+    comptime message_level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    fields: anytype,
+) std.Io.Writer.Error!void {
+    try out.print("{s}({t}):", .{ levelText(message_level), scope });
+    try writeFields(out, fields);
+    try out.writeAll("\n");
+}
+
+fn writeFields(out: *std.Io.Writer, fields: anytype) std.Io.Writer.Error!void {
+    // `fieldNames`, not `@typeInfo(...).@"struct".fields`: the shape of
+    // `std.builtin.Type.Struct` differs between 0.16 and 0.17, and this
+    // helper is the one spelling both accept.
+    inline for (comptime std.meta.fieldNames(@TypeOf(fields))) |name| {
+        try out.writeAll(" " ++ name ++ "=");
+        try writeValue(out, @field(fields, name));
+    }
+}
+
+fn writeValue(out: *std.Io.Writer, value: anytype) std.Io.Writer.Error!void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .int, .comptime_int => return out.print("{d}", .{value}),
+        .@"enum", .enum_literal => return out.print("{t}", .{value}),
+        .bool => return out.writeAll(if (value) "true" else "false"),
+        else => {},
+    }
+    try out.writeByte('"');
+    var escaping = EscapingWriter.init(out);
+    if (comptime isBytes(T)) {
+        try escaping.interface.writeAll(value);
+    } else {
+        try escaping.interface.print("{f}", .{value});
+    }
+    try out.writeByte('"');
+}
+
+/// A byte slice, or a pointer to a byte array (a string literal).
+fn isBytes(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info != .pointer) return false;
+    const child = info.pointer.child;
+    if (child == u8) return info.pointer.size == .slice;
+    const child_info = @typeInfo(child);
+    return child_info == .array and child_info.array.child == u8;
 }
 
 /// Renders one complete record, newline included.
@@ -486,6 +591,59 @@ test "writeTimestamp handles leap years and clamps a pre-epoch clock" {
 // `std.meta.declarations` reports only `pub` declarations, so `@This()` alone
 // would never reach it — and it is the one type here whose correctness no call
 // site can bypass.
+test "writeEvent renders fields as real pairs: bare numbers and tags, quoted strings" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const Verdict = enum { block, hit };
+    try writeEvent(&w, 0, .debug, .query, .{
+        .qname = "ads.example.com",
+        .qtype = @as(u16, 28),
+        .verdict = Verdict.block,
+        .latency_us = @as(i64, -3),
+        .cached = true,
+    });
+    try testing.expectEqualStrings(
+        "ts=1970-01-01T00:00:00.000Z level=debug scope=query qname=\"ads.example.com\" qtype=28 verdict=block latency_us=-3 cached=true\n",
+        w.buffered(),
+    );
+}
+
+test "a hostile qname in an event cannot forge a second record or a field" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    // A newline to start a fake record, and a quote to close the value early
+    // and append a fake field.
+    try writeEvent(&w, 0, .debug, .query, .{
+        .qname = "evil\" verdict=allow\nts=x level=info msg=\"forged",
+        .qtype = @as(u16, 1),
+    });
+    // The exact bytes: the injected quote and newline are escaped, so the
+    // whole payload stays inside one quoted qname, followed by the real qtype,
+    // and the record ends at its one real newline.
+    try testing.expectEqualStrings(
+        "ts=1970-01-01T00:00:00.000Z level=debug scope=query qname=\"evil\\\" verdict=allow\\nts=x level=info msg=\\\"forged\" qtype=1\n",
+        w.buffered(),
+    );
+}
+
+test "writeEvent quotes anything with a format method, such as an address" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const addr = try std.Io.net.IpAddress.parse("::1", 5353);
+    try writeEvent(&w, 0, .info, .query, .{ .client = addr });
+    try testing.expectEqualStrings(
+        "ts=1970-01-01T00:00:00.000Z level=info scope=query client=\"[::1]:5353\"\n",
+        w.buffered(),
+    );
+}
+
+test "writeEventText keeps the pairs after a short prefix" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeEventText(&w, .info, .stats, .{ .queries = @as(u64, 7) });
+    try testing.expectEqualStrings("info(stats): queries=7\n", w.buffered());
+}
+
 test "refAllDecls" {
     testing.refAllDecls(@This());
     testing.refAllDecls(Level);
