@@ -96,8 +96,10 @@ test "a forwarded query returns with the client's transaction ID restored" {
 
 // ── Blocking ──────────────────────────────────────────────────────────────
 
-test "an exact-blocked name is answered locally with NXDOMAIN and an SOA" {
-    var vortex = try Instance.start(testing.io, testing.allocator, .{});
+test "under VORTEX_BLOCK_RESPONSE=nxdomain, an exact-blocked name gets NXDOMAIN and an SOA" {
+    // The pre-P4.1 answer, now one strategy of three. Its byte-level checks
+    // are kept: the SOA shape below is shared by `nodata`.
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .block_response = "nxdomain" });
     defer vortex.deinit();
     errdefer vortex.reportChildLog();
 
@@ -138,6 +140,85 @@ test "an exact-blocked name is answered locally with NXDOMAIN and an SOA" {
     try vortex.expectNoUpstreamQuery(200);
 }
 
+test "by default a blocked A gets 0.0.0.0 and a blocked AAAA gets ::, each with a 60 s TTL" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{});
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    var buf: [wire.max_message]u8 = undefined;
+
+    // A: one answer, 0.0.0.0, no SOA, and the question echoed with its case.
+    const query = wire.query(&query_buf, 0x4101, "AdS.Example.COM", .{});
+    try vortex.sendQuery(query);
+    const a = try vortex.recvClient(&buf, harness.default_timeout_ms);
+    try testing.expectEqual(@as(u16, 0x4101), wire.id(a));
+    try testing.expect(wire.isNullIpBlock(a));
+    const q_end = try wire.questionEnd(a);
+    try testing.expectEqualSlices(u8, query[12..q_end], a[12..q_end]);
+    try testing.expectEqual(q_end + 16, a.len);
+    try testing.expectEqual(@as(u32, 60), try wire.firstAnswerTtl(a, q_end));
+    try vortex.expectNoUpstreamQuery(200);
+
+    // AAAA: one answer of type AAAA, 16 zero bytes.
+    try vortex.sendQuery(wire.query(&query_buf, 0x4102, "ads.example.com", .{ .qtype = wire.Type.aaaa }));
+    const aaaa = try vortex.recvClient(&buf, harness.default_timeout_ms);
+    try testing.expectEqual(@as(u4, wire.RCode.no_error), wire.rcode(aaaa));
+    try testing.expectEqual(@as(u16, 1), wire.ancount(aaaa));
+    try testing.expectEqual(@as(u16, 0), wire.nscount(aaaa));
+    const rr = aaaa[try wire.questionEnd(aaaa)..];
+    try testing.expectEqual(@as(usize, 28), rr.len);
+    try testing.expectEqual(@as(u16, 0xC00C), std.mem.readInt(u16, rr[0..2], .big));
+    try testing.expectEqual(@as(u16, wire.Type.aaaa), std.mem.readInt(u16, rr[2..4], .big));
+    try testing.expectEqual(@as(u32, 60), std.mem.readInt(u32, rr[6..10], .big));
+    try testing.expectEqual(@as(u16, 16), std.mem.readInt(u16, rr[10..12], .big));
+    try testing.expectEqualSlices(u8, &@as([16]u8, @splat(0)), rr[12..]);
+}
+
+test "by default a blocked HTTPS query gets NODATA, not an address" {
+    // Browsers send HTTPS (type 65) next to A and AAAA. An address record in
+    // reply to it would be malformed, so it gets the negative answer instead.
+    var vortex = try Instance.start(testing.io, testing.allocator, .{});
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    var buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&query_buf, 0x4201, "ads.example.com", .{ .qtype = 65 }));
+    const answer = try vortex.recvClient(&buf, harness.default_timeout_ms);
+
+    try testing.expectEqual(@as(u4, wire.RCode.no_error), wire.rcode(answer));
+    try testing.expectEqual(@as(u16, 0), wire.ancount(answer));
+    try testing.expectEqual(@as(u16, 1), wire.nscount(answer)); // the SOA, so it caches
+    try vortex.expectNoUpstreamQuery(200);
+}
+
+test "under VORTEX_BLOCK_RESPONSE=nodata, a blocked A gets NODATA" {
+    var vortex = try Instance.start(testing.io, testing.allocator, .{ .block_response = "nodata" });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    var buf: [wire.max_message]u8 = undefined;
+    try vortex.sendQuery(wire.query(&query_buf, 0x4301, "ads.example.com", .{}));
+    const answer = try vortex.recvClient(&buf, harness.default_timeout_ms);
+
+    try testing.expectEqual(@as(u4, wire.RCode.no_error), wire.rcode(answer));
+    try testing.expectEqual(@as(u16, 0), wire.ancount(answer));
+    try testing.expectEqual(@as(u16, 1), wire.nscount(answer));
+    try testing.expectEqual(@as(u16, wire.Type.soa), std.mem.readInt(u16, answer[try wire.questionEnd(answer) + 2 ..][0..2], .big));
+}
+
+test "a malformed VORTEX_BLOCK_RESPONSE refuses to start, naming the value" {
+    var result = try harness.runUntilExit(testing.io, testing.allocator, .{
+        .block_response = "0.0.0.0",
+    });
+    defer result.deinit(testing.allocator);
+
+    try testing.expect(result.failed());
+    try testing.expect(std.mem.indexOf(u8, result.stderr, "VORTEX_BLOCK_RESPONSE") != null);
+}
+
 test "a suffix-blocked subdomain is answered locally" {
     var vortex = try Instance.start(testing.io, testing.allocator, .{});
     defer vortex.deinit();
@@ -153,8 +234,7 @@ test "a suffix-blocked subdomain is answered locally" {
     const answer = try vortex.recvClient(&client_buf, harness.default_timeout_ms);
 
     try testing.expectEqual(@as(u16, 0x55AA), wire.id(answer));
-    try testing.expectEqual(@as(u4, wire.RCode.name_error), wire.rcode(answer));
-    try testing.expectEqual(@as(u16, 1), wire.nscount(answer));
+    try testing.expect(wire.isNullIpBlock(answer));
     try vortex.expectNoUpstreamQuery(200);
 }
 
@@ -670,7 +750,7 @@ fn sleepMs(ms: u64) !void {
     try testing.io.sleep(std.Io.Duration.fromMilliseconds(@intCast(ms)), std.Io.Clock.boot);
 }
 
-/// Asserts `name` is answered locally with NXDOMAIN and never forwarded.
+/// Asserts `name` is answered locally as blocked and never forwarded.
 fn expectBlocked(vortex: *Instance, name: []const u8, id: u16) !void {
     var query_buf: [wire.max_message]u8 = undefined;
     try vortex.sendQuery(wire.query(&query_buf, id, name, .{}));
@@ -678,7 +758,7 @@ fn expectBlocked(vortex: *Instance, name: []const u8, id: u16) !void {
     var buf: [wire.max_message]u8 = undefined;
     const answer = try vortex.recvClient(&buf, harness.default_timeout_ms);
     try testing.expectEqual(id, wire.id(answer));
-    try testing.expectEqual(@as(u4, wire.RCode.name_error), wire.rcode(answer));
+    try testing.expect(wire.isNullIpBlock(answer));
 }
 
 /// Asserts `name` reaches the fake upstream, and answers it so the query does
@@ -698,7 +778,7 @@ fn expectForwarded(vortex: *Instance, name: []const u8, id: u16) !void {
     _ = try vortex.recvClient(&client_buf, harness.default_timeout_ms);
 }
 
-/// Polls until `name` comes back NXDOMAIN, or gives up.
+/// Polls until `name` comes back blocked, or gives up.
 ///
 /// A poll rather than one timed wait because the refresh happens on the child's
 /// own schedule: the case knows a swap is coming, not exactly when. Each round
@@ -739,7 +819,7 @@ fn waitUntilBlocked(vortex: *Instance, name: []const u8) !void {
 
         var client_buf: [wire.max_message]u8 = undefined;
         const answer = vortex.recvClient(&client_buf, 200) catch continue;
-        if (wire.rcode(answer) == wire.RCode.name_error) return;
+        if (wire.isNullIpBlock(answer)) return;
     }
 
     std.debug.print("'{s}' was never blocked after {d} rounds\n", .{ name, deadline_rounds });
@@ -856,7 +936,7 @@ test "a blocked name queried with EDNS gets our OPT back, and without EDNS gets 
         .edns = .{ .udp_size = 4096, .do_bit = true },
     }));
     const with = try vortex.recvClient(&buf, harness.default_timeout_ms);
-    try testing.expectEqual(@as(u4, wire.RCode.name_error), wire.rcode(with));
+    try testing.expect(wire.isNullIpBlock(with));
     try testing.expectEqual(@as(u16, 1), wire.arcount(with));
     const opt = wire.trailingOpt(with) orelse return error.NoOptInReply;
     try testing.expectEqual(@as(u16, 1232), opt.udp_size);
@@ -1030,8 +1110,7 @@ test "a blocked name is answered over TCP" {
     var buf: [wire.max_message]u8 = undefined;
     const answer = try vortex.tcpRecv(conn, &buf, harness.default_timeout_ms);
     try testing.expectEqual(@as(u16, 0xF001), wire.id(answer));
-    try testing.expectEqual(@as(u4, wire.RCode.name_error), wire.rcode(answer));
-    try testing.expectEqual(@as(u16, 1), wire.nscount(answer)); // the SOA
+    try testing.expect(wire.isNullIpBlock(answer));
 }
 
 test "a forwarded name over TCP goes upstream over TCP and comes back whole" {
@@ -1171,7 +1250,7 @@ fn expectAnsweredOnEveryPath(vortex: *Instance) !void {
     try vortex.sendQuery(wire.query(&query_buf, 0x6001, "ads.example.com", .{}));
     const blocked = try vortex.recvClient(&buf, harness.default_timeout_ms);
     try testing.expectEqual(@as(u16, 0x6001), wire.id(blocked));
-    try testing.expectEqual(@as(u4, wire.RCode.name_error), wire.rcode(blocked));
+    try testing.expect(wire.isNullIpBlock(blocked));
 
     try vortex.sendQuery(wire.query(&query_buf, 0x6002, "family.example.com", .{}));
     var upstream_buf: [wire.max_message]u8 = undefined;
@@ -1189,7 +1268,7 @@ fn expectAnsweredOnEveryPath(vortex: *Instance) !void {
     try vortex.tcpSend(conn, wire.query(&query_buf, 0x6003, "ads.example.com", .{}));
     const over_tcp = try vortex.tcpRecv(conn, &buf, harness.default_timeout_ms);
     try testing.expectEqual(@as(u16, 0x6003), wire.id(over_tcp));
-    try testing.expectEqual(@as(u4, wire.RCode.name_error), wire.rcode(over_tcp));
+    try testing.expect(wire.isNullIpBlock(over_tcp));
 }
 
 test "an IPv6 listener answers an IPv6 client over UDP and TCP" {
@@ -1279,7 +1358,7 @@ test "a client outside VORTEX_ALLOW_CLIENTS gets nothing over UDP, and its TCP c
     // was a dead process.
     const answer = try queryFromIp6Loopback(&vortex, wire.query(&query_buf, 0x7005, "ads.example.com", .{}), &buf);
     try testing.expectEqual(@as(u16, 0x7005), wire.id(answer));
-    try testing.expectEqual(@as(u4, wire.RCode.name_error), wire.rcode(answer));
+    try testing.expect(wire.isNullIpBlock(answer));
 }
 
 test "an IPv4 range matches an IPv4 client on a dual-stack listener, and nothing else" {

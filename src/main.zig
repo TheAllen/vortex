@@ -195,9 +195,14 @@ fn decide(
         .allow => query_log.debug("verdict=allow qname={s}", .{domain}),
         .block => {
             query_log.debug("verdict=block qname={s}", .{domain});
-            // NXDOMAIN + a synthetic SOA so the client can negatively cache the
-            // block, and our OPT if the query carried one (RFC 6891 §7).
-            const reply = blocked_response.buildInto(out, data, q_end, .name_error, .{
+            // P4.1: a null-IP answer, NODATA or NXDOMAIN, by strategy and
+            // qtype. The negative forms carry a synthetic SOA so the client can
+            // cache the block. Our OPT goes on any of them if the query carried
+            // one (RFC 6891 §7).
+            const p = blocked_response.plan(ctx.block_response, question.qtype, question.qclass);
+            const reply = blocked_response.buildInto(out, data, q_end, p.rcode, .{
+                .answer = p.answer,
+                .soa = p.soa,
                 .opt = our_opt,
             }) catch {
                 std.log.warn("dropping blocked reply for {s}: reply buffer too small", .{domain});
@@ -1127,6 +1132,7 @@ pub fn main(init: std.process.Init) !void {
     );
     ctx.tcp = if (tcp) |*t| t else null;
     ctx.client_gate = &client_gate;
+    ctx.block_response = cfg.block_response;
     // 1232 only when there is a TCP listener to retry against; see
     // `Context.edns_udp_size`.
     ctx.edns_udp_size = if (tcp_enabled) edns.advertised_udp_size else edns.no_tcp_udp_size;
@@ -1143,12 +1149,13 @@ pub fn main(init: std.process.Init) !void {
     if (ctx.tcp != null) try spawnLoop(&group, io, &ctx, "tcp accept", tcpAcceptLoop);
 
     // `{f}`, not host:port, so an IPv6 listener reads `[::]:53` rather than `:::53`.
-    std.log.info("listening={f} upstream={f} handler_threads={d} tcp_conns={d} edns_udp_size={d}", .{
+    std.log.info("listening={f} upstream={f} handler_threads={d} tcp_conns={d} edns_udp_size={d} block_response={s}", .{
         listen_addr,
         upstream_addr,
         handler_threads,
         cfg.max_tcp_conns,
         ctx.edns_udp_size,
+        @tagName(cfg.block_response),
     });
     var buffer: [4096]u8 = undefined;
     while (true) {

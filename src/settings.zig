@@ -30,6 +30,7 @@ const std = @import("std");
 
 const obs_log = @import("obs/log.zig");
 const AllowedClients = @import("utils/allowed_clients.zig").AllowedClients;
+const BlockResponse = @import("dns/blocked_response.zig").Strategy;
 
 const Environ = std.process.Environ;
 
@@ -211,6 +212,10 @@ pub const Settings = struct {
     /// over IPv6, still answers no one there.
     allowed_clients: AllowedClients,
 
+    /// How a blocked name is answered (P4.1); see `blocked_response.Strategy`.
+    /// Defaults to `null_ip`: `0.0.0.0` / `::` for A / AAAA, NODATA otherwise.
+    block_response: BlockResponse,
+
     pub const defaults: Settings = .{
         .listen_host = "127.0.0.1",
         .listen_port = 5354,
@@ -257,6 +262,8 @@ pub const Settings = struct {
         .max_tcp_conns = 64,
 
         .allowed_clients = AllowedClients.local,
+
+        .block_response = .null_ip,
     };
 
     /// Environment file consulted when `VORTEX_ENV_FILE` is unset. Missing is
@@ -291,6 +298,8 @@ pub const Settings = struct {
         /// `VORTEX_ALLOW_CLIENTS` had an item that isn't `local`, `any`, an
         /// address or `address/len`, held too many ranges, or held none.
         InvalidAllowClients,
+        /// `VORTEX_BLOCK_RESPONSE` was not `null_ip`, `nodata` or `nxdomain`.
+        InvalidBlockResponse,
         /// A variable that no longer exists under that name is still set. See
         /// `renamed`.
         RenamedSetting,
@@ -377,6 +386,14 @@ pub const Settings = struct {
             .max_pending = try envMaxPending(environ),
             .max_tcp_conns = try envCount(environ, "VORTEX_MAX_TCP_CONNS", defaults.max_tcp_conns),
             .allowed_clients = try envAllowedClients(environ),
+            .block_response = try envEnum(
+                BlockResponse,
+                environ,
+                "VORTEX_BLOCK_RESPONSE",
+                defaults.block_response,
+                error.InvalidBlockResponse,
+                "null_ip, nodata or nxdomain",
+            ),
         };
     }
 
@@ -938,6 +955,21 @@ test "fromEnviron reads allowed_clients, defaulting to local" {
     try testing.expectError(error.InvalidAllowClients, Settings.fromEnviron(&map));
     try map.put("VORTEX_ALLOW_CLIENTS", ",");
     try testing.expectError(error.InvalidAllowClients, Settings.fromEnviron(&map));
+}
+
+test "fromEnviron reads block_response, defaulting to null_ip" {
+    var map = Environ.Map.init(testing.allocator);
+    defer map.deinit();
+
+    try testing.expectEqual(BlockResponse.null_ip, (try Settings.fromEnviron(&map)).block_response);
+    try map.put("VORTEX_BLOCK_RESPONSE", "nxdomain");
+    try testing.expectEqual(BlockResponse.nxdomain, (try Settings.fromEnviron(&map)).block_response);
+    try map.put("VORTEX_BLOCK_RESPONSE", "nodata");
+    try testing.expectEqual(BlockResponse.nodata, (try Settings.fromEnviron(&map)).block_response);
+
+    // A typo is a startup error, never a silent fall back to the default.
+    try map.put("VORTEX_BLOCK_RESPONSE", "0.0.0.0");
+    try testing.expectError(error.InvalidBlockResponse, Settings.fromEnviron(&map));
 }
 
 // One line of guard per container. `refAllDecls` is shallow and 0.16.0 has no

@@ -5,9 +5,10 @@ const Header = @import("header.zig").Header;
 const edns = @import("edns.zig");
 
 /// Builds a locally-synthesized reply to a query we are answering ourselves:
-/// the original question echoed back, response flags set, then optionally a
-/// synthetic SOA in Authority (so a blocked name can be negatively cached, RFC
-/// 2308) and optionally our own OPT in Additional.
+/// the original question echoed back, response flags set, then optionally one
+/// answer record (a null-IP block, P4.1), optionally a synthetic SOA in
+/// Authority (so a negative block can be cached, RFC 2308) and optionally our
+/// own OPT in Additional. `plan` decides which, for a blocked name.
 ///
 /// Pure: bytes in, bytes out. `query` is only read, so this is unit-testable
 /// without an `Io`, a socket, or a `Context` — which is the whole reason it
@@ -49,6 +50,11 @@ pub fn buildInto(
     @memset(reply[6..12], 0);
     var at = question_end;
 
+    // Answer, then Authority, then Additional: RFC 1035 §4.1's section order.
+    if (opts.answer) |answer| {
+        std.mem.writeInt(u16, reply[6..8], 1, .big); // ANCOUNT = 1
+        at = answer.write(reply, at);
+    }
     if (opts.soa) {
         std.mem.writeInt(u16, reply[8..10], 1, .big); // NSCOUNT = 1
         var authority = Authority{};
@@ -65,11 +71,116 @@ pub fn buildInto(
 }
 
 pub const Options = struct {
-    /// Append the synthetic SOA. On for a blocked name, off for BADVERS.
+    /// One answer record for the question, before everything else. Set for a
+    /// null-IP block (P4.1); null for every negative answer.
+    answer: ?Answer = null,
+    /// Append the synthetic SOA. On for a negative blocked answer (NXDOMAIN or
+    /// NODATA), off for a null-IP answer and for BADVERS.
     soa: bool = true,
     /// Append our OPT. Set exactly when the query carried one.
     opt: ?Opt = null,
 };
+
+/// TTL on a null-IP answer. Short on purpose: a device holds the block for
+/// this long after the name is unblocked, and blocked names are answered
+/// locally, so re-asking costs nothing upstream. Decided 2026-11-22.
+pub const answer_ttl: u32 = 60;
+
+/// The unroutable address a null-IP block answers with: `0.0.0.0` or `::`.
+pub const Answer = union(enum) {
+    a: [4]u8,
+    aaaa: [16]u8,
+
+    pub const zero_a: Answer = .{ .a = @splat(0) };
+    pub const zero_aaaa: Answer = .{ .aaaa = @splat(0) };
+
+    /// NAME, TYPE, CLASS, TTL and RDLENGTH, before the address.
+    const fixed_len = 12;
+
+    pub fn wireLen(self: Answer) usize {
+        return fixed_len + self.rdata().len;
+    }
+
+    fn rdata(self: *const Answer) []const u8 {
+        return switch (self.*) {
+            .a => |*b| b,
+            .aaaa => |*b| b,
+        };
+    }
+
+    fn rrType(self: Answer) u16 {
+        return switch (self) {
+            .a => qtype_a,
+            .aaaa => qtype_aaaa,
+        };
+    }
+
+    /// Writes the record at `at` and returns the offset one past it. The name
+    /// is a compression pointer to the question's QNAME, which always starts
+    /// at offset 12, so the answer is for exactly the name that was asked.
+    fn write(self: Answer, out: []u8, at: usize) usize {
+        const rec = out[at..][0..self.wireLen()];
+        std.mem.writeInt(u16, rec[0..2], 0xC00C, .big); // NAME → offset 12
+        std.mem.writeInt(u16, rec[2..4], self.rrType(), .big);
+        std.mem.writeInt(u16, rec[4..6], class_in, .big);
+        std.mem.writeInt(u32, rec[6..10], answer_ttl, .big);
+        const data = self.rdata();
+        std.mem.writeInt(u16, rec[10..12], @intCast(data.len), .big);
+        @memcpy(rec[fixed_len..], data);
+        return at + rec.len;
+    }
+};
+
+const qtype_a: u16 = 1;
+const qtype_aaaa: u16 = 28;
+const class_in: u16 = 1;
+
+/// How a blocked name is answered (P4.1): `VORTEX_BLOCK_RESPONSE`.
+pub const Strategy = enum {
+    /// `0.0.0.0` for A and `::` for AAAA, NODATA for every other type. The
+    /// default: an app trying to connect fails at once (connection refused)
+    /// instead of treating the name as missing and retrying. It is also what
+    /// the hosts-format lists Vortex loads literally say (`0.0.0.0 ads.…`).
+    null_ip,
+    /// NOERROR with no answer and an SOA: "the name exists, but has no record
+    /// of this type". Never hands out an address.
+    nodata,
+    /// NXDOMAIN with an SOA: "the name does not exist". Vortex's only answer
+    /// before P4.1.
+    nxdomain,
+
+    pub fn parse(raw: []const u8) ?Strategy {
+        return std.meta.stringToEnum(Strategy, raw);
+    }
+};
+
+/// What a blocked reply carries, before the OPT, which is the caller's call.
+pub const Plan = struct {
+    rcode: Header.RCode,
+    answer: ?Answer,
+    soa: bool,
+};
+
+/// Picks the reply for a blocked question. Pure, so the whole
+/// strategy × qtype table is unit-tested without building a message.
+///
+/// Only an A or AAAA question in class IN gets an address. Everything else
+/// under `null_ip`, HTTPS (type 65) above all, gets NODATA: browsers send an
+/// HTTPS query next to A and AAAA, and an address there would be malformed.
+/// A null-IP answer carries no SOA, because it is a positive answer and the
+/// SOA exists only so a negative one can be cached (RFC 2308).
+pub fn plan(strategy: Strategy, qtype: u16, qclass: u16) Plan {
+    const nodata: Plan = .{ .rcode = .no_error, .answer = null, .soa = true };
+    return switch (strategy) {
+        .nxdomain => .{ .rcode = .name_error, .answer = null, .soa = true },
+        .nodata => nodata,
+        .null_ip => if (qclass != class_in) nodata else switch (qtype) {
+            qtype_a => .{ .rcode = .no_error, .answer = Answer.zero_a, .soa = false },
+            qtype_aaaa => .{ .rcode = .no_error, .answer = Answer.zero_aaaa, .soa = false },
+            else => nodata,
+        },
+    };
+}
 
 pub const Opt = struct {
     udp_size: u16,
@@ -81,6 +192,7 @@ pub const Opt = struct {
 /// Bytes `buildInto` writes for this question and these options.
 pub fn wireLen(question_end: usize, opts: Options) usize {
     return question_end +
+        (if (opts.answer) |a| a.wireLen() else 0) +
         (if (opts.soa) @as(usize, Authority.WIRE_LEN) else 0) +
         (if (opts.opt != null) @as(usize, edns.opt_wire_len) else 0);
 }
@@ -247,6 +359,115 @@ test "build refuses a buffer too small for the reply" {
     );
 }
 
+// ── P4.1: null-IP answers and the strategy table ─────────────────────────
+
+/// `query_ads_example_com` asking for AAAA instead of A.
+const query_ads_aaaa = blk: {
+    var q = query_ads_example_com;
+    std.mem.writeInt(u16, q[ads_question_end - 4 ..][0..2], 28, .big);
+    break :blk q;
+};
+
+test "build emits the exact null-IP A answer, with no SOA" {
+    var buf: [512]u8 = undefined;
+    const reply = try buildInto(&buf, &query_ads_example_com, ads_question_end, .no_error, .{
+        .answer = Answer.zero_a,
+        .soa = false,
+    });
+
+    try testing.expectEqual(@as(usize, ads_question_end + 16), reply.len);
+    try testing.expectEqual(@as(u16, 0x8180), std.mem.readInt(u16, reply[2..4], .big)); // NOERROR
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, reply[6..8], .big)); // ANCOUNT
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, reply[8..10], .big)); // NSCOUNT
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, reply[10..12], .big)); // ARCOUNT
+
+    try testing.expectEqualSlices(u8, &.{
+        0xC0, 0x0C, // NAME — pointer to the QNAME at offset 12
+        0x00, 0x01, // TYPE — A
+        0x00, 0x01, // CLASS — IN
+        0x00, 0x00, 0x00, 0x3C, // TTL 60
+        0x00, 0x04, // RDLENGTH 4
+        0, 0, 0, 0, // 0.0.0.0
+    }, reply[ads_question_end..]);
+}
+
+test "build emits the exact null-IP AAAA answer, then our OPT" {
+    var buf: [512]u8 = undefined;
+    const reply = try buildInto(&buf, &query_ads_aaaa, ads_question_end, .no_error, .{
+        .answer = Answer.zero_aaaa,
+        .soa = false,
+        .opt = .{ .udp_size = 1232, .do_bit = false },
+    });
+
+    const answer_end = ads_question_end + 28;
+    try testing.expectEqual(@as(usize, answer_end + edns.opt_wire_len), reply.len);
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, reply[6..8], .big)); // ANCOUNT
+    try testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, reply[10..12], .big)); // ARCOUNT
+
+    try testing.expectEqualSlices(u8, &[_]u8{
+        0xC0, 0x0C, // NAME
+        0x00, 0x1C, // TYPE — AAAA (28)
+        0x00, 0x01, // CLASS — IN
+        0x00, 0x00, 0x00, 0x3C, // TTL 60
+        0x00, 0x10, // RDLENGTH 16
+    } ++ @as([16]u8, @splat(0)), reply[ads_question_end..answer_end]); // ::
+    // The OPT comes after the answer, not in place of it.
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0x29, 0x04, 0xD0, 0, 0, 0, 0, 0, 0 }, reply[answer_end..]);
+}
+
+test "build refuses a buffer one byte short of an answer" {
+    const opts: Options = .{ .answer = Answer.zero_aaaa, .soa = false };
+    var buf: [ads_question_end + 27]u8 = undefined;
+    try testing.expectEqual(@as(usize, buf.len + 1), wireLen(ads_question_end, opts));
+    try testing.expectError(error.NoSpaceLeft, buildInto(&buf, &query_ads_aaaa, ads_question_end, .no_error, opts));
+}
+
+test "plan: every strategy against A, AAAA, HTTPS and a non-IN class" {
+    const a = 1;
+    const aaaa = 28;
+    const https = 65;
+    const in = 1;
+    const chaos = 3;
+
+    // null_ip: an address for A and AAAA only, NODATA for everything else.
+    const pa = plan(.null_ip, a, in);
+    try testing.expectEqual(Header.RCode.no_error, pa.rcode);
+    try testing.expectEqualDeep(@as(?Answer, Answer.zero_a), pa.answer);
+    try testing.expect(!pa.soa);
+
+    const p6 = plan(.null_ip, aaaa, in);
+    try testing.expectEqualDeep(@as(?Answer, Answer.zero_aaaa), p6.answer);
+    try testing.expect(!p6.soa);
+
+    for ([_][2]u16{ .{ https, in }, .{ 15, in }, .{ 255, in }, .{ a, chaos }, .{ aaaa, chaos } }) |q| {
+        const p = plan(.null_ip, q[0], q[1]);
+        try testing.expectEqual(Header.RCode.no_error, p.rcode);
+        try testing.expectEqual(@as(?Answer, null), p.answer);
+        try testing.expect(p.soa);
+    }
+
+    // nodata and nxdomain never hand out an address, whatever was asked.
+    for ([_]u16{ a, aaaa, https }) |qtype| {
+        const nd = plan(.nodata, qtype, in);
+        try testing.expectEqual(Header.RCode.no_error, nd.rcode);
+        try testing.expectEqual(@as(?Answer, null), nd.answer);
+        try testing.expect(nd.soa);
+
+        const nx = plan(.nxdomain, qtype, in);
+        try testing.expectEqual(Header.RCode.name_error, nx.rcode);
+        try testing.expectEqual(@as(?Answer, null), nx.answer);
+        try testing.expect(nx.soa);
+    }
+}
+
+test "Strategy.parse accepts exactly the three names" {
+    try testing.expectEqual(@as(?Strategy, .null_ip), Strategy.parse("null_ip"));
+    try testing.expectEqual(@as(?Strategy, .nodata), Strategy.parse("nodata"));
+    try testing.expectEqual(@as(?Strategy, .nxdomain), Strategy.parse("nxdomain"));
+    try testing.expectEqual(@as(?Strategy, null), Strategy.parse("null-ip"));
+    try testing.expectEqual(@as(?Strategy, null), Strategy.parse("NXDOMAIN"));
+}
+
 // One line of guard per container. `refAllDecls` is shallow and 0.16.0 has no
 // recursive variant, so a type that is not named here has its methods left
 // unanalysed — see resource_record.zig, where exactly that let a `pub fn` ship
@@ -255,4 +476,7 @@ test "refAllDecls" {
     testing.refAllDecls(@This());
     testing.refAllDecls(Options);
     testing.refAllDecls(Opt);
+    testing.refAllDecls(Answer);
+    testing.refAllDecls(Strategy);
+    testing.refAllDecls(Plan);
 }

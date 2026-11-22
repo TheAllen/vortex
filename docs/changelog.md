@@ -9,6 +9,66 @@ Newest first. Open work lives in [next_steps.md](next_steps.md).
 
 ---
 
+## Landed 2026-11-22 — P4.1: blocked-response strategy
+
+**A blocked name now gets an answer chosen by query type.** `VORTEX_BLOCK_RESPONSE` picks
+one of three strategies:
+
+| Query type | `null_ip` (default) | `nodata` | `nxdomain` |
+|---|---|---|---|
+| A | NOERROR, `0.0.0.0`, TTL 60 | NOERROR, no answer, SOA | NXDOMAIN, SOA |
+| AAAA | NOERROR, `::`, TTL 60 | the same | the same |
+| any other type, or a class other than IN | NOERROR, no answer, SOA | the same | the same |
+
+Before this, every block was NXDOMAIN. That claims the name does not exist, which some apps
+treat as a hard failure and retry. **`null_ip` is the default** because an app trying to connect
+to `0.0.0.0` fails at once with "connection refused". It is also what the hosts-format lists
+Vortex loads literally say. Decided 2026-11-22, together with the TTL.
+
+**HTTPS gets NODATA, not an address.** Browsers send an HTTPS query (type 65) next to A and
+AAAA, and an address record in reply to it would be malformed. Only an A or AAAA question in
+class IN gets an address.
+
+**The TTL is 60 s, not the SOA's 3600.** It is how long a device keeps a block after the name
+is unblocked. Blocked names are answered locally, so a device re-asking costs nothing upstream.
+A null-IP answer carries no SOA, because it is a positive answer and the SOA exists so that a
+negative one can be cached (RFC 2308).
+
+**Shape.** [blocked_response.zig](../src/dns/blocked_response.zig) gained `Answer`, one record
+whose NAME is a compression pointer to the question at offset 12. `buildInto` writes it before
+the SOA and OPT, in RFC 1035's section order. The strategy × qtype table is `plan`, a pure
+function, so it is tested exhaustively without building a message. `decide` calls `plan` and
+passes the result through, so UDP and TCP cannot disagree on it. The startup line now names the
+active strategy, and a value that is not one of the three is a startup error.
+
+**Tests:** 6 unit tests (exact bytes for the A and AAAA answers, the AAAA one followed by our
+OPT; the one-byte-short buffer; the whole `plan` table; `Strategy.parse`; settings) and 4 new
+integration cases (default A and AAAA; HTTPS gets NODATA; `nodata`; a malformed value refuses
+to start). The NXDOMAIN case keeps its byte-level checks, now pinned to `nxdomain`. Nine
+assertions that only meant "this was blocked" go through one helper, `wire.isNullIpBlock`, so
+the next change of default is one edit. *232/232 — 190 unit, 42 integration*, on Zig 0.17.1
+and 0.16.0.
+
+**Mutation-checked: 14 mutations, all killed**, each run against the full suite and reverted:
+
+| Rule broken | Killed by |
+|---|---|
+| ANCOUNT not set / NAME pointer wrong / RDLENGTH wrong | both exact-bytes tests, plus the TCP and EDNS integration cases |
+| Answer TYPE wrong | the exact A-answer test |
+| A and AAAA addresses swapped | the `plan` table, and every integration case that checks for a blocked name |
+| HTTPS and other types get an address | the `plan` table and the HTTPS integration case |
+| A non-IN class gets an address | the `plan` table |
+| A null-IP answer also carries an SOA | the `plan` table and three integration cases |
+| TTL 3600 instead of 60 | both exact-bytes tests and the default A/AAAA case |
+| `decide` ignores the setting / the setting never reaches `Context` | the `nodata` and `nxdomain` integration cases |
+| A bad value accepted as the default | `Strategy.parse`, settings, and the malformed-value case |
+| `nodata` answers NXDOMAIN / `nxdomain` answers NODATA | the `plan` table and the matching integration case |
+
+**Not done here:** any per-list or per-name choice of strategy (one setting covers every block),
+and a configurable TTL. Neither has a user yet.
+
+---
+
 ## Landed 2026-11-22 — P2.7: client allowlist
 
 **Vortex now enforces "home network only" itself.** `VORTEX_ALLOW_CLIENTS` is a
