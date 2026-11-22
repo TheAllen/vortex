@@ -418,7 +418,7 @@ pub const Settings = struct {
                 ),
                 error.EmptyList => log.err("{s}: '{s}' lists no clients at all", .{ key, raw }),
             }
-            return defaults.allowed_clients;
+            return error.InvalidAllowClients;
         };
     }
 

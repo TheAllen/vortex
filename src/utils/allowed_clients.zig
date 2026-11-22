@@ -251,11 +251,11 @@ test "local allows every home-network range and nothing public" {
     // One address inside each local range, including both edges of the
     // smaller ones, so a range one bit too narrow fails here.
     for ([_][]const u8{
-        "127.0.0.1",       "127.255.255.255", "10.1.2.3",
-        "172.16.0.1",      "172.31.255.255",  "192.168.1.20",
-        "169.254.10.10",   "100.64.0.1",      "100.127.255.255",
-        "::1",             "fe80::1",         "febf:ffff::1",
-        "fd12:3456::1",    "fc00::1",
+        "127.0.0.1",     "127.255.255.255", "10.1.2.3",
+        "172.16.0.1",    "172.31.255.255",  "192.168.1.20",
+        "169.254.10.10", "100.64.0.1",      "100.127.255.255",
+        "::1",           "fe80::1",         "febf:ffff::1",
+        "fd12:3456::1",  "fc00::1",
     }) |text| {
         if (!l.allows(ip(text))) {
             std.debug.print("expected {s} to be local\n", .{text});
