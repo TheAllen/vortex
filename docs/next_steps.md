@@ -701,48 +701,56 @@ real sinkhole (the Pi-hole / AdGuard Home / Unbound-`local-zone` feature class).
 
 ## Suggested order
 
-**All three P0s are now pinned**, so the regression risk that drove the last two passes is
-retired. What follows is ordered by cost-to-value, cheapest first.
+*Rewritten 2026-11-22.* The version this replaces was written in August and kept verbatim
+while every item it named shipped; it is in git history before this date. What follows is
+ordered by what stands between Vortex and running as the resolver for a home network
+first, then by value per unit of effort.
 
-**1. P4.2 (QDCOUNT/opcode) — do this next.** It has jumped the queue twice and is now
-almost free: `Header.validateQuery`, `Rejection`, and the rcode-parameterized
-`writeResponseFlags` all exist. Two enum variants, two `if`s, two switch arms, and three
-tests in the shape already established. It closes out header validation entirely, and the
-P4.2 entry above spells out the one open decision (header-only FORMERR replies).
+**0. Close out P2.7.** The client allowlist is implemented and committed on
+`feat/client-allowlist`. What is left is the pass that makes it count as landed:
+mutation-check each rule (the `local` ranges, IPv4-mapped unwrapping, the UDP drop, the TCP
+close at accept), confirm the test count, and write it up — a changelog entry, the P2.7
+entry above marked done, and `VORTEX_ALLOW_CLIENTS` in the README and
+[vortex.env](../deploy/systemd/vortex.env). After this, nothing on the board blocks a bind
+off localhost.
 
-**2. Finish the tests (P2.5 + P1.1).** Write the **`parseQuestion` malformed-input tests**
-first — pure, over byte slices, no `Io`, same shape as everything added on 08-08. Then the
-**`PendingTable` suite**, which is now the single largest gap on the board: still zero
-tests, and where the entire P0.B series hid. It needs an `Io`, so budget more for it than
-for the byte-slice tests. Add the **CI workflow** in the same pass so the count can't
-quietly stall for six weeks again — `.github/` still does not exist.
+**1. Run it for real (P2.6 remainder).** Deploy the unit on an actual systemd host, run
+`systemd-analyze security`, and loosen whatever the syscall filter breaks. Add
+**sd_notify readiness** (`Type=notify`) in the same pass, since it is small and only
+testable there. This is the first time Vortex serves a network rather than a harness, so
+expect it to find something.
 
-**Then P2.1 config + P2.3 structured logging** — makes everything after observable, and
-P2.1 unblocks the configurable negative-cache TTL that C2 hard-coded.
+**2. Graceful shutdown (P2.4).** Catch SIGINT/SIGTERM, cancel the group, flush the log, run
+the deferred deinits. A resolver under systemd gets stopped on every restart and upgrade,
+so this matters as soon as step 1 does. The same signal handling unlocks the
+**SIGHUP-triggered blocklist refresh** left open by P2.2 — one function call once signals
+exist.
 
-**Then branch:** **P4.1 blocked-response strategy** if the goal is "a real blackhole," or
-the **P3 compression → parsing → caching** track if the goal is "keep learning DNS."
-P1.4 and the coroutine-supervisor half of P1.2 are small and can be sprinkled in anytime;
-**P1.5 and P2.7 both jump the queue the moment you bind anything other than localhost** —
-C3 removed the reflector and P1.2 stopped OOM from being fatal, but nothing yet *bounds*
-the number of in-flight handlers a flood can create.
+**3. P2.3 phase 2: the per-query event and counters.** One record per query with client,
+qname, qtype, verdict, rcode and latency as real fields, plus total / blocked / forwarded /
+orphan / eviction counters. Once Vortex is serving a real network this is how you find out
+what it is doing, and it is the base P4.6 builds on.
 
-> ⚠️ **This section is stale** and is kept verbatim by request; only this note is maintained.
-> As of 2026-09-13: items 1 and 2 are done (P4.2 landed 08-09, both test suites landed 08-09,
-> CI exists), P2.1/P2.3 both shipped, and the P3 track it offers as a *branch* has now been
-> walked end to end — compression 08-13, record parsing 08-30, caching 09-05. **P2.5's harness
-> landed 09-12 and came off this list**, as P2.1's local-file blocklist source did on 09-11
-> and **P2.2's cache + refresh did on 09-13**.
-> The real order is now **P1.5, P2.3's per-query event, then P4.1** — with P2.6 and P2.7
-> alongside P1.5 if the goal is a bind off localhost, since none of the three is sufficient
-> on its own. Rewriting this section against that is a separate pass, and the case for doing
-> so keeps strengthening: every item it names is done, what is left is entirely the
-> deployability block, and the list is now down to three.
->
-> **2026-09-19:** the verbatim text above ends on *"nothing yet bounds the number of in-flight
-> handlers a flood can create"* — which is no longer the right way to state the gap. The
-> runtime bounds the handlers; what is unbounded is `PendingTable`. The order is unchanged,
-> P1.5 is still first, and only its shape moved. See P1.5 above.
+**4. P4.1 blocked-response strategy.** The biggest remaining feature for "a real
+blackhole": NXDOMAIN, NODATA or a null-IP answer, chosen per qtype and configurable. The
+`rcode` parameter on `blocked_response.build` is the door in. Real traffic from step 1 is
+the best evidence for which default to pick.
+
+**5. P4.3 upstream timeout and failover.** A per-query timeout and a second upstream, so
+one bad upstream does not take DNS down for the house. Leads naturally toward P3.7
+(multiple upstreams / DoT / DoH).
+
+**Then, by appetite:**
+- **P4.4 local records / conditional forwarding** — names for LAN devices, the most-asked
+  sinkhole feature after blocking.
+- **P4.5 blocklist footprint** and **P4.6 sinkhole observability** (query log, top
+  blocked, per-client ratios — needs step 3 and a privacy decision).
+- **Small items, sprinkle in anytime:** CLI flags (P2.1); Vortex reporting its bound port,
+  which removes the last startup race in the harness (P2.5); request coalescing and a cache
+  eviction policy (P3.3); upstream TCP connection reuse and honoring
+  `VORTEX_UPSTREAM_BIND_*` over TCP (P3.6).
+- **Only if Vortex ever serves beyond a home network:** per-client rate limiting (deferred
+  under P2.7), multiple listen addresses and the multihomed reply-source fix (P2.6).
 
 For the view from above — how far along the whole project is, which of these bands is worth
 the most per unit of effort, and why "no open P0s" does **not** mean "safe to deploy" — see
