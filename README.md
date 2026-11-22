@@ -1,6 +1,6 @@
 # Vortex
 
-A DNS forwarder with blocklist filtering, written in Zig 0.17 on the new `std.Io`
+A DNS forwarder with blocklist filtering, written in Zig on the new `std.Io`
 async runtime. Point a resolver at it and ad/tracker domains come back as
 `0.0.0.0` / `::`; everything else is forwarded upstream.
 
@@ -13,8 +13,8 @@ metrics endpoint) largely is not. See
 
 ## Quick start
 
-Requires **Zig 0.16.0** (the `std.Io` APIs used here do not exist in 0.15 and are
-not stable across versions).
+Builds and passes its tests on **Zig 0.16.0** (the CI pin) and **0.17.1**. The
+`std.Io` APIs used here do not exist in 0.15 and are not stable across versions.
 
 ```sh
 git clone <your-repo-url> && cd vortex
@@ -279,7 +279,7 @@ per query.
 
 ## Where it actually stands
 
-Roughly **62%** of the way to "production-ready home sinkhole," with the caveat
+Roughly **80%** of the way to "production-ready home sinkhole," with the caveat
 that the expensive-to-reverse architectural decisions are the ones already made.
 [`docs/progress.md`](docs/progress.md) has the weighted breakdown and what would
 actually move it.
@@ -290,8 +290,8 @@ QDCOUNT), QName case normalization, a choice of blocked answer per query type
 verified against the question that provoked them, SERVFAIL on upstream timeout,
 and TC=1 rather than silent corruption when a reply overflows the receive buffer.
 Every one of those is now asserted end to end against the running binary, not just
-against the pure function behind it. `zig build test` runs **163 tests** — 147 unit
-tests plus 16 integration cases — under both Debug and ReleaseSafe.
+against the pure function behind it. `zig build test` runs **251 tests**: 201 unit
+tests plus 50 integration cases.
 
 **Responses are cached, with honest TTLs.** The compression → parsing → caching
 chain is complete: pointer following (P3.1), the record walk (P3.2), and a
@@ -321,17 +321,19 @@ an error page looks like by the time it reaches the parser.
 
 The gap is everything around the datapath: config reload, a metrics endpoint
 and rate limiting. EDNS0 and TCP landed 2026-09-28; a systemd unit and IPv6 listening
-(P2.6) on 2026-10-06; the client allowlist (P2.7) on 2026-11-22. [`docs/next_steps.md`](docs/next_steps.md) is the full
+(P2.6) on 2026-10-06; the client allowlist (P2.7), the blocked-answer choice
+(P4.1), graceful shutdown with SIGHUP refresh (P2.4) and the per-query log (P2.3)
+on 2026-11-22. [`docs/next_steps.md`](docs/next_steps.md) is the full
 prioritized board.
 
-The testing gap that used to sit here is closed. The 147 unit tests are all over
+The testing gap that used to sit here is closed. The unit tests are all over
 pure functions, which left `handleQuery`, `dispatcherLoop` and the ingress loop
 with no runtime coverage at all — the two functions where this project's last two
 real bugs lived. As of 2026-09-12 [`tests/`](tests/) spawns the real binary
 against a scratch config and a fake upstream and drives it over UDP: 16 cases,
 every one confirmed to fail when the behavior it covers is deliberately broken.
 
-`zig build test` runs both suites (208 tests: 173 unit, 35 integration, the
+`zig build test` runs both suites (251 tests: 201 unit, 50 integration, the
 integration cases over TCP as well as UDP, and over IPv6 and a dual-stack `::`
 listener as well as IPv4); `zig build test-integration` runs
 just the harness, and `-Dtest-filter=<substr>` narrows it to a single case.

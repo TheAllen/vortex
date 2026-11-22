@@ -4,6 +4,9 @@ Reviewed **2026-09-15** against the current source (Zig 0.16.0, `zig build test`
 **163/163 pass** — 147 unit tests, of which 127 are real behavior tests, plus **16
 integration cases**). *Updated 2026-09-27: 166/166 — 149 unit, 17 integration.*
 *Updated 2026-11-15: builds on Zig 0.17.1 (ported 10-06); 208/208 — 173 unit, 35 integration.*
+*Updated 2026-11-22: 251/251 — 201 unit, 50 integration — on both 0.16.0 and 0.17.1. P2.7,
+P4.1, P2.4 and P2.3 phase 2 landed; next in the [suggested order](#suggested-order) is step 1,
+running the unit on a real systemd host.*
 
 **2026-11-15: P2.7 rescoped to the deployment Vortex is meant for, a home network.**
 Behind a home router's NAT, nothing on the internet can reach port 53 unless the port is
