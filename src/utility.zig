@@ -7,6 +7,7 @@ const Cache = @import("dns/cache.zig").Cache;
 const Settings = @import("settings.zig").Settings;
 const ConnTable = @import("utils/conn_table.zig").ConnTable;
 const edns = @import("dns/edns.zig");
+const Gate = @import("utils/allowed_clients.zig").Gate;
 
 /// The TCP listener and its connection table (P3.6), or absent when
 /// `VORTEX_MAX_TCP_CONNS=0`.
@@ -65,6 +66,10 @@ pub const Context = struct {
     /// a forwarded query may advertise on a client's behalf (P3.5): 1232 with a
     /// TCP listener to retry against, our 4096 buffer without one.
     edns_udp_size: u16 = edns.advertised_udp_size,
+
+    /// Which clients are answered (P2.7). Checked by the UDP ingress loop and
+    /// the TCP accept loop, and drained by the sweeper for its log line.
+    client_gate: *Gate = undefined,
 
     pub fn init(
         client_socket: *const std.Io.net.Socket,

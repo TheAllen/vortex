@@ -1212,3 +1212,108 @@ test "listening on :: also answers IPv4 clients, over UDP and TCP" {
 
     try expectAnsweredOnEveryPath(&vortex);
 }
+
+// ── Client allowlist (P2.7) ───────────────────────────────────────────────
+
+/// Sends `msg` to Vortex from a fresh `::1` socket and returns the reply, or
+/// `error.Timeout`. The case's own client is in the listener's IPv4 family, so
+/// this is the second source address a P2.7 case needs: one inside the list
+/// and one outside it, against the same running Vortex.
+fn queryFromIp6Loopback(vortex: *Instance, msg: []const u8, buf: []u8) ![]u8 {
+    const sock = try (std.Io.net.IpAddress{ .ip6 = .loopback(0) }).bind(testing.io, .{ .mode = .dgram, .protocol = .udp });
+    defer sock.close(testing.io);
+    const target: std.Io.net.IpAddress = .{ .ip6 = .loopback(vortex.listen_addr.getPort()) };
+    try sock.send(testing.io, &target, msg);
+    const got = try sock.receiveTimeout(testing.io, buf, .{ .duration = .{
+        .raw = .fromMilliseconds(harness.default_timeout_ms),
+        .clock = .boot,
+    } });
+    return got.data;
+}
+
+test "a client outside VORTEX_ALLOW_CLIENTS gets nothing over UDP, and its TCP connection is closed" {
+    // Listening on `::` with only `::1` allowed: the case's IPv4 client arrives
+    // as `::ffff:127.0.0.1`, which is outside the list. Readiness is probed
+    // from `::1`, so the instance is proven up before any negative is asserted.
+    var vortex = try Instance.start(testing.io, testing.allocator, .{
+        .listen = .dual_stack,
+        .allow_clients = "::1/128",
+        .readiness = .ip6_blocked_probe,
+    });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    var buf: [wire.max_message]u8 = undefined;
+
+    // A blocked name would be answered locally, so no reply means the check
+    // ran before the policy.
+    try vortex.sendQuery(wire.query(&query_buf, 0x7001, "ads.example.com", .{}));
+    try vortex.expectNoClientReply(500);
+
+    // A forwarded name must not reach upstream either.
+    try vortex.sendQuery(wire.query(&query_buf, 0x7002, "denied.example.com", .{}));
+    try vortex.expectNoUpstreamQuery(500);
+
+    // An oversized query would get a FORMERR, which is sent before any parsing.
+    // No reply means the check runs before that too: nothing at all is sent to
+    // a client outside the list.
+    try vortex.sendQuery(wire.query(&query_buf, 0x7003, "huge.example.com", .{ .padding = 5000 }));
+    try vortex.expectNoClientReply(500);
+
+    // Over TCP the kernel completes the handshake, and Vortex closes the
+    // connection unread. EOF, or a reset if the query was already in the
+    // socket when it closed.
+    const conn = try vortex.tcpConnect();
+    defer conn.close(testing.io);
+    vortex.tcpSend(conn, wire.query(&query_buf, 0x7004, "ads.example.com", .{})) catch {};
+    if (vortex.tcpRecv(conn, &buf, harness.default_timeout_ms)) |got| {
+        std.debug.print("expected the connection closed, got {d} bytes\n", .{got.len});
+        return error.UnexpectedClientReply;
+    } else |err| switch (err) {
+        error.EndOfStream, error.ConnectionResetByPeer => {},
+        else => return err,
+    }
+
+    // Still serving the client that is allowed, so none of the silence above
+    // was a dead process.
+    const answer = try queryFromIp6Loopback(&vortex, wire.query(&query_buf, 0x7005, "ads.example.com", .{}), &buf);
+    try testing.expectEqual(@as(u16, 0x7005), wire.id(answer));
+    try testing.expectEqual(@as(u4, wire.RCode.name_error), wire.rcode(answer));
+}
+
+test "an IPv4 range matches an IPv4 client on a dual-stack listener, and nothing else" {
+    // The other direction: only `127.0.0.1` allowed. The case's client arrives
+    // on `::` as `::ffff:127.0.0.1` and must match the IPv4 range, while `::1`,
+    // a different address, must not.
+    var vortex = try Instance.start(testing.io, testing.allocator, .{
+        .listen = .dual_stack,
+        .allow_clients = "127.0.0.1",
+    });
+    defer vortex.deinit();
+    errdefer vortex.reportChildLog();
+
+    var query_buf: [wire.max_message]u8 = undefined;
+    var buf: [wire.max_message]u8 = undefined;
+
+    try vortex.sendQuery(wire.query(&query_buf, 0x7101, "ads.example.com", .{}));
+    const answer = try vortex.recvClient(&buf, harness.default_timeout_ms);
+    try testing.expectEqual(@as(u16, 0x7101), wire.id(answer));
+
+    try testing.expectError(
+        error.Timeout,
+        queryFromIp6Loopback(&vortex, wire.query(&query_buf, 0x7102, "ads.example.com", .{}), &buf),
+    );
+}
+
+test "a malformed VORTEX_ALLOW_CLIENTS refuses to start, naming the bad item" {
+    // Falling back to a default here could mean answering clients the
+    // operator meant to exclude, so it is fatal like every other bad setting.
+    var result = try harness.runUntilExit(testing.io, testing.allocator, .{
+        .allow_clients = "local, 192.168.1.0/33",
+    });
+    defer result.deinit(testing.allocator);
+
+    try testing.expect(result.failed());
+    try testing.expect(std.mem.indexOf(u8, result.stderr, "192.168.1.0/33") != null);
+}
